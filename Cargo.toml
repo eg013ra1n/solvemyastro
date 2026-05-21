@@ -1,0 +1,37 @@
+[package]
+name = "solvemyastro"
+version = "0.1.0"
+edition = "2021"
+authors = ["Vilen Sharifov <vilen.sharifov@gmail.com>"]
+description = "Standalone astrometric plate solver — precise WCS with SIP distortion. Rust lib + CLI."
+license = "Apache-2.0"
+repository = "http://192.168.31.208:9080/root/solvemyastro.git"
+readme = "README.md"
+keywords = ["astronomy", "astrometry", "plate-solving", "wcs", "astrophotography"]
+categories = ["science", "command-line-utilities"]
+
+[lib]
+name = "solvemyastro"
+path = "src/lib.rs"
+
+[[bin]]
+name = "solvemyastro"
+path = "src/main.rs"
+
+[dependencies]
+# FITS/XISF decode + raw star detection (ImageAnalyzer). solvemyastro adds
+# its own star *selection* (SNR gate + SNR-rank, capped pool) on top;
+# detection stays in rustafits (dual-use). Crate package = `rustafits`,
+# lib = `astroimage`.
+# Versions pinned to the workspace lock to avoid duplicate crate versions
+# (project rule). CLI uses std::env::args (project convention — no clap).
+rustafits = { path = "../rustafits" }
+nalgebra = "0.33"
+rayon = "1.10"
+anyhow = "1"
+memmap2 = "0.9"
+cdshealpix = "0.7"
+byteorder = "1"
+
+[dev-dependencies]
+tempfile = "3"

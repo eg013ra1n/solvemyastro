@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target
+Cargo.lock
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+*.bk
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Internal docs (not published)
+/docs/
