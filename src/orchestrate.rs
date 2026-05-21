@@ -17,6 +17,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::{
+    math::great_circle_deg,
     project::project_catalog,
     quad::{build_quads, fit_affine, group_size_for, match_quads},
     select::select_fast_stars,
@@ -119,18 +120,6 @@ fn fov_rungs(long_px: usize, hints: &SolveHints) -> Vec<FovRung> {
 // ---------------------------------------------------------------------------
 // Square-spiral sky-cell generator
 // ---------------------------------------------------------------------------
-
-fn great_circle_deg(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
-    let dra = (ra1 - ra2).to_radians();
-    let lat1 = dec1.to_radians();
-    let lat2 = dec2.to_radians();
-    let (s1, c1) = lat1.sin_cos();
-    let (s2, c2) = lat2.sin_cos();
-    let (sd, cd) = dra.sin_cos();
-    let a = (c2 * sd).hypot(c1 * s2 - s1 * c2 * cd);
-    let b = s1 * s2 + c1 * c2 * cd;
-    a.atan2(b).to_degrees()
-}
 
 /// Generate sky cells in square-spiral order around the seed centre.
 fn spiral_cells(center: Option<(f64, f64)>, radius_deg: f64, step_deg: f64) -> Vec<(f64, f64)> {
@@ -667,7 +656,10 @@ pub fn solve(
                             .iter()
                             .map(|&((px, py), (dx, dy))| ((px - dx).powi(2) + (py - dy).powi(2)).sqrt())
                             .collect();
-                        resid.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        // Residuals are sqrt of (finite px,py - finite dx,dy)^2; non-NaN by upstream
+                        // invariants (count_inliers filters NaN positions). Use defensive comparison
+                        // so a stray NaN cannot panic this rayon worker.
+                        resid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                         let med = resid.get(resid.len() / 2).copied().unwrap_or(0.0);
                         let p90 = resid.get(resid.len() * 9 / 10).copied().unwrap_or(0.0);
                         let mx = resid.last().copied().unwrap_or(0.0);

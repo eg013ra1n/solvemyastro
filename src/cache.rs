@@ -40,7 +40,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use cdshealpix::nested;
 use memmap2::Mmap;
 
-use crate::CatalogStar;
+use crate::{math::great_circle_deg, CatalogStar};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -677,23 +677,6 @@ fn propagate(
     (new_ra, new_dec)
 }
 
-/// Precise great-circle angular separation between two sky positions (degrees).
-///
-/// Uses the Vincenty formula (numerically stable for all separations).
-fn great_circle_deg(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
-    let dra = (ra1 - ra2).to_radians();
-    let lat1 = dec1.to_radians();
-    let lat2 = dec2.to_radians();
-
-    let (sin_lat1, cos_lat1) = lat1.sin_cos();
-    let (sin_lat2, cos_lat2) = lat2.sin_cos();
-    let (sin_dra, cos_dra) = dra.sin_cos();
-
-    let a = (cos_lat2 * sin_dra).hypot(cos_lat1 * sin_lat2 - sin_lat1 * cos_lat2 * cos_dra);
-    let b = sin_lat1 * sin_lat2 + cos_lat1 * cos_lat2 * cos_dra;
-    a.atan2(b).to_degrees()
-}
-
 /// Write a single 64-byte header to `w`.
 fn write_header<W: Write + Seek>(w: &mut W, star_count: u64, catalog_epoch: f64) -> Result<()> {
     // Magic (8)
@@ -814,10 +797,10 @@ mod tests {
         // Full-sky mag coverage: union of two 90° cones (north + south poles)
         let south = cache.cone(0.0, -90.0, 90.0, 99.0, epoch).expect("south cone");
         let mut all_mags: Vec<f32> = results.iter().chain(south.iter()).map(|s| s.mag).collect();
-        all_mags.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        all_mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         all_mags.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
         let mut expected_mags: Vec<f32> = stars.iter().map(|s| s.mag).collect();
-        expected_mags.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        expected_mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         // Every input magnitude must appear in the union
         for &em in &expected_mags {
             assert!(
@@ -1006,7 +989,7 @@ mod tests {
         // The results from a single pixel should be mag-sorted (they come from one pixel slice)
         let mags: Vec<f32> = all.iter().map(|s| s.mag).collect();
         let mut sorted = mags.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         assert_eq!(mags, sorted, "results should be mag-ascending (single pixel)");
     }
 
@@ -1481,7 +1464,7 @@ mod tests {
         // (b) Quad-pool purity: brightest-20 detections within 3 px of a
         //     catalog star.
         let mut sorted_by_flux = result.stars.clone();
-        sorted_by_flux.sort_unstable_by(|a, b| b.flux.partial_cmp(&a.flux).unwrap());
+        sorted_by_flux.sort_unstable_by(|a, b| b.flux.partial_cmp(&a.flux).unwrap_or(std::cmp::Ordering::Equal));
         let top20 = sorted_by_flux.iter().take(20);
 
         let nearest_cat_dist = |dpx: f64, dpy: f64| -> f64 {

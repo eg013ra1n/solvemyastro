@@ -94,7 +94,9 @@ fn push_quad(
         euclidean(p[1], p[3]),
         euclidean(p[2], p[3]),
     ];
-    d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    // euclidean() returns non-NaN, non-negative for finite inputs; defensive cmp
+    // so a malformed point cannot panic this code path.
+    d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let longest = d[5];
     if longest < 1e-15 {
@@ -169,10 +171,11 @@ pub fn build_quads(points: &[(f64, f64)], n: usize, group_size: usize) -> Vec<Qu
         }
 
         // Partial-sort: bring the n_nbr smallest to the front, then stable-sort
-        // those so group membership is deterministic.
-        nbrs.select_nth_unstable_by(n_nbr - 1, |a, b| a.1.partial_cmp(&b.1).unwrap());
+        // those so group membership is deterministic. Distances are finite by
+        // construction; defensive cmp so a stray NaN cannot panic the worker.
+        nbrs.select_nth_unstable_by(n_nbr - 1, |a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         nbrs.truncate(n_nbr);
-        nbrs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        nbrs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Build local group: star i + its n_nbr nearest.
         let mut group = [0usize; 6]; // g ≤ 6 in practice
@@ -234,7 +237,9 @@ pub fn match_quads(image: &[Quad], catalog: &[Quad], tol: f64) -> Vec<(usize, us
 
     // Median of scale ratios.
     let mut ratios: Vec<f64> = raw.iter().map(|&(_, _, r)| r).collect();
-    ratios.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    // Scale ratios are catalog_longest / image_longest; both positive finite,
+    // ratio finite. Defensive cmp so a degenerate quad cannot panic.
+    ratios.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = ratios[ratios.len() / 2];
 
     // Outlier reject: |ratio − median| > 0.2 * |median| → drop.

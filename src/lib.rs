@@ -15,6 +15,7 @@ use std::path::Path;
 use anyhow::Result;
 
 pub mod cache;
+pub(crate) mod math;
 pub mod orchestrate;
 pub mod project;
 pub mod quad;
@@ -80,16 +81,43 @@ impl Default for SolveConfig {
 /// `PlateSolveRecord` inputs so the adapter maps 1:1.
 #[derive(Clone, Debug)]
 pub struct SolveSolution {
+    /// Linear (CD matrix + tangent point) WCS, with optional SIP distortion
+    /// polynomial. Use `wcs.pixel_to_sky` / `wcs.sky_to_pixel` to evaluate.
     pub wcs: WcsSolution,
+    /// Plate scale, arcsec per pixel. Derived from the CD matrix:
+    /// `sqrt(|det(CD)|) * 3600`. Constant across the field — the
+    /// per-position scale variation due to SIP is not captured here.
     pub pixel_scale_arcsec: f64,
+    /// Position angle of catalog north (+Dec) relative to the image +Y axis,
+    /// degrees in `[0, 360)`. Positive = east-of-north (counter-clockwise on
+    /// a standard image where +X is right and +Y is up).
     pub field_rotation_deg: f64,
+    /// Number of catalog stars matched to detections within the inlier
+    /// tolerance after the final affine refit (linear stage). Does not
+    /// re-count after the SIP refit.
     pub matched_stars: usize,
+    /// Total stars produced by `detect_fast` before SNR-gating / selection.
+    /// Useful as a denominator for `matched_stars` and for diagnosing low-SNR
+    /// fields.
     pub total_detected: usize,
+    /// RMS of inlier residuals in image pixels. If SIP was applied, this is
+    /// the post-SIP RMS; otherwise it is the linear-fit RMS.
     pub rms_residual_px: f64,
+    /// Same as `rms_residual_px`, expressed in arcsec
+    /// (`rms_residual_px * pixel_scale_arcsec`).
     pub rms_residual_arcsec: f64,
+    /// Fraction `matched_stars / total_detected`. Healthy solves are
+    /// typically in `[0.1, 0.7]`; very low values suggest a faint /
+    /// crowded field or a partial match.
     pub inlier_ratio: f64,
+    /// Identifier of the catalog used. Currently `"gaia_dr3"`. Reserved for
+    /// future support of alternative catalogs (Tycho-2 fallback, etc.).
     pub catalog_used: String,
+    /// Solver-implementation identifier (e.g. `"solvemyastro"`). Opaque
+    /// string; do not parse — it is for human-facing diagnostic logging.
     pub algorithm: String,
+    /// Wall-clock time from `solve()` entry to return, milliseconds. Includes
+    /// rustafits detection, blind search, and any SIP fit.
     pub solve_time_ms: u64,
 }
 

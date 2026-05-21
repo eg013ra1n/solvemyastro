@@ -1,0 +1,37 @@
+{
+  "_comment": "Per-frame baseline captured by tests/corpus_bench.rs before any Phase-1+ algorithm changes. Used by the regression gate: post-edit rms_px must be <= 1.15 x baseline per frame, and median(post) <= 1.05 x median(baseline). Captured on 2026-05-22 against smac_gaia at G<16 (no RUWE filter; pre-Phase-0).",
+  "_schema": {
+    "frame": "filename substring, matched into the bench corpus",
+    "truth_solved": "true if a reference-truth entry exists for this frame",
+    "solvemyastro_solved": "true if the current solver produced a solution",
+    "dpos_arcsec": "great-circle distance to truth crval, arcsec; null if no truth or no solve",
+    "dscale_pct": "abs scale error vs truth, percent; null if no truth or no solve",
+    "linear_rms_px": "RMS of inliers under the linear-only WCS; null on no-solve",
+    "sip_rms_px": "RMS of inliers after SIP fit; null if SIP not applied or no-solve",
+    "has_sip": "true iff sip_forward.is_some() in the solution",
+    "sip_n_pairs": "matched pair count used in the SIP fit; null if no SIP",
+    "n_inliers_linear": "inlier count at the seed/linear stage",
+    "solve_time_ms": "wall-clock solve time"
+  },
+  "frames": [
+    {"frame": "1_18_r_1_P.fit",                                           "truth_solved": false, "solvemyastro_solved": true,  "dpos_arcsec": null, "dscale_pct": null, "linear_rms_px": 0.71, "sip_rms_px": 0.16, "has_sip": true,  "sip_n_pairs": 13,  "n_inliers_linear": 13,  "solve_time_ms": 21789},
+    {"frame": "2024-01-13_20-27-32_L_-10.00_120.00s_0081.fits",            "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 3.5,  "dscale_pct": 0.13, "linear_rms_px": 1.86, "sip_rms_px": 0.52, "has_sip": true,  "sip_n_pairs": 31,  "n_inliers_linear": 30,  "solve_time_ms": 2472},
+    {"frame": "2024-02-24_19-42-32_H_-20.60_300.00s_0074.fits",            "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 0.9,  "dscale_pct": 0.01, "linear_rms_px": 3.01, "sip_rms_px": 0.67, "has_sip": true,  "sip_n_pairs": 39,  "n_inliers_linear": 34,  "solve_time_ms": 959},
+    {"frame": "2024-02-27_00-13-43_M 82_H_-20.60_300.00s_0254.fits",       "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 1.6,  "dscale_pct": 0.05, "linear_rms_px": 2.46, "sip_rms_px": 0.53, "has_sip": true,  "sip_n_pairs": 35,  "n_inliers_linear": 33,  "solve_time_ms": 481},
+    {"frame": "2024-03-01_04-47-58_M 51_H_-20.60_300.00s_0060.fits",       "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 3.6,  "dscale_pct": 0.22, "linear_rms_px": 2.57, "sip_rms_px": null, "has_sip": false, "sip_n_pairs": null, "n_inliers_linear": 9,   "solve_time_ms": 497},
+    {"frame": "2024-03-03_21-27-12_NGC 2903_H_-19.80_300.00s_0004.fits",   "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 1.7,  "dscale_pct": 0.04, "linear_rms_px": 2.34, "sip_rms_px": 0.88, "has_sip": true,  "sip_n_pairs": 20,  "n_inliers_linear": 18,  "solve_time_ms": 415},
+    {"frame": "2024-09-08_04-30-13_L_-9.90_180.00s_0008.fits",             "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 2.1,  "dscale_pct": 0.93, "linear_rms_px": 4.11, "sip_rms_px": 2.08, "has_sip": true,  "sip_n_pairs": 39,  "n_inliers_linear": 36,  "solve_time_ms": 2628},
+    {"frame": "2025-08-23_01-38-32_B_-10.00_180.00s_0012.fits",            "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 1.5,  "dscale_pct": 0.18, "linear_rms_px": 1.01, "sip_rms_px": 0.39, "has_sip": true,  "sip_n_pairs": 563, "n_inliers_linear": 276, "solve_time_ms": 28148},
+    {"frame": "2025-10-05_00-50-11_R_-0.00_120.00s_0000.fits",             "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 1.7,  "dscale_pct": 0.20, "linear_rms_px": 0.60, "sip_rms_px": 0.18, "has_sip": true,  "sip_n_pairs": 444, "n_inliers_linear": 433, "solve_time_ms": 9623},
+    {"frame": "2025-10-05_04-30-45_R_0.00_30.00s_0003.fits",               "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 1.5,  "dscale_pct": 0.16, "linear_rms_px": 0.68, "sip_rms_px": 0.14, "has_sip": true,  "sip_n_pairs": 158, "n_inliers_linear": 155, "solve_time_ms": 1233},
+    {"frame": "2025-10-26_01-35-09_L_-10.00_300.00s_0034.fits",            "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 1.7,  "dscale_pct": 0.00, "linear_rms_px": 0.91, "sip_rms_px": 0.31, "has_sip": true,  "sip_n_pairs": 409, "n_inliers_linear": 400, "solve_time_ms": 15037},
+    {"frame": "2026-04-09_01-33-58__-7.50_10.00s_26.15_0010.fits",         "truth_solved": false, "solvemyastro_solved": true,  "dpos_arcsec": null, "dscale_pct": null, "linear_rms_px": 0.38, "sip_rms_px": 0.29, "has_sip": true,  "sip_n_pairs": 580, "n_inliers_linear": 578, "solve_time_ms": 14873},
+    {"frame": "2026-04-10_00-06-14__-15.00_120.00s_37.15_0023.fits",       "truth_solved": false, "solvemyastro_solved": false, "dpos_arcsec": null, "dscale_pct": null, "linear_rms_px": null, "sip_rms_px": null, "has_sip": false, "sip_n_pairs": null, "n_inliers_linear": null, "solve_time_ms": 14990},
+    {"frame": "2_18_r_1_P.fit",                                           "truth_solved": false, "solvemyastro_solved": false, "dpos_arcsec": null, "dscale_pct": null, "linear_rms_px": null, "sip_rms_px": null, "has_sip": false, "sip_n_pairs": null, "n_inliers_linear": null, "solve_time_ms": 5851},
+    {"frame": "3_18_r_01_P.fit",                                          "truth_solved": false, "solvemyastro_solved": false, "dpos_arcsec": null, "dscale_pct": null, "linear_rms_px": null, "sip_rms_px": null, "has_sip": false, "sip_n_pairs": null, "n_inliers_linear": null, "solve_time_ms": 12896},
+    {"frame": "Light_Gamma Scuti_180.0s_Bin1_20251018-201649_0010",        "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 2.5,  "dscale_pct": 0.06, "linear_rms_px": 0.62, "sip_rms_px": 0.26, "has_sip": true,  "sip_n_pairs": 589, "n_inliers_linear": 388, "solve_time_ms": 17784},
+    {"frame": "Light_Pane 4_300.0s_Bin1_O_gain111_20211011-024956",       "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 0.9,  "dscale_pct": 0.13, "linear_rms_px": 0.83, "sip_rms_px": 0.23, "has_sip": true,  "sip_n_pairs": 119, "n_inliers_linear": 121, "solve_time_ms": 29014},
+    {"frame": "Light_Pane 7_300.0s_Bin1_O_gain111_20211014-045033",       "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 1.4,  "dscale_pct": 0.17, "linear_rms_px": 0.74, "sip_rms_px": 0.31, "has_sip": true,  "sip_n_pairs": 101, "n_inliers_linear": 101, "solve_time_ms": 29017},
+    {"frame": "Light_veil_300.0s_Bin1_0015.fit",                          "truth_solved": true,  "solvemyastro_solved": true,  "dpos_arcsec": 1.5,  "dscale_pct": 0.16, "linear_rms_px": 0.81, "sip_rms_px": 0.40, "has_sip": true,  "sip_n_pairs": 529, "n_inliers_linear": 333, "solve_time_ms": 3292}
+  ]
+}

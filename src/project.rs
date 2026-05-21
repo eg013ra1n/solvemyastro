@@ -20,7 +20,7 @@
 //! feed the projected positions into `quad::build_quads` with the same
 //! `group_size` used for the image side.
 
-use crate::{wcs::tan, CatalogStar};
+use crate::{math::great_circle_deg, wcs::tan, CatalogStar};
 
 /// Arcsec per degree.
 const ARCSEC_PER_DEG: f64 = 3600.0;
@@ -55,19 +55,6 @@ pub fn project_catalog(stars: &[CatalogStar], ra0: f64, dec0: f64) -> Vec<(f64, 
             (xi_deg * ARCSEC_PER_DEG, eta_deg * ARCSEC_PER_DEG)
         })
         .collect()
-}
-
-/// Great-circle angular separation, degrees (Vincenty formula).
-fn great_circle_deg(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
-    let dra = (ra1 - ra2).to_radians();
-    let lat1 = dec1.to_radians();
-    let lat2 = dec2.to_radians();
-    let (s1, c1) = lat1.sin_cos();
-    let (s2, c2) = lat2.sin_cos();
-    let (sd, cd) = dra.sin_cos();
-    let a = (c2 * sd).hypot(c1 * s2 - s1 * c2 * cd);
-    let b = s1 * s2 + c1 * c2 * cd;
-    a.atan2(b).to_degrees()
 }
 
 #[cfg(test)]
