@@ -180,30 +180,68 @@ struct TrialResult {
     scale_arcsec: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_trial(
     image_quads: &[crate::quad::Quad],
-    _image_pts: &[(f64, f64)],
+    image_pts: &[(f64, f64)],
     image_center: (f64, f64),
     cell: (f64, f64),
     cat_stars: &[CatalogStar],
     group_size: usize,
     cfg: &SolveConfig,
     min_quads: usize,
+    balance: bool,
 ) -> Option<TrialResult> {
     let (ra0, dec0) = cell;
+
+    // In `balance` mode (the fallback pass) density-cap the image quad pool
+    // to the catalog's depth. `build_quads` forms quads from spatial
+    // nearest-neighbours, so when the image detects fainter than the catalog
+    // the two pools don't correspond and matching starves. The catalog cone
+    // covers the frame rectangle scaled by `aspect / (π·OVERSIZE²)`, so the
+    // catalog count expected within the frame is `n_cat·aspect/(π·OVERSIZE²)`
+    // — cap the image pool to that. Catalog is never reduced. When the image
+    // is not the deeper pool the cap is ≥ n_img and this is a no-op, so the
+    // fallback pass can only ever help, never regress.
+    let balanced: Option<(Vec<crate::quad::Quad>, usize, usize)> = if balance {
+        let dim_a = 2.0 * image_center.0 + 1.0;
+        let dim_b = 2.0 * image_center.1 + 1.0;
+        let aspect = dim_a.min(dim_b) / dim_a.max(dim_b);
+        let est = (cat_stars.len() as f64 * aspect
+            / (std::f64::consts::PI * CONE_OVERSIZE * CONE_OVERSIZE))
+            .round() as usize;
+        let img_keep = est.clamp(4, image_pts.len());
+        if img_keep >= image_pts.len() {
+            None // image not the deeper pool — nothing to cap
+        } else {
+            let gs = group_size_for(img_keep);
+            let q = build_quads(&image_pts[..img_keep], img_keep, gs);
+            Some((q, gs, minimum_quads(img_keep)))
+        }
+    } else {
+        None
+    };
+    let (iquads, gs, mq): (&[crate::quad::Quad], usize, usize) = match &balanced {
+        Some((q, g, m)) => (q.as_slice(), *g, *m),
+        None => (image_quads, group_size, min_quads),
+    };
+    if iquads.len() < 3 {
+        return None;
+    }
+
     let projected = project_catalog(cat_stars, ra0, dec0);
     if projected.len() < 4 {
         return None;
     }
-    let cat_quads = build_quads(&projected, projected.len(), group_size);
+    let cat_quads = build_quads(&projected, projected.len(), gs);
     if cat_quads.is_empty() {
         return None;
     }
-    let matches = match_quads(image_quads, &cat_quads, cfg.quad_tolerance);
-    if matches.len() < min_quads {
+    let matches = match_quads(iquads, &cat_quads, cfg.quad_tolerance);
+    if matches.len() < mq {
         return None;
     }
-    let affine = fit_affine(&matches, image_quads, &cat_quads)?;
+    let affine = fit_affine(&matches, iquads, &cat_quads)?;
     let wcs = affine_to_wcs(&affine, image_center, (ra0, dec0));
 
     // Sanity: pixel scale must be in physical range (0.05"–120"/px).
@@ -463,8 +501,102 @@ pub fn solve(
         if center.is_some() { "hinted" } else { "blind" }
     );
 
-    // 5. Spiral search — rayon-parallelised per rung.
-    for rung in &rungs {
+    // 5. Search. Primary pass uses the full detection pool (unchanged
+    //    behaviour). If it finds nothing, a fallback pass retries with
+    //    density-balanced quad pools — for frames whose detections
+    //    out-resolve the catalog. Frames that solve never reach the
+    //    fallback, so it cannot regress them.
+    let ctx = SearchCtx {
+        image_pts: &image_pts,
+        image_quads: &image_quads,
+        group_size,
+        min_quads,
+        image_center,
+        width,
+        height,
+        long_px,
+        total_detected,
+        rungs: &rungs,
+        center,
+        search_radius,
+        cache,
+        cfg,
+        obs_epoch,
+        t0,
+        cancel,
+    };
+    if let Some(sol) = run_search(&ctx, false)? {
+        return Ok(sol);
+    }
+    if is_cancelled() {
+        anyhow::bail!("cancelled");
+    }
+    eprintln!(
+        "[solvemyastro] primary search found nothing — \
+         retrying with density-balanced quad pools"
+    );
+    if let Some(sol) = run_search(&ctx, true)? {
+        return Ok(sol);
+    }
+    anyhow::bail!(
+        "no trial passed verification across {} FOV rung(s) \
+         (incl. density-balanced retry)",
+        rungs.len()
+    )
+}
+
+/// Bundled inputs for one search pass — avoids a 17-argument function.
+struct SearchCtx<'a> {
+    image_pts: &'a [(f64, f64)],
+    image_quads: &'a [crate::quad::Quad],
+    group_size: usize,
+    min_quads: usize,
+    image_center: (f64, f64),
+    width: f64,
+    height: f64,
+    long_px: usize,
+    total_detected: usize,
+    rungs: &'a [FovRung],
+    center: Option<(f64, f64)>,
+    search_radius: f64,
+    cache: &'a StarCache,
+    cfg: &'a SolveConfig,
+    obs_epoch: f64,
+    t0: Instant,
+    cancel: Option<&'a AtomicBool>,
+}
+
+/// One search pass over the autoFOV ladder × square spiral.
+///
+/// `balance = false` is the primary pass — the full pre-built image quad
+/// pool, byte-identical to the original single-pass solver. `balance =
+/// true` is the fallback — each trial density-caps the image pool against
+/// its catalog cone (see `run_trial`). Returns `Ok(Some)` on a verified
+/// solve, `Ok(None)` if no trial passed any rung, `Err` on cancellation.
+fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
+    let &SearchCtx {
+        image_pts,
+        image_quads,
+        group_size,
+        min_quads,
+        image_center,
+        width,
+        height,
+        long_px,
+        total_detected,
+        rungs,
+        center,
+        search_radius,
+        cache,
+        cfg,
+        obs_epoch,
+        t0,
+        cancel,
+    } = ctx;
+    let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
+
+    // 5a. Spiral search — rayon-parallelised per rung.
+    for rung in rungs {
         if is_cancelled() {
             anyhow::bail!("cancelled");
         }
@@ -503,14 +635,15 @@ pub fn solve(
                     stars
                 };
                 run_trial(
-                    &image_quads,
-                    &image_pts,
+                    image_quads,
+                    image_pts,
                     image_center,
                     cell,
                     &stars,
                     group_size,
                     cfg,
                     min_quads,
+                    balance,
                 )
             })
             .collect();
@@ -690,7 +823,7 @@ pub fn solve(
             // Mark verified so remaining parallel trials in this rung stop early.
             any_verified.store(true, Ordering::Relaxed);
 
-            return Ok(SolveSolution {
+            return Ok(Some(SolveSolution {
                 pixel_scale_arcsec: sip_wcs.pixel_scale_arcsec(),
                 field_rotation_deg: sip_wcs.field_rotation_deg(),
                 matched_stars: final_inliers,
@@ -702,15 +835,12 @@ pub fn solve(
                 algorithm: "solvemyastro".to_string(),
                 solve_time_ms,
                 wcs: sip_wcs,
-            });
+            }));
         } // end 'candidates loop
     } // end rung loop
 
     if is_cancelled() {
         anyhow::bail!("cancelled");
     }
-    anyhow::bail!(
-        "no trial passed verification across {} FOV rung(s)",
-        rungs.len()
-    )
+    Ok(None)
 }
