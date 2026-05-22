@@ -1685,6 +1685,83 @@ mod tests {
         }
     }
 
+    /// Dump `detect_fast`'s detections for 2_18_r_1_P.fit to a CSV, each
+    /// classified catalog-star vs not (via the true WCS). Feeds an external
+    /// visualisation. Columns: `x,y,peak,flux,snr,is_catalog`.
+    #[test]
+    #[ignore = "needs the bench frame + smac_gaia cache"]
+    fn diag_dump_2_18_detections() {
+        use astroimage::ImageAnalyzer;
+        use crate::wcs::WcsSolution;
+        let path = std::path::Path::new(
+            "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench/2_18_r_1_P.fit",
+        );
+        let smac = std::path::Path::new(
+            "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia",
+        );
+        if !path.exists() || !smac.is_dir() {
+            eprintln!("SKIP diag_dump_2_18_detections: frame or smac_gaia missing");
+            return;
+        }
+        let (fw, fh) = (2048usize, 4096usize);
+        let wcs = WcsSolution {
+            crpix: (2109.900114368 - 1.0, -4522.937352613 - 1.0),
+            crval: (345.848529613, -4.164077306),
+            cd: [[-0.000138136, -0.000000050], [0.000000087, 0.000137891]],
+            sip_forward: None,
+            sip_reverse: None,
+        };
+        let cache = StarCache::open(smac).expect("open smac_gaia");
+        let (fc_ra, fc_dec) =
+            wcs.pixel_to_sky((fw as f64 - 1.0) / 2.0, (fh as f64 - 1.0) / 2.0);
+        let result = ImageAnalyzer::new()
+            .with_detection_sigma(5.0)
+            .with_max_stars(600)
+            .with_saturation_fraction(1.0)
+            .detect_fast(path)
+            .expect("detect_fast");
+        let sx = fw as f64 / result.width as f64;
+        let sy = fh as f64 / result.height as f64;
+        let cat = cache
+            .cone(fc_ra, fc_dec, 0.5, 16.0, 2024.04)
+            .expect("cone query");
+        let in_frame: Vec<(f64, f64)> = cat
+            .iter()
+            .filter_map(|s| {
+                let (px, py) = wcs.sky_to_pixel(s.ra, s.dec);
+                if px >= 0.0 && px < fw as f64 && py >= 0.0 && py < fh as f64 {
+                    Some((px, py))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut out = String::from("x,y,peak,flux,snr,is_catalog\n");
+        for s in &result.stars {
+            let (px, py) = (s.x as f64 * sx, s.y as f64 * sy);
+            let is_cat = in_frame
+                .iter()
+                .any(|&(cx, cy)| ((cx - px).powi(2) + (cy - py).powi(2)).sqrt() <= 3.0);
+            out.push_str(&format!(
+                "{px:.2},{py:.2},{},{},{},{}\n",
+                s.peak,
+                s.flux,
+                s.snr,
+                if is_cat { 1 } else { 0 }
+            ));
+        }
+        let dst = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join("2_18_detections.csv");
+        std::fs::write(&dst, out).expect("write detections csv");
+        eprintln!(
+            "wrote {} detections ({} catalog stars in-frame) to {}",
+            result.stars.len(),
+            in_frame.len(),
+            dst.display()
+        );
+    }
+
     // ── Brute-force pixel-search fallback ─────────────────────────────────
     //
     // Last-resort path used when cdshealpix `cone_coverage_approx` panics
