@@ -30,7 +30,7 @@ nalgebra = "0.33"
 rayon = "1.10"
 anyhow = "1"
 memmap2 = "0.9"
-cdshealpix = "0.7"
+cdshealpix = "0.9"
 byteorder = "1"
 
 [dev-dependencies]

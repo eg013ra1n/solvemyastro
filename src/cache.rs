@@ -571,8 +571,12 @@ fn sky_to_pixel(ra_deg: f64, dec_deg: f64) -> u64 {
 
 /// Return the set of depth-6 HEALPix pixel IDs that overlap a cone.
 ///
-/// Mirrors the athenaeum-core reference implementation including the
-/// panic-catching nudge strategy for cdshealpix 0.7.x edge cases.
+/// cdshealpix 0.7.x panicked inside `cone_coverage_approx` for cones
+/// reaching the equatorial/polar HEALPix boundary (cds-healpix-rust #21).
+/// That is **fixed in the 0.9.1 pin** (see the `cdshealpix_no_panic_*`
+/// regression test). The `catch_unwind` + radius-nudge + brute-force
+/// fallback below is retained as a thin defence-in-depth guard — it should
+/// never trigger now, but it costs nothing on the success path.
 fn cone_search_pixels(ra_deg: f64, dec_deg: f64, radius_deg: f64) -> Vec<u64> {
     if !ra_deg.is_finite()
         || !dec_deg.is_finite()
@@ -616,10 +620,10 @@ fn cone_search_pixels(ra_deg: f64, dec_deg: f64, radius_deg: f64) -> Vec<u64> {
 
 /// Brute-force pixel enumeration — scans all depth-6 pixel centers for
 /// intersection with the query cone. Last-resort fallback when cdshealpix
-/// `cone_coverage_approx` panics across every radius nudge (a known issue
-/// with cdshealpix 0.7.x for certain sky regions, e.g. around RA≈315°
-/// Dec≈-23°). Depth 6 has 49 152 pixels, so a full scan is bounded and
-/// fast (~tens of µs).
+/// `cone_coverage_approx` panics across every radius nudge — the 0.7.x bug
+/// (cds-healpix-rust #21) that is fixed in the 0.9.1 pin. Retained as
+/// defence-in-depth; depth 6 has 49 152 pixels, so a full scan is bounded
+/// and fast (~tens of µs).
 ///
 /// The result may slightly over-cover (the test radius is inflated by one
 /// pixel half-diagonal so we never miss a boundary pixel). The `cone()`
@@ -1508,6 +1512,144 @@ mod tests {
         // Do not panic on INADEQUATE — the verdict is a decision signal.
     }
 
+    /// Decisive detection-vs-matching probe for the failing SkyMapper frames.
+    /// Each frame carries an embedded TPV WCS whose PV terms are < 0.02"
+    /// across the field, so a plain TAN WCS built from CD/CRPIX/CRVAL is the
+    /// exact truth. We feed that WCS, run `detect_fast`, and count how many
+    /// catalog stars land on a detection. High match rate ⇒ detection +
+    /// catalog + projection are sound and the solve failure is in quad
+    /// matching; low rate ⇒ detection itself is the problem.
+    #[test]
+    #[ignore = "needs the bench frames + smac_gaia cache"]
+    fn diag_truth_wcs_match() {
+        use astroimage::ImageAnalyzer;
+        use crate::wcs::WcsSolution;
+        let bench = std::path::Path::new(
+            "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench",
+        );
+        let smac = std::path::Path::new(
+            "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia",
+        );
+        if !bench.is_dir() || !smac.is_dir() {
+            eprintln!("SKIP diag_truth_wcs_match: bench dir or smac_gaia missing");
+            return;
+        }
+        let cache = StarCache::open(smac).expect("open smac_gaia");
+        let obs_epoch = 2024.04_f64;
+
+        // (frame, fits_w, fits_h, crpix0-based, crval, cd) — from the headers.
+        let frames: &[(&str, usize, usize, (f64, f64), (f64, f64), [[f64; 2]; 2])] = &[
+            (
+                "3_18_r_01_P.fit", 2048, 4096,
+                (2099.644956806 - 1.0, -4523.280419991 - 1.0),
+                (316.600291408, -15.825524027),
+                [[-0.000138124, 0.000000075], [0.000000165, 0.000137879]],
+            ),
+            (
+                "1_18_r_1_P.fit", 2048, 4096,
+                (2104.296678372 - 1.0, -4522.428795921 - 1.0),
+                (234.420401254, -34.142040255),
+                [[-0.000138077, 0.000000212], [0.000000279, 0.000137855]],
+            ),
+        ];
+
+        for &(name, fw, fh, crpix, crval, cd) in frames {
+            let path = bench.join(name);
+            if !path.exists() {
+                eprintln!("SKIP {name}: not found");
+                continue;
+            }
+            let wcs = WcsSolution { crpix, crval, cd, sip_forward: None, sip_reverse: None };
+            let (fc_ra, fc_dec) =
+                wcs.pixel_to_sky((fw as f64 - 1.0) / 2.0, (fh as f64 - 1.0) / 2.0);
+
+            let result = ImageAnalyzer::new()
+                .with_detection_sigma(5.0)
+                .with_max_stars(600)
+                .with_saturation_fraction(1.0)
+                .detect_fast(&path)
+                .expect("detect_fast");
+            let sx = fw as f64 / result.width as f64;
+            let sy = fh as f64 / result.height as f64;
+
+            let cat = cache
+                .cone(fc_ra, fc_dec, 0.5, 16.0, obs_epoch)
+                .expect("cone query");
+            let in_frame: Vec<(f64, f64, f32)> = cat
+                .iter()
+                .filter_map(|s| {
+                    let (px, py) = wcs.sky_to_pixel(s.ra, s.dec);
+                    if px >= 0.0 && px < fw as f64 && py >= 0.0 && py < fh as f64 {
+                        Some((px, py, s.mag))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let nearest_det = |px: f64, py: f64| -> f64 {
+                result
+                    .stars
+                    .iter()
+                    .map(|s| {
+                        ((s.x as f64 * sx - px).powi(2) + (s.y as f64 * sy - py).powi(2)).sqrt()
+                    })
+                    .fold(f64::INFINITY, f64::min)
+            };
+            let tol = 3.0_f64;
+
+            eprintln!("=== {name}  true field centre ({fc_ra:.4}, {fc_dec:.4}) ===");
+            eprintln!(
+                "  detect_fast: {} detections (grid {}x{}, fits-scale {sx:.3}x{sy:.3})",
+                result.stars.len(),
+                result.width,
+                result.height
+            );
+            eprintln!(
+                "  catalog: {} in cone, {} project in-frame",
+                cat.len(),
+                in_frame.len()
+            );
+            for &mlim in &[12.0_f32, 14.0, 16.0] {
+                let tier: Vec<&(f64, f64, f32)> =
+                    in_frame.iter().filter(|&&(_, _, m)| m <= mlim).collect();
+                let matched = tier
+                    .iter()
+                    .filter(|&&&(px, py, _)| nearest_det(px, py) <= tol)
+                    .count();
+                let pct = if tier.is_empty() {
+                    0.0
+                } else {
+                    matched as f64 / tier.len() as f64 * 100.0
+                };
+                eprintln!(
+                    "  mag<={mlim:>4.0}: {matched:>4}/{:>4} catalog stars have a detection within {tol}px  ({pct:.0}%)",
+                    tier.len()
+                );
+            }
+            // Reverse: how many of the brightest 100 detections sit on a catalog star?
+            let nearest_cat = |px: f64, py: f64| -> f64 {
+                in_frame
+                    .iter()
+                    .map(|&(cx, cy, _)| ((cx - px).powi(2) + (cy - py).powi(2)).sqrt())
+                    .fold(f64::INFINITY, f64::min)
+            };
+            let mut by_flux = result.stars.clone();
+            by_flux.sort_unstable_by(|a, b| {
+                b.flux.partial_cmp(&a.flux).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let n_top = by_flux.len().min(100);
+            let pure = by_flux
+                .iter()
+                .take(n_top)
+                .filter(|s| nearest_cat(s.x as f64 * sx, s.y as f64 * sy) <= tol)
+                .count();
+            eprintln!(
+                "  purity: {pure}/{n_top} brightest detections sit on a catalog star"
+            );
+        }
+    }
+
     // ── Brute-force pixel-search fallback ─────────────────────────────────
     //
     // Last-resort path used when cdshealpix `cone_coverage_approx` panics
@@ -1515,6 +1657,33 @@ mod tests {
     // the field for a frame at RA≈315° Dec≈-23°). The fallback must
     // (a) return a non-empty set covering the query, and (b) be a
     // superset of `cone_coverage_approx` so consumers don't miss pixels.
+
+    /// Regression test for cds-healpix-rust issue #21: `cone_coverage_approx`
+    /// panicked (`assertion failed: … lat_abs …`) for cones reaching the
+    /// equatorial/polar HEALPix boundary. Fixed in cdshealpix 0.9.x. These
+    /// are the exact coordinates from the field-observed panic flood on
+    /// `3_18_r_01_P.fit` (dec ≈ −23°). With 0.9.1 the call must return
+    /// normally — if cdshealpix is ever downgraded this test panics.
+    #[test]
+    fn cdshealpix_no_panic_on_known_bad_cones() {
+        let cases = [
+            (314.986673_f64, -23.239028_f64, 0.370675_f64),
+            (321.441148, -23.239028, 0.370675),
+            (314.183208, -23.053690, 0.556013),
+        ];
+        for (ra, dec, r) in cases {
+            let bmoc = nested::cone_coverage_approx(
+                HEALPIX_DEPTH,
+                ra.to_radians(),
+                dec.to_radians(),
+                r.to_radians(),
+            );
+            assert!(
+                bmoc.flat_iter().count() > 0,
+                "cone ({ra},{dec},r={r}) should cover ≥1 pixel"
+            );
+        }
+    }
 
     #[test]
     fn bruteforce_returns_pixels_for_known_panic_region() {
