@@ -1,19 +1,18 @@
 //! solvemyastro CLI — standalone plate solver.
 //!
-//! Plain `std::env::args` parsing (project convention — no clap). Phase 0:
-//! subcommands parse and dispatch into the (stubbed) lib so the interface
-//! is fixed; bodies land with their lib phases.
+//! Plain `std::env::args` parsing (project convention — no clap).
 //!
 //! Usage:
 //!   solvemyastro solve <image> --catalog <dir> [--ra <d> --dec <d>]
 //!                [--fov <d> | --scale <as/px>] [--radius <d>] [--json]
-//!   solvemyastro build-cache --from <src-dir> --out <cache-dir>
+//!   solvemyastro build-cache --from <legacy-dir> --out <cache-dir> [--epoch <year>]
 //!   solvemyastro cache-info <cache-dir>
 
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 
+use solvemyastro::cache::{build_cache_from_legacy_dir, BuildProgress};
 use solvemyastro::{solve, SolveConfig, SolveHints, StarCache};
 
 fn opt(args: &[String], flag: &str) -> Option<String> {
@@ -66,18 +65,48 @@ fn main() -> Result<()> {
         }
         "build-cache" => {
             let from = opt(rest, "--from")
-                .ok_or_else(|| anyhow::anyhow!("--from <src-dir> is required"))?;
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("--from <legacy-dir> is required"))?;
             let out = opt(rest, "--out")
+                .map(PathBuf::from)
                 .ok_or_else(|| anyhow::anyhow!("--out <cache-dir> is required"))?;
-            bail!("build-cache not implemented yet (plan Phase 1): {from} -> {out}")
+            // Julian year of the catalog positions. Gaia DR3 = 2016.0.
+            let epoch = opt_f64(rest, "--epoch").unwrap_or(2016.0);
+            std::fs::create_dir_all(&out)
+                .map_err(|e| anyhow::anyhow!("create --out {}: {e}", out.display()))?;
+            eprintln!(
+                "build-cache: {} -> {} (epoch J{epoch})",
+                from.display(),
+                out.display()
+            );
+            let total = build_cache_from_legacy_dir(&from, &out, epoch, |p| match p {
+                BuildProgress::Ingesting { records } => {
+                    eprintln!("  ingesting … {records} records");
+                }
+                BuildProgress::Finalizing { shards_done, shards_total } => {
+                    eprintln!("  finalizing {shards_done}/{shards_total} shards");
+                }
+                BuildProgress::Complete { records } => {
+                    eprintln!("  done — {records} records");
+                }
+            })?;
+            println!(
+                "build-cache: wrote {total} stars to {}",
+                out.join("stars.smac").display()
+            );
+            Ok(())
         }
         "cache-info" => {
             let dir = rest
                 .first()
+                .filter(|a| !a.starts_with("--"))
                 .map(PathBuf::from)
                 .ok_or_else(|| anyhow::anyhow!("usage: solvemyastro cache-info <cache-dir>"))?;
-            let _ = StarCache::open(&dir)?;
-            bail!("cache-info not implemented yet (plan Phase 1)")
+            let cache = StarCache::open(&dir)?;
+            println!("cache-info: {}", dir.display());
+            println!("  stars:         {}", cache.star_count());
+            println!("  catalog epoch: J{}", cache.catalog_epoch());
+            Ok(())
         }
         "" | "-h" | "--help" => {
             println!(

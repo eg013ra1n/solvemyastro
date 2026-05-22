@@ -171,13 +171,11 @@ impl StarCache {
     }
 
     /// Number of stars in the cache.
-    #[allow(dead_code)]
     pub fn star_count(&self) -> u64 {
         self.star_count
     }
 
     /// Catalog epoch (Julian year, e.g. 2016.0 for Gaia DR3).
-    #[allow(dead_code)]
     pub fn catalog_epoch(&self) -> f64 {
         self.catalog_epoch
     }
