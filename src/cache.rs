@@ -1551,6 +1551,12 @@ mod tests {
                 (234.420401254, -34.142040255),
                 [[-0.000138077, 0.000000212], [0.000000279, 0.000137855]],
             ),
+            (
+                "2_18_r_1_P.fit", 2048, 4096,
+                (2109.900114368 - 1.0, -4522.937352613 - 1.0),
+                (345.848529613, -4.164077306),
+                [[-0.000138136, -0.000000050], [0.000000087, 0.000137891]],
+            ),
         ];
 
         for &(name, fw, fh, crpix, crval, cd) in frames {
@@ -1646,6 +1652,35 @@ mod tests {
                 .count();
             eprintln!(
                 "  purity: {pure}/{n_top} brightest detections sit on a catalog star"
+            );
+            // Characterise the non-catalog bright detections: peak/flux
+            // discriminates sharp junk (cosmic ray / hot pixel ≈ 0.5–1.0)
+            // from real point sources (≈ 0.05–0.3) and extended sources
+            // (galaxies, low).
+            let mut pf_cat: Vec<f64> = Vec::new();
+            let mut pf_non: Vec<f64> = Vec::new();
+            for s in by_flux.iter().take(n_top) {
+                let pf = if s.flux > 0.0 { s.peak as f64 / s.flux as f64 } else { -1.0 };
+                if nearest_cat(s.x as f64 * sx, s.y as f64 * sy) <= tol {
+                    pf_cat.push(pf);
+                } else {
+                    pf_non.push(pf);
+                }
+            }
+            let med = |v: &mut Vec<f64>| -> f64 {
+                if v.is_empty() {
+                    return f64::NAN;
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                v[v.len() / 2]
+            };
+            let sharp_non = pf_non.iter().filter(|&&p| p > 0.40).count();
+            eprintln!(
+                "  peak/flux median — catalog={:.3}  non-catalog={:.3}  | \
+                 non-catalog with peak/flux>0.40 (sharp): {sharp_non}/{}",
+                med(&mut pf_cat),
+                med(&mut pf_non),
+                pf_non.len(),
             );
         }
     }
