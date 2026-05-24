@@ -14,7 +14,7 @@ fn main() {
     let cfg = solvemyastro::SolveConfig::default();
     let path = std::path::Path::new("/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench/Light_Pane 4_300.0s_Bin1_O_gain111_20211011-024956_-10.0C_0002_c_lps_r.xisf");
 
-    match solvemyastro::solve(path, &hints, &cache, &cfg, None) {
+    match solvemyastro::solve(path, &hints, &solvemyastro::Caches::deep_only(&cache), &cfg, None) {
         Ok(sol) => println!("SOLVED: RA={:.4} Dec={:.4} scale={:.3}\"/px inliers={}", 
             sol.wcs.crval.0, sol.wcs.crval.1, sol.pixel_scale_arcsec, sol.matched_stars),
         Err(e) => println!("FAILED: {e}"),

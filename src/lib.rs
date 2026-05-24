@@ -29,6 +29,44 @@ pub mod wcs_fit;
 pub use cache::{PixelCache, StarCache, StarRecord};
 pub use wcs::{SipCoefficients, WcsSolution};
 
+/// Bundle of star caches passed to [`solve`]. Always carries a `deep`
+/// catalog (G<19 Gaia, full depth — needed by the verify stage so the
+/// Bayesian log-odds gate has correct `NR = catalog stars in FOV`).
+/// Optionally carries a `bright` sub-catalog (hybrid floor + density
+/// top-up) used only for the per-cell quad-matching cone — faster
+/// per-pixel decode + smaller working set, with automatic fallback to
+/// the deep cache when a cone returns fewer than
+/// [`SolveConfig::bright_fallback_threshold`] stars.
+///
+/// Construct with [`Caches::deep_only`] (current single-cache behaviour)
+/// or [`Caches::tiered`] (bright + deep). Both variants are byte-cheap
+/// (just two references).
+#[derive(Clone, Copy)]
+pub struct Caches<'a> {
+    /// Deep catalog (Gaia G<19). Used for: verify-stage inlier counting,
+    /// quad matching when no `bright` is configured OR when the bright
+    /// cone is too sparse.
+    pub deep: &'a StarCache,
+    /// Optional bright sub-catalog (hybrid floor + density top-up).
+    /// When present, quad matching tries this first and falls back to
+    /// `deep` only when the bright cone has < threshold stars.
+    pub bright: Option<&'a StarCache>,
+}
+
+impl<'a> Caches<'a> {
+    /// Single-cache mode — quad matching and verify both use `deep`.
+    /// Byte-identical to pre-bright-cache behaviour.
+    pub fn deep_only(deep: &'a StarCache) -> Self {
+        Self { deep, bright: None }
+    }
+
+    /// Tiered mode — quad matching tries `bright` first, falls back to
+    /// `deep` on under-population. Verify always uses `deep`.
+    pub fn tiered(deep: &'a StarCache, bright: &'a StarCache) -> Self {
+        Self { deep, bright: Some(bright) }
+    }
+}
+
 /// A catalog star with epoch-corrected sky position.
 #[derive(Clone, Copy, Debug)]
 pub struct CatalogStar {
@@ -83,6 +121,14 @@ pub struct SolveConfig {
     /// of catalog stars in FOV that have no matching detection). Default
     /// `0.25`. See [`crate::verify::DEFAULT_DISTRACTOR_FRACTION`].
     pub distractor_fraction: f64,
+    /// Minimum bright-cache cone stars before the quad-matching path
+    /// falls back to the deep cache for the same cone. Only honoured
+    /// when [`Caches::bright`] is `Some`. Default `30` — enough for
+    /// `minimum_quads = 3 + n/140` to clear with ~5-7 quads. Set to
+    /// `0` to never fall back (trust the bright cache absolutely);
+    /// set to `usize::MAX` to always fall back (effectively disabling
+    /// the bright path).
+    pub bright_fallback_threshold: usize,
 }
 
 impl Default for SolveConfig {
@@ -96,6 +142,7 @@ impl Default for SolveConfig {
             use_bayesian_verify: true,
             log_odds_threshold: verify::DEFAULT_LOG_ODDS_MIN,
             distractor_fraction: verify::DEFAULT_DISTRACTOR_FRACTION,
+            bright_fallback_threshold: 30,
         }
     }
 }
@@ -158,11 +205,11 @@ pub struct SolveSolution {
 pub fn solve(
     image: &Path,
     hints: &SolveHints,
-    cache: &StarCache,
+    caches: &Caches<'_>,
     cfg: &SolveConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SolveSolution> {
-    orchestrate::solve(image, hints, cache, cfg, cancel)
+    orchestrate::solve(image, hints, caches, cfg, cancel)
 }
 
 /// Future seam (NOT in scope for this plan): register a sub-frame's

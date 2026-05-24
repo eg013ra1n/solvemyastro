@@ -350,6 +350,52 @@ impl StarCache {
         Ok(results)
     }
 
+    /// Read the raw (un-PM-propagated) records of HEALPix-6 pixel `px`,
+    /// in their on-disk mag-sorted ascending order. Used by tooling that
+    /// rebuilds derived caches (the `build-bright-cache` CLI subcommand)
+    /// — those tools want the catalog-epoch positions + the original
+    /// `pmra`/`pmdec` so the rebuilt cache can be re-propagated to any
+    /// future observation epoch.
+    ///
+    /// Returns an empty vector for empty pixels. Pixel IDs are
+    /// 0..49152 (HEALPix nside=64 nested scheme).
+    ///
+    /// # Errors
+    ///
+    /// `Err` if the mmap slice is internally inconsistent or the pixel
+    /// directory entry points beyond the file.
+    pub fn iter_pixel_records(&self, px: u64) -> Result<Vec<StarRecord>> {
+        let (offset, count) = self.directory[px as usize];
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let byte_start = offset as usize;
+        let byte_end = byte_start + count as usize * RECORD_SIZE;
+        anyhow::ensure!(
+            byte_end <= self.mmap.len(),
+            "pixel {px} directory entry points beyond mmap ({byte_end} > {})",
+            self.mmap.len()
+        );
+        let slice = &self.mmap[byte_start..byte_end];
+        let mut cur = std::io::Cursor::new(slice);
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let rec_ra = cur.read_f64::<LittleEndian>().context("read rec ra")?;
+            let rec_dec = cur.read_f64::<LittleEndian>().context("read rec dec")?;
+            let rec_mag = cur.read_f32::<LittleEndian>().context("read rec mag")?;
+            let rec_pmra = cur.read_f32::<LittleEndian>().context("read rec pmra")? as f64;
+            let rec_pmdec = cur.read_f32::<LittleEndian>().context("read rec pmdec")? as f64;
+            out.push(StarRecord {
+                ra: rec_ra,
+                dec: rec_dec,
+                mag: rec_mag,
+                pmra_mas_yr: rec_pmra,
+                pmdec_mas_yr: rec_pmdec,
+            });
+        }
+        Ok(out)
+    }
+
     /// Decode + PM-propagate every record in pixel `px` to `epoch`.
     /// Internal helper used by [`Self::cone_cached`] on cache miss.
     fn read_pixel_propagated(&self, px: u64, epoch: f64) -> Result<Vec<PropagatedRecord>> {
@@ -910,6 +956,116 @@ mod tests {
         assert!(n > 0 || true, "build succeeded");
         let cache = StarCache::open(tmp.path()).expect("open");
         (cache, tmp)
+    }
+
+    // -----------------------------------------------------------------------
+    // 0. iter_pixel_records + hybrid-build algorithm correctness
+    // -----------------------------------------------------------------------
+
+    /// Build a deep cache, call `iter_pixel_records` for every pixel,
+    /// collect the union, then rebuild a second cache from the union.
+    /// The second cache's records (per-pixel) must equal the first's.
+    /// Verifies that `iter_pixel_records` returns raw records with the
+    /// PM components intact so a re-build round-trips without loss.
+    #[test]
+    fn iter_pixel_records_round_trip() {
+        // Seed with stars scattered across enough HEALPix-6 pixels that
+        // we exercise more than one cell. Use distinct mag values so any
+        // reordering is detectable.
+        let stars: Vec<StarRecord> = (0..50)
+            .map(|i| StarRecord {
+                ra: (i as f64) * 7.31 % 360.0,
+                dec: -45.0 + (i as f64) * 1.8,
+                mag: 4.0 + (i as f32) * 0.25,
+                pmra_mas_yr: (i as f64) * 0.7,
+                pmdec_mas_yr: -(i as f64) * 0.4,
+            })
+            .collect();
+        let (cache_a, _tmp_a) = build_and_open(stars, 2016.0);
+
+        let mut roundtripped: Vec<StarRecord> = Vec::new();
+        for px in 0..N_PIXELS as u64 {
+            roundtripped.extend(cache_a.iter_pixel_records(px).expect("iter"));
+        }
+        let (cache_b, _tmp_b) = build_and_open(roundtripped, 2016.0);
+
+        // Per-pixel equality: every non-empty pixel in A must equal the
+        // same pixel in B (ra/dec/mag/pmra/pmdec all preserved bit-wise).
+        for px in 0..N_PIXELS as u64 {
+            let a = cache_a.iter_pixel_records(px).expect("iter A");
+            let b = cache_b.iter_pixel_records(px).expect("iter B");
+            assert_eq!(a.len(), b.len(), "pixel {px} count differs");
+            for (ra_r, rb_r) in a.iter().zip(b.iter()) {
+                assert_eq!(ra_r.ra, rb_r.ra, "pixel {px} ra");
+                assert_eq!(ra_r.dec, rb_r.dec, "pixel {px} dec");
+                assert_eq!(ra_r.mag, rb_r.mag, "pixel {px} mag");
+                assert_eq!(ra_r.pmra_mas_yr, rb_r.pmra_mas_yr, "pixel {px} pmra");
+                assert_eq!(ra_r.pmdec_mas_yr, rb_r.pmdec_mas_yr, "pixel {px} pmdec");
+            }
+        }
+    }
+
+    /// Documents + verifies the hybrid bright-cache build algorithm
+    /// (floor: include all m < BRIGHT_FLOOR; top-up to TARGET_DENSITY).
+    /// Runs the algorithm against a synthetic single-pixel deep cache
+    /// to confirm both "dense cell — keep all bright" and "sparse cell —
+    /// top up with fainter" branches behave as documented in the plan.
+    #[test]
+    fn hybrid_build_preserves_floor_and_tops_up() {
+        const BRIGHT_FLOOR: f32 = 14.0;
+        const TARGET: usize = 100;
+
+        let hybrid_select = |records: &[StarRecord]| -> Vec<StarRecord> {
+            let floor: Vec<StarRecord> = records
+                .iter()
+                .take_while(|r| r.mag < BRIGHT_FLOOR)
+                .copied()
+                .collect();
+            if floor.len() >= TARGET {
+                floor
+            } else {
+                let mut s = floor;
+                let need = TARGET - s.len();
+                s.extend(records.iter().skip(s.len()).take(need).copied());
+                s
+            }
+        };
+
+        // Dense MW-plane-like cell: 200 stars uniformly at m=8..14 + 100 at m=14..17.
+        // Floor = 200 (all m<14) ≥ TARGET → keep all 200; no top-up.
+        let dense: Vec<StarRecord> = (0..300)
+            .map(|i| {
+                let mag = if i < 200 { 8.0 + (i as f32) * 6.0 / 200.0 }
+                          else { 14.0 + ((i - 200) as f32) * 3.0 / 100.0 };
+                StarRecord { ra: 180.0, dec: 0.0, mag, pmra_mas_yr: 0.0, pmdec_mas_yr: 0.0 }
+            })
+            .collect();
+        let dense_out = hybrid_select(&dense);
+        assert_eq!(dense_out.len(), 200, "dense cell keeps all m<14, no cap");
+        assert!(dense_out.iter().all(|r| r.mag < BRIGHT_FLOOR),
+                "dense output has only floor stars");
+
+        // Sparse polar-like cell: 30 stars at m=8..14 + 200 at m=14..17.
+        // Floor = 30 < TARGET → top up with brightest 70 from the m≥14 set.
+        let sparse: Vec<StarRecord> = (0..230)
+            .map(|i| {
+                let mag = if i < 30 { 8.0 + (i as f32) * 6.0 / 30.0 }
+                          else { 14.0 + ((i - 30) as f32) * 3.0 / 200.0 };
+                StarRecord { ra: 0.0, dec: 80.0, mag, pmra_mas_yr: 0.0, pmdec_mas_yr: 0.0 }
+            })
+            .collect();
+        let sparse_out = hybrid_select(&sparse);
+        assert_eq!(sparse_out.len(), TARGET,
+                "sparse cell tops up to TARGET");
+        let n_floor_in_sparse = sparse_out.iter().filter(|r| r.mag < BRIGHT_FLOOR).count();
+        assert_eq!(n_floor_in_sparse, 30,
+                "sparse output includes all 30 m<14 floor stars");
+        // The mag-ordered topup means stars 30..100 should be the 70
+        // brightest of the m>=14 tail (mag-sorted ascending).
+        for w in sparse_out.windows(2) {
+            assert!(w[0].mag <= w[1].mag,
+                "sparse output stays mag-sorted ascending");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2235,7 +2391,7 @@ mod tests {
         let blind = crate::solve(
             image,
             &SolveHints::default(),
-            &cache,
+            &crate::Caches::deep_only(&cache),
             &SolveConfig::default(),
             None,
         );
@@ -2252,7 +2408,7 @@ mod tests {
                 pixel_scale_arcsec: None,
                 search_radius_deg: Some(1.0),
             },
-            &cache,
+            &crate::Caches::deep_only(&cache),
             &SolveConfig::default(),
             None,
         );
@@ -2286,7 +2442,7 @@ mod tests {
         let blind = crate::solve(
             image,
             &SolveHints::default(),
-            &cache,
+            &crate::Caches::deep_only(&cache),
             &SolveConfig::default(),
             None,
         );
@@ -2304,7 +2460,7 @@ mod tests {
                 pixel_scale_arcsec: None,
                 search_radius_deg: Some(1.0),
             },
-            &cache,
+            &crate::Caches::deep_only(&cache),
             &SolveConfig::default(),
             None,
         );

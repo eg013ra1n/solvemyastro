@@ -27,6 +27,10 @@ use solvemyastro::{solve, SolveConfig, SolveHints, StarCache};
 const BENCH_DIR: &str =
     "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench";
 const SMAC_GAIA: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia";
+/// Optional bright sub-catalog path. If present, the bench uses
+/// `Caches::tiered(&deep, &bright)`; if absent, it falls back to
+/// `Caches::deep_only(&deep)` (byte-identical to the pre-bright bench).
+const SMAC_GAIA_BRIGHT: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia_bright";
 
 /// Key: distinctive filename substring; value: (ra_deg, dec_deg, scale_arcsec_per_px)
 fn cached_truth() -> &'static [(&'static str, f64, f64, f64)] {
@@ -328,6 +332,28 @@ fn corpus_bench() {
     }
 
     let cache = StarCache::open(smac_path).expect("open smac_gaia cache");
+
+    // Optional bright sub-catalog. Present → use tiered caches (bright
+    // for quad matching, deep for verify, auto-fallback). Absent → byte-
+    // identical to the pre-bright path. Either way the gate is the same.
+    let bright_path = Path::new(SMAC_GAIA_BRIGHT);
+    let bright_cache: Option<StarCache> = if bright_path.is_dir() {
+        match StarCache::open(bright_path) {
+            Ok(c) => {
+                println!("corpus_bench: using BRIGHT sub-catalog at {} ({} stars)",
+                    bright_path.display(), c.star_count());
+                Some(c)
+            }
+            Err(e) => {
+                println!("corpus_bench: failed to open bright cache ({e}), using deep-only");
+                None
+            }
+        }
+    } else {
+        println!("corpus_bench: no bright sub-catalog at {} — using deep-only", bright_path.display());
+        None
+    };
+
     let cfg = SolveConfig {
         // Phase 1 instrumentation: print per-stage timing for each frame so we
         // can validate where wall-clock actually goes before committing to the
@@ -424,7 +450,11 @@ fn corpus_bench() {
 
         // Run solver with panic protection.
         let solve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            solve(path, &hints, &cache, &cfg, None)
+            let caches = match &bright_cache {
+                Some(b) => solvemyastro::Caches::tiered(&cache, b),
+                None    => solvemyastro::Caches::deep_only(&cache),
+            };
+            solve(path, &hints, &caches, &cfg, None)
         }));
 
         let elapsed_ms = t0.elapsed().as_millis() as u64;

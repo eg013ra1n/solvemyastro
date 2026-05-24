@@ -224,6 +224,41 @@ fn minimum_quads(n: usize) -> usize {
     (3 + n / 140).max(3)
 }
 
+/// Catalog cone for the quad-matching pass with bright-cache auto-fallback.
+///
+/// When a bright sub-catalog is configured (`bright_cache.is_some()`), try
+/// it first — it's smaller (hybrid floor+top-up per HEALPix cell) so the
+/// per-pixel decode + PM-propagation in `PixelCache` is much faster. If
+/// the bright cone returns fewer than `fallback_threshold` stars (rare
+/// with the hybrid build — only HEALPix singular caps or other boundary
+/// degeneracies), retry the same cone against the deep catalog and use
+/// that. Either way returns one set, not a union.
+///
+/// When `bright_cache` is `None`, this is byte-identical to a direct
+/// `cache.cone_cached(...)` call.
+#[allow(clippy::too_many_arguments)]
+fn cone_for_quad_match(
+    deep_cache: &StarCache,
+    deep_pc: &PixelCache,
+    bright_cache: Option<&StarCache>,
+    bright_pc: Option<&PixelCache>,
+    ra: f64,
+    dec: f64,
+    radius_deg: f64,
+    mag_limit: f32,
+    obs_epoch: f64,
+    fallback_threshold: usize,
+) -> Result<Vec<CatalogStar>> {
+    if let (Some(bc), Some(bpc)) = (bright_cache, bright_pc) {
+        let bright_stars = bc.cone_cached(bpc, ra, dec, radius_deg, mag_limit, obs_epoch)?;
+        if bright_stars.len() >= fallback_threshold {
+            return Ok(bright_stars);
+        }
+        // Bright cone too sparse — fall back to the deep cache.
+    }
+    deep_cache.cone_cached(deep_pc, ra, dec, radius_deg, mag_limit, obs_epoch)
+}
+
 // ---------------------------------------------------------------------------
 // Per-cell trial result
 // ---------------------------------------------------------------------------
@@ -530,10 +565,13 @@ fn required_inliers(expected_bright_in_fov: usize, n_detected: usize) -> usize {
 pub fn solve(
     image: &Path,
     hints: &SolveHints,
-    cache: &StarCache,
+    caches: &crate::Caches<'_>,
     cfg: &SolveConfig,
     cancel: Option<&AtomicBool>,
 ) -> Result<SolveSolution> {
+    // The deep cache is the only one used by every stage; the optional
+    // bright cache is consulted for quad matching with auto-fallback.
+    let cache = caches.deep;
     let t0 = Instant::now();
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
@@ -599,6 +637,12 @@ pub fn solve(
     //    fallback, so it cannot regress them.
     let timing = TimingProfile::default();
     let pixel_cache = PixelCache::new(obs_epoch);
+    // Bright cache mirrors the deep cache's per-solve PixelCache pattern
+    // — separate instance because each `cone_cached` call is bound to one
+    // PixelCache instance + epoch. Only constructed when a bright cache
+    // is provided; else `None` and the fallback path is never taken.
+    let bright_pixel_cache: Option<PixelCache> =
+        caches.bright.map(|_| PixelCache::new(obs_epoch));
     let frame_name = image
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -632,6 +676,8 @@ pub fn solve(
         search_radius,
         cache,
         pixel_cache: &pixel_cache,
+        bright_cache: caches.bright,
+        bright_pixel_cache: bright_pixel_cache.as_ref(),
         cfg,
         obs_epoch,
         t0,
@@ -726,6 +772,12 @@ struct SearchCtx<'a> {
     /// trial workers. Created once in `solve()`; reused for every cone
     /// query (primary and verify passes alike).
     pixel_cache: &'a PixelCache,
+    /// Optional bright sub-catalog for the quad-matching cone fast path.
+    /// `Some` when `Caches::tiered(..)` was passed to `solve()`.
+    bright_cache: Option<&'a StarCache>,
+    /// Per-solve PM-propagated pixel cache for the bright sub-catalog
+    /// (mirror of `pixel_cache`). `Some` iff `bright_cache.is_some()`.
+    bright_pixel_cache: Option<&'a PixelCache>,
     cfg: &'a SolveConfig,
     obs_epoch: f64,
     t0: Instant,
@@ -765,6 +817,8 @@ fn run_search(
         search_radius,
         cache,
         pixel_cache,
+        bright_cache,
+        bright_pixel_cache,
         cfg,
         obs_epoch,
         t0,
@@ -827,7 +881,13 @@ fn run_search(
                     }
                     let mut ct = CellTrace { ra: cell.0, dec: cell.1, ..Default::default() };
                     let t_cone = Instant::now();
-                    let stars = match cache.cone_cached(pixel_cache, cell.0, cell.1, cone_radius, cfg.catalog_mag_limit, obs_epoch) {
+                    let stars = match cone_for_quad_match(
+                        cache, pixel_cache,
+                        bright_cache, bright_pixel_cache,
+                        cell.0, cell.1, cone_radius,
+                        cfg.catalog_mag_limit, obs_epoch,
+                        cfg.bright_fallback_threshold,
+                    ) {
                         Ok(s) => s,
                         Err(_) => {
                             ct.stop = CellStop::ConeTooSparse;
