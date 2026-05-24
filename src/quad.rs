@@ -213,7 +213,19 @@ pub fn build_quads(points: &[(f64, f64)], n: usize, group_size: usize) -> Vec<Qu
 ///
 /// Returns matched `(image_quad_index, catalog_quad_index)` pairs.
 pub fn match_quads(image: &[Quad], catalog: &[Quad], tol: f64) -> Vec<(usize, usize)> {
-    let mut raw: Vec<(usize, usize, f64)> = Vec::new(); // (img_i, cat_j, scale_ratio)
+    match_quads_stats(image, catalog, tol).0
+}
+
+/// Diagnostic variant of [`match_quads`]. Returns `(matches, raw_count)`
+/// where `raw_count` is the number of ratio-matched pairs BEFORE the
+/// median-scale-ratio outlier filter. The trace uses the gap between
+/// `raw_count` and `matches.len()` to spot pathological filter behaviour.
+pub fn match_quads_stats(
+    image: &[Quad],
+    catalog: &[Quad],
+    tol: f64,
+) -> (Vec<(usize, usize)>, usize) {
+    let mut raw: Vec<(usize, usize, f64)> = Vec::new();
 
     for (ii, iq) in image.iter().enumerate() {
         for (ci, cq) in catalog.iter().enumerate() {
@@ -231,26 +243,24 @@ pub fn match_quads(image: &[Quad], catalog: &[Quad], tol: f64) -> Vec<(usize, us
         }
     }
 
+    let raw_count = raw.len();
     if raw.len() < 3 {
-        return raw.into_iter().map(|(i, j, _)| (i, j)).collect();
+        return (raw.into_iter().map(|(i, j, _)| (i, j)).collect(), raw_count);
     }
 
-    // Median of scale ratios.
     let mut ratios: Vec<f64> = raw.iter().map(|&(_, _, r)| r).collect();
-    // Scale ratios are catalog_longest / image_longest; both positive finite,
-    // ratio finite. Defensive cmp so a degenerate quad cannot panic.
     ratios.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = ratios[ratios.len() / 2];
 
-    // Outlier reject: |ratio − median| > 0.2 * |median| → drop.
-    // Guard against median ≈ 0 (degenerate catalog quads).
     if median.abs() < 1e-15 {
-        return raw.into_iter().map(|(i, j, _)| (i, j)).collect();
+        return (raw.into_iter().map(|(i, j, _)| (i, j)).collect(), raw_count);
     }
-    raw.into_iter()
+    let filtered: Vec<(usize, usize)> = raw
+        .into_iter()
         .filter(|&(_, _, r)| (r - median).abs() <= 0.2 * median)
         .map(|(i, j, _)| (i, j))
-        .collect()
+        .collect();
+    (filtered, raw_count)
 }
 
 /// Fit a 6-parameter affine from matched quad-center correspondences.

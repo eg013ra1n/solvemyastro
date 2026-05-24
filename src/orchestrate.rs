@@ -11,6 +11,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -70,9 +71,10 @@ impl TimingProfile {
 }
 
 use crate::{
+    diag::{CellStop, CellTrace, KnownTruth, PassTrace, RungTrace, SeedInfo, SolveTrace, TraceOutcome, VerifyTrace, known_truth_for},
     math::great_circle_deg,
     project::project_catalog,
-    quad::{build_quads, fit_affine, group_size_for, match_quads},
+    quad::{build_quads, fit_affine, group_size_for, match_quads_stats},
     select::select_fast_stars,
     wcs::WcsSolution,
     wcs_fit::affine_to_wcs,
@@ -245,6 +247,8 @@ fn run_trial(
     min_quads: usize,
     balance: bool,
     timing: &TimingProfile,
+    hint: Option<(f64, f64)>,
+    ct: &mut CellTrace,
 ) -> Option<TrialResult> {
     let (ra0, dec0) = cell;
 
@@ -280,6 +284,7 @@ fn run_trial(
         None => (image_quads, group_size, min_quads),
     };
     if iquads.len() < 3 {
+        ct.stop = CellStop::CatQuadsEmpty; // image side; rare, reported under same bucket
         return None;
     }
 
@@ -287,23 +292,36 @@ fn run_trial(
     let projected = project_catalog(cat_stars, ra0, dec0);
     TimingProfile::add(&timing.project_ns, t_proj.elapsed());
     if projected.len() < 4 {
+        ct.stop = CellStop::ConeTooSparse;
         return None;
     }
     let t_bq = Instant::now();
     let cat_quads = build_quads(&projected, projected.len(), gs);
     TimingProfile::add(&timing.build_quads_cat_ns, t_bq.elapsed());
+    ct.cat_quads = cat_quads.len();
     if cat_quads.is_empty() {
+        ct.stop = CellStop::CatQuadsEmpty;
         return None;
     }
     let t_mq = Instant::now();
-    let matches = match_quads(iquads, &cat_quads, cfg.quad_tolerance);
+    let (matches, raw_match_count) =
+        match_quads_stats(iquads, &cat_quads, cfg.quad_tolerance);
     TimingProfile::add(&timing.match_quads_ns, t_mq.elapsed());
     timing.match_quads_calls.fetch_add(1, Ordering::Relaxed);
+    ct.match_raw = raw_match_count;
+    ct.match_filtered = matches.len();
     if matches.len() < mq {
+        ct.stop = CellStop::MatchBelowFloor;
         return None;
     }
     let t_fa = Instant::now();
-    let affine = fit_affine(&matches, iquads, &cat_quads)?;
+    let affine = match fit_affine(&matches, iquads, &cat_quads) {
+        Some(a) => a,
+        None => {
+            ct.stop = CellStop::AffineFailed;
+            return None;
+        }
+    };
     TimingProfile::add(&timing.fit_affine_ns, t_fa.elapsed());
     timing.fit_affine_calls.fetch_add(1, Ordering::Relaxed);
     let wcs = affine_to_wcs(&affine, image_center, (ra0, dec0));
@@ -311,9 +329,19 @@ fn run_trial(
     // Sanity: pixel scale must be in physical range (0.05"–120"/px).
     let scale = wcs.pixel_scale_arcsec();
     if !scale.is_finite() || scale < 0.05 || scale > 120.0 {
+        ct.stop = CellStop::ScaleSanityFailed;
         return None;
     }
 
+    let (seed_ra, seed_dec) = wcs.pixel_to_sky(image_center.0, image_center.1);
+    let dist_from_hint_deg = hint.map(|(hr, hd)| great_circle_deg(hr, hd, seed_ra, seed_dec));
+    ct.seed = Some(SeedInfo {
+        ra: seed_ra,
+        dec: seed_dec,
+        scale_arcsec_per_px: scale,
+        dist_from_hint_deg,
+    });
+    ct.stop = CellStop::SeedEmitted;
     Some(TrialResult { wcs, tangent: (ra0, dec0), scale_arcsec: scale })
 }
 
@@ -509,11 +537,19 @@ pub fn solve(
     let t0 = Instant::now();
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
-    // 1. Detect stars.
+    // 1. Detect stars. Phase 3: opt into the rustafits saturation gate by
+    //    setting `saturation_fraction = 0.92` (limit ≈ 60 292 ADU). Pixels
+    //    at/above the limit are excluded from the centroid sum inside
+    //    `adaptive_detection.rs::hfd_at` — fixing the biased-centroid
+    //    problem that prevented frame 0023 from solving (42% of its top-600
+    //    detections had saturated cores → biased centroids → every solver
+    //    trial got 0-13 inliers when 30 required). Peak/flux/SNR are
+    //    unchanged. Frames with few saturated detections (Pane 4/7, 0010
+    //    at 1-3% saturated) are essentially unaffected.
     let result = astroimage::ImageAnalyzer::new()
         .with_detection_sigma(5.0)
         .with_max_stars(600)
-        .with_saturation_fraction(1.0)
+        .with_saturation_fraction(0.92)
         .detect_fast(image)
         .map_err(|e| anyhow::anyhow!("detect_fast failed: {e}"))?;
 
@@ -576,6 +612,20 @@ pub fn solve(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let mut trace = SolveTrace {
+        frame: frame_name.clone(),
+        n_detected: total_detected,
+        n_selected: n,
+        snr_floor: 10.0,
+        n_image_quads: image_quads.len(),
+        group_size,
+        hint_center: center,
+        hint_radius_deg: search_radius,
+        passes: Vec::with_capacity(2),
+        outcome: TraceOutcome::Pending,
+        total_ms: 0,
+    };
+    let truth = known_truth_for(&frame_name);
     let ctx = SearchCtx {
         image_pts: &image_pts,
         image_quads: &image_quads,
@@ -596,12 +646,31 @@ pub fn solve(
         t0,
         cancel,
         timing: &timing,
+        truth,
     };
-    if let Some(sol) = run_search(&ctx, false)? {
-        if cfg.print_timing {
-            timing.print_summary(t0.elapsed(), &frame_name);
+    let mut primary_pass = PassTrace::new(false);
+    let primary_result = run_search(&ctx, false, &mut primary_pass);
+    trace.passes.push(primary_pass);
+    match primary_result {
+        Err(e) => {
+            trace.outcome = TraceOutcome::Failed(e.to_string());
+            trace.total_ms = t0.elapsed().as_millis() as u64;
+            eprintln!("{trace}");
+            return Err(e);
         }
-        return Ok(sol);
+        Ok(Some(sol)) => {
+            trace.outcome = TraceOutcome::Solved {
+                ra: sol.wcs.crval.0, dec: sol.wcs.crval.1,
+                inliers: sol.matched_stars, rms_px: sol.rms_residual_px,
+            };
+            trace.total_ms = t0.elapsed().as_millis() as u64;
+            if cfg.print_timing {
+                timing.print_summary(t0.elapsed(), &frame_name);
+            }
+            eprintln!("{trace}");
+            return Ok(sol);
+        }
+        Ok(None) => {}
     }
     if is_cancelled() {
         anyhow::bail!("cancelled");
@@ -610,20 +679,41 @@ pub fn solve(
         "[solvemyastro] primary search found nothing — \
          retrying with density-balanced quad pools"
     );
-    if let Some(sol) = run_search(&ctx, true)? {
-        if cfg.print_timing {
-            timing.print_summary(t0.elapsed(), &frame_name);
+    let mut fallback_pass = PassTrace::new(true);
+    let fallback_result = run_search(&ctx, true, &mut fallback_pass);
+    trace.passes.push(fallback_pass);
+    match fallback_result {
+        Err(e) => {
+            trace.outcome = TraceOutcome::Failed(e.to_string());
+            trace.total_ms = t0.elapsed().as_millis() as u64;
+            eprintln!("{trace}");
+            return Err(e);
         }
-        return Ok(sol);
+        Ok(Some(sol)) => {
+            trace.outcome = TraceOutcome::Solved {
+                ra: sol.wcs.crval.0, dec: sol.wcs.crval.1,
+                inliers: sol.matched_stars, rms_px: sol.rms_residual_px,
+            };
+            trace.total_ms = t0.elapsed().as_millis() as u64;
+            if cfg.print_timing {
+                timing.print_summary(t0.elapsed(), &frame_name);
+            }
+            eprintln!("{trace}");
+            return Ok(sol);
+        }
+        Ok(None) => {}
     }
     if cfg.print_timing {
         timing.print_summary(t0.elapsed(), &frame_name);
     }
-    anyhow::bail!(
-        "no trial passed verification across {} FOV rung(s) \
-         (incl. density-balanced retry)",
+    let msg = format!(
+        "no trial passed verification across {} FOV rung(s) (incl. density-balanced retry)",
         rungs.len()
-    )
+    );
+    trace.outcome = TraceOutcome::Failed(msg.clone());
+    trace.total_ms = t0.elapsed().as_millis() as u64;
+    eprintln!("{trace}");
+    anyhow::bail!(msg)
 }
 
 /// Bundled inputs for one search pass — avoids a 17-argument function.
@@ -650,6 +740,11 @@ struct SearchCtx<'a> {
     t0: Instant,
     cancel: Option<&'a AtomicBool>,
     timing: &'a TimingProfile,
+    /// Optional known-correct WCS for this frame; populated by `solve()` via
+    /// `known_truth_for(frame_name)`. Used only by the diagnostic trace to
+    /// answer "did any trial seed land near the true answer?" — never
+    /// influences solver decisions.
+    truth: Option<KnownTruth>,
 }
 
 /// One search pass over the autoFOV ladder × square spiral.
@@ -659,7 +754,11 @@ struct SearchCtx<'a> {
 /// true` is the fallback — each trial density-caps the image pool against
 /// its catalog cone (see `run_trial`). Returns `Ok(Some)` on a verified
 /// solve, `Ok(None)` if no trial passed any rung, `Err` on cancellation.
-fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
+fn run_search(
+    ctx: &SearchCtx,
+    balance: bool,
+    pass_trace: &mut PassTrace,
+) -> Result<Option<SolveSolution>> {
     let &SearchCtx {
         image_pts,
         image_quads,
@@ -680,21 +779,25 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
         t0,
         cancel,
         timing,
+        truth,
     } = ctx;
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
     // 5a. Spiral search — rayon-parallelised per rung.
-    for rung in rungs {
+    let total_rungs = rungs.len();
+    for (rung_idx, rung) in rungs.iter().enumerate() {
         if is_cancelled() {
             anyhow::bail!("cancelled");
         }
         let cells = spiral_cells(center, search_radius, rung.fov_deg);
         let cone_radius = (rung.fov_deg * CONE_OVERSIZE).min(89.0);
+        let mut rt = RungTrace::new(rung_idx + 1, total_rungs, rung.fov_deg, cells.len());
 
         // Early-exit flag: set once ANY trial passes verification (set below, not here).
         // We collect ALL trial results per rung so that false quad matches don't block
         // the correct cell — each candidate is verified in turn.
         let any_verified = AtomicBool::new(false);
+        let cells_mutex: Mutex<Vec<CellTrace>> = Mutex::new(Vec::with_capacity(cells.len()));
 
         // Collect trial results in parallel (rayon `par_iter` + filter_map).
         // No early-exit within the quad-match phase: all cells that produce a
@@ -707,13 +810,22 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                 {
                     return None; // Another thread verified, or cancelled.
                 }
+                let mut ct = CellTrace { ra: cell.0, dec: cell.1, ..Default::default() };
                 let t_cone = Instant::now();
-                let stars = cache
-                    .cone_cached(pixel_cache, cell.0, cell.1, cone_radius, cfg.catalog_mag_limit, obs_epoch)
-                    .ok()?;
+                let stars = match cache.cone_cached(pixel_cache, cell.0, cell.1, cone_radius, cfg.catalog_mag_limit, obs_epoch) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        ct.stop = CellStop::ConeTooSparse;
+                        cells_mutex.lock().unwrap().push(ct);
+                        return None;
+                    }
+                };
                 TimingProfile::add(&timing.cone_ns, t_cone.elapsed());
                 timing.cone_calls.fetch_add(1, Ordering::Relaxed);
+                ct.cat_raw = stars.len();
                 if stars.len() < 4 {
+                    ct.stop = CellStop::ConeTooSparse;
+                    cells_mutex.lock().unwrap().push(ct);
                     return None;
                 }
                 // ASTAP-style brightness-rank-aligned cap on the catalog quad
@@ -756,7 +868,8 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                 } else {
                     stars
                 };
-                run_trial(
+                ct.cat_after_cap = stars.len();
+                let trial = run_trial(
                     image_quads,
                     image_pts,
                     image_center,
@@ -767,11 +880,19 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                     min_quads,
                     balance,
                     timing,
-                )
+                    center,
+                    &mut ct,
+                );
+                cells_mutex.lock().unwrap().push(ct);
+                trial
             })
             .collect();
 
+        rt.cells = cells_mutex.into_inner().unwrap();
+        rt.candidates_emitted = results.len();
+
         if results.is_empty() {
+            pass_trace.rungs.push(rt);
             continue;
         }
 
@@ -790,13 +911,53 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
             let verify_radius = (image_fov_deg * 0.75).min(88.0);
 
             if !verify_radius.is_finite() || verify_radius <= 0.0 {
+                rt.verifies.push(VerifyTrace {
+                    seed_ra: 0.0, seed_dec: 0.0, scale_arcsec_per_px: seed_scale,
+                    cat_in_fov: 0, seed_inliers: 0, required: 0,
+                    seed_rms_px: 0.0,
+                    log_odds: f64::NEG_INFINITY,
+                    final_inliers: 0, final_rms_px: 0.0,
+                    dist_from_truth_deg: None, scale_ratio_to_truth: None,
+                    accepted: false,
+                    reject_reason: Some("verify_radius_invalid".into()),
+                });
                 continue 'candidates;
             }
 
             let (seed_ra, seed_dec) = trial.wcs.pixel_to_sky(image_center.0, image_center.1);
             if !seed_ra.is_finite() || !seed_dec.is_finite() {
+                rt.verifies.push(VerifyTrace {
+                    seed_ra: 0.0, seed_dec: 0.0, scale_arcsec_per_px: seed_scale,
+                    cat_in_fov: 0, seed_inliers: 0, required: 0,
+                    seed_rms_px: 0.0,
+                    log_odds: f64::NEG_INFINITY,
+                    final_inliers: 0, final_rms_px: 0.0,
+                    dist_from_truth_deg: None, scale_ratio_to_truth: None,
+                    accepted: false,
+                    reject_reason: Some("seed_ra_dec_nonfinite".into()),
+                });
                 continue 'candidates;
             }
+
+            // Truth comparison (diagnostic only): if we have a known-correct
+            // WCS for this frame, record per-trial distance + scale ratio so
+            // the funnel can show "did we find the right WCS and reject it?".
+            let (dist_from_truth_deg, scale_ratio_to_truth) = match truth {
+                Some(t) => (
+                    Some(great_circle_deg(t.ra, t.dec, seed_ra, seed_dec)),
+                    Some(seed_scale / t.scale_arcsec_per_px),
+                ),
+                None => (None, None),
+            };
+            let mut v = VerifyTrace {
+                seed_ra, seed_dec, scale_arcsec_per_px: seed_scale,
+                cat_in_fov: 0, seed_inliers: 0, required: 0,
+                seed_rms_px: 0.0,
+                log_odds: f64::NEG_INFINITY,
+                final_inliers: 0, final_rms_px: 0.0,
+                dist_from_truth_deg, scale_ratio_to_truth,
+                accepted: false, reject_reason: None,
+            };
 
             // Verification uses bright stars to keep the expected-count denominator sensible.
             // For sparse narrow-FOV fields, step up the mag limit until we have enough
@@ -834,13 +995,16 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                 let _ = hit_floor;
                 stars
             };
+            v.cat_in_fov = verify_stars.len();
             if verify_stars.len() < 4 {
+                v.reject_reason = Some("verify_cone_too_sparse".into());
+                rt.verifies.push(v);
                 continue 'candidates;
             }
 
             let tol_px = adaptive_tol_px(seed_scale, BASE_MATCH_ARCSEC);
             let t_ci = Instant::now();
-            let (seed_inliers, _seed_rss, seed_pairs) = count_inliers(
+            let (seed_inliers, seed_rss, seed_pairs) = count_inliers(
                 &trial.wcs,
                 &verify_stars,
                 &image_pts,
@@ -851,13 +1015,53 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
             TimingProfile::add(&timing.count_inliers_ns, t_ci.elapsed());
             timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
 
+            v.seed_inliers = seed_inliers;
+            v.seed_rms_px = if seed_inliers > 0 {
+                (seed_rss / seed_inliers as f64).sqrt()
+            } else {
+                0.0
+            };
+            rt.best_inliers_seen = rt.best_inliers_seen.max(seed_inliers);
             let required = required_inliers(verify_stars.len(), image_pts.len());
-            if seed_inliers < required {
-                eprintln!(
-                    "[solvemyastro] trial rejected: {seed_inliers} inliers < {required} required \
-                     (expected={} stars in FOV)",
-                    verify_stars.len()
+            v.required = required;
+
+            // Verification gate: Bayesian log-odds (astrometry.net style) by
+            // default; legacy 5%-of-FOV-inlier floor available behind
+            // `use_bayesian_verify=false` for emergency revert.
+            let gate_decision = if cfg.use_bayesian_verify {
+                let inlier_distances: Vec<f64> = seed_pairs.iter()
+                    .map(|&((px, py), (dx, dy))| ((px - dx).powi(2) + (py - dy).powi(2)).sqrt())
+                    .collect();
+                let area_px2 = width * height;
+                let lo = crate::verify::log_odds(
+                    &inlier_distances,
+                    tol_px,
+                    verify_stars.len(),
+                    area_px2,
+                    cfg.distractor_fraction,
                 );
+                v.log_odds = lo;
+                let gate_cfg = crate::verify::BayesianGateConfig {
+                    log_odds_threshold: cfg.log_odds_threshold,
+                    distractor: cfg.distractor_fraction,
+                    ..Default::default()
+                };
+                crate::verify::accept_bayesian(lo, seed_inliers, v.seed_rms_px, tol_px, &gate_cfg)
+            } else if seed_inliers < required {
+                crate::verify::AcceptanceDecision::Rejected(
+                    format!("seed_inliers {seed_inliers} < required {required} (legacy gate)"),
+                )
+            } else {
+                crate::verify::AcceptanceDecision::Accepted
+            };
+            if let crate::verify::AcceptanceDecision::Rejected(reason) = gate_decision {
+                eprintln!(
+                    "[solvemyastro] trial rejected: {reason} \
+                     (inliers={seed_inliers}/{required} log_odds={:.1} seed_rms={:.2}px cat_in_fov={})",
+                    v.log_odds, v.seed_rms_px, verify_stars.len(),
+                );
+                v.reject_reason = Some(reason);
+                rt.verifies.push(v);
                 continue 'candidates;
             }
 
@@ -912,6 +1116,9 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
             timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
 
             if final_inliers < MIN_ABSOLUTE_INLIERS {
+                v.final_inliers = final_inliers;
+                v.reject_reason = Some(format!("final_inliers {final_inliers} < MIN_ABSOLUTE_INLIERS {MIN_ABSOLUTE_INLIERS}"));
+                rt.verifies.push(v);
                 continue 'candidates;
             }
 
@@ -919,6 +1126,11 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
             let rms_px = if final_inliers > 0 { (final_rss / final_inliers as f64).sqrt() } else { 0.0 };
             let rms_arcsec = rms_px * final_scale;
             let inlier_ratio = final_inliers as f64 / verify_stars.len() as f64;
+
+            v.accepted = true;
+            v.final_inliers = final_inliers;
+            v.final_rms_px = rms_px;
+            rt.verifies.push(v);
 
             let (cra, cdec) = final_wcs.pixel_to_sky(image_center.0, image_center.1);
             eprintln!(
@@ -988,6 +1200,10 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
             // Mark verified so remaining parallel trials in this rung stop early.
             any_verified.store(true, Ordering::Relaxed);
 
+            // Successful return: snapshot this rung into pass_trace before
+            // exiting so the funnel includes the rung that ultimately solved.
+            pass_trace.rungs.push(rt);
+
             return Ok(Some(SolveSolution {
                 pixel_scale_arcsec: sip_wcs.pixel_scale_arcsec(),
                 field_rotation_deg: sip_wcs.field_rotation_deg(),
@@ -1002,6 +1218,8 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                 wcs: sip_wcs,
             }));
         } // end 'candidates loop
+        // No candidate solved this rung — snapshot it before moving on.
+        pass_trace.rungs.push(rt);
     } // end rung loop
 
     if is_cancelled() {

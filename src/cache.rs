@@ -2032,6 +2032,85 @@ mod tests {
         );
     }
 
+    /// Phase 3 pre-flight: dump `detect_fast` peak histograms for the
+    /// saturation-class frames (0023, Pane 4, Pane 7, 0010). The plan
+    /// requires confirming that ≥30% of 0023's detections sit at the
+    /// 16-bit ceiling before designing the saturated-core gate in
+    /// `adaptive_detection.rs::hfd_at`. If the histogram disconfirms
+    /// the hypothesis, the gate design changes (different threshold,
+    /// weighted-centroid only, etc.).
+    #[test]
+    #[ignore = "needs bench frames"]
+    fn diag_phase3_saturation_histogram() {
+        use astroimage::ImageAnalyzer;
+        let bench = std::path::Path::new(
+            "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench",
+        );
+        if !bench.is_dir() {
+            eprintln!("SKIP: bench dir missing");
+            return;
+        }
+        let frames: &[(&str, &str)] = &[
+            ("0010 (10 s, OSC, solves)",            "2026-04-09_01-33-58__-7.50_10.00s_26.15_0010.fits"),
+            ("0023 (120 s, OSC, FAILS)",            "2026-04-10_00-06-14__-15.00_120.00s_37.15_0023.fits"),
+            ("Pane 4 (XISF, narrowband, solves)",   "Light_Pane 4_300.0s_Bin1_O_gain111_20211011-024956_-10.0C_0002_c_lps_r.xisf"),
+            ("Pane 7 (XISF, narrowband, solves)",   "Light_Pane 7_300.0s_Bin1_O_gain111_20211014-045033_-10.0C_0002_c_lps_r.xisf"),
+        ];
+        eprintln!("\nPhase 3 pre-flight: detect_fast peak histograms\n");
+        eprintln!("Hypothesis: 0023 has ≥30% of detections at the 16-bit saturation ceiling (≥62000 ADU);");
+        eprintln!("            other frames have <10%. Confirming the saturated-core gate is the right fix.\n");
+        for &(label, fname) in frames {
+            let path = bench.join(fname);
+            if !path.exists() {
+                eprintln!("SKIP {label}: missing {}", path.display());
+                continue;
+            }
+            let result = ImageAnalyzer::new()
+                .with_detection_sigma(5.0)
+                .with_max_stars(600)
+                .with_saturation_fraction(1.0)
+                .detect_fast(&path)
+                .expect("detect_fast");
+            let n = result.stars.len();
+            // Bin by ADU range. The 16-bit unsigned ceiling is 65535;
+            // rustafits' adaptive detector reports `peak` as the
+            // background-subtracted peak, so saturation manifests as
+            // peak near 62-65k (sensor-dependent).
+            let bin_edges: [(&str, f32, f32); 6] = [
+                ("< 10000",     0.0,        10_000.0),
+                ("10000-30000", 10_000.0,   30_000.0),
+                ("30000-50000", 30_000.0,   50_000.0),
+                ("50000-60000", 50_000.0,   60_000.0),
+                ("60000-62000", 60_000.0,   62_000.0),
+                ("62000-65535", 62_000.0,   f32::INFINITY),
+            ];
+            let counts: Vec<usize> = bin_edges
+                .iter()
+                .map(|&(_, lo, hi)| {
+                    result.stars.iter().filter(|s| s.peak >= lo && s.peak < hi).count()
+                })
+                .collect();
+            let saturated_62k = counts[5];
+            let saturated_60k = counts[4] + counts[5];
+            let mut peaks: Vec<f32> = result.stars.iter().map(|s| s.peak).collect();
+            peaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let pct = |q: f64| peaks.get(((peaks.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or(0.0);
+
+            eprintln!("=== {label} ===");
+            eprintln!("  total detections: {n}");
+            eprintln!("  peak percentiles: p10={:.0}  p50={:.0}  p90={:.0}  p99={:.0}  max={:.0}",
+                pct(0.10), pct(0.50), pct(0.90), pct(0.99),
+                peaks.last().copied().unwrap_or(0.0));
+            for (i, (label, _, _)) in bin_edges.iter().enumerate() {
+                eprintln!("    peak {label:13}: {:>4}  ({:>3}%)", counts[i], counts[i] * 100 / n.max(1));
+            }
+            eprintln!("  → saturated (peak ≥ 62000): {saturated_62k}  ({}%)",
+                saturated_62k * 100 / n.max(1));
+            eprintln!("  → near-saturated (peak ≥ 60000): {saturated_60k}  ({}%)\n",
+                saturated_60k * 100 / n.max(1));
+        }
+    }
+
     // ── Brute-force pixel-search fallback ─────────────────────────────────
     //
     // Last-resort path used when cdshealpix `cone_coverage_approx` panics

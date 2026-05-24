@@ -15,12 +15,14 @@ use std::path::Path;
 use anyhow::Result;
 
 pub mod cache;
+pub mod diag;
 pub(crate) mod math;
 pub mod orchestrate;
 pub mod project;
 pub mod quad;
 pub mod select;
 pub mod sip;
+pub mod verify;
 pub mod wcs;
 pub mod wcs_fit;
 
@@ -69,6 +71,18 @@ pub struct SolveConfig {
     /// Set to `true` from `corpus_bench` and ad-hoc profiling to see where
     /// wall-clock actually goes.
     pub print_timing: bool,
+    /// Use the Bayesian log-odds verification gate (astrometry.net style).
+    /// Default `true`. When `false`, falls back to the legacy 5%-of-FOV
+    /// inlier floor (kept for emergency revert; documented to over-reject
+    /// valid solves in dense fields).
+    pub use_bayesian_verify: bool,
+    /// Bayesian log-odds acceptance threshold. Default `log(1e6) ≈ 13.8`.
+    /// See [`crate::verify::DEFAULT_LOG_ODDS_MIN`].
+    pub log_odds_threshold: f64,
+    /// Distractor fraction `D` for the Bayesian gate (expected proportion
+    /// of catalog stars in FOV that have no matching detection). Default
+    /// `0.25`. See [`crate::verify::DEFAULT_DISTRACTOR_FRACTION`].
+    pub distractor_fraction: f64,
 }
 
 impl Default for SolveConfig {
@@ -79,6 +93,9 @@ impl Default for SolveConfig {
             fit_sip: true,
             sip_order: 3,
             print_timing: false,
+            use_bayesian_verify: true,
+            log_odds_threshold: verify::DEFAULT_LOG_ODDS_MIN,
+            distractor_fraction: verify::DEFAULT_DISTRACTOR_FRACTION,
         }
     }
 }
