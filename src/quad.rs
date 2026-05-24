@@ -67,6 +67,17 @@ fn euclidean(a: (f64, f64), b: (f64, f64)) -> f64 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
 }
 
+/// Squared Euclidean distance — used in K-NN comparisons inside
+/// [`build_quads`] where ordering is all that matters and `sqrt` is dead
+/// weight. The actual sqrt is paid later in [`push_quad`] for the 6
+/// pairwise distances of the K-best 4-subsets only.
+#[inline]
+fn squared_distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let dx = a.0 - b.0;
+    let dy = a.1 - b.1;
+    dx * dx + dy * dy
+}
+
 /// Emit one quad from 4 star indices if not already seen.
 ///
 /// Deduplication is on the sorted star-index set (the canonical form;
@@ -157,32 +168,53 @@ pub fn build_quads(points: &[(f64, f64)], n: usize, group_size: usize) -> Vec<Qu
     let n_nbr = g - 1; // nearest neighbors to collect per star
     let mut quads: Vec<Quad> = Vec::with_capacity(n);
     let mut seen: HashSet<[usize; 4]> = HashSet::new();
-    let mut nbrs: Vec<(usize, f64)> = Vec::with_capacity(n.saturating_sub(1));
+
+    // Fixed-size K-best buffer (sorted ascending by d²). `n_nbr ≤ 5` since
+    // `g ≤ 6`. Slot value `(usize::MAX, INFINITY)` = "empty"; any finite d²
+    // is smaller and naturally fills the buffer on first encounters. After
+    // the buffer is warm, the cheap `d2 < worst_d2` reject skips ~all
+    // subsequent inserts (only K-best worth of points qualify), which is
+    // the actual speed win over the previous `Vec` + `select_nth_unstable`
+    // approach.
+    const MAX_K: usize = 5;
+    let mut k_best: [(usize, f64); MAX_K] = [(usize::MAX, f64::INFINITY); MAX_K];
 
     for i in 0..n {
-        nbrs.clear();
-        for j in 0..n {
-            if i != j {
-                nbrs.push((j, euclidean(points[i], points[j])));
-            }
+        // Reset the K-best buffer for this i.
+        for slot in k_best.iter_mut().take(n_nbr) {
+            *slot = (usize::MAX, f64::INFINITY);
         }
-        if nbrs.len() < n_nbr {
+        let pi = points[i];
+
+        for j in 0..n {
+            if i == j { continue; }
+            let d2 = squared_distance(pi, points[j]);
+            // Cheap reject — d² >= current worst means this point is not
+            // closer than the K-th nearest seen so far. Most points hit
+            // this branch once the buffer is warm.
+            if d2 >= k_best[n_nbr - 1].1 {
+                continue;
+            }
+            // Insertion-sort into k_best (sorted ascending by d²).
+            let mut pos = n_nbr - 1;
+            while pos > 0 && k_best[pos - 1].1 > d2 {
+                k_best[pos] = k_best[pos - 1];
+                pos -= 1;
+            }
+            k_best[pos] = (j, d2);
+        }
+
+        // Skip if we didn't find n_nbr neighbours (n < n_nbr + 1).
+        if k_best[n_nbr - 1].0 == usize::MAX {
             continue;
         }
 
-        // Partial-sort: bring the n_nbr smallest to the front, then stable-sort
-        // those so group membership is deterministic. Distances are finite by
-        // construction; defensive cmp so a stray NaN cannot panic the worker.
-        nbrs.select_nth_unstable_by(n_nbr - 1, |a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        nbrs.truncate(n_nbr);
-        nbrs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Build local group: star i + its n_nbr nearest.
+        // Build local group: star i + its n_nbr nearest (already sorted).
         let mut group = [0usize; 6]; // g ≤ 6 in practice
         let gsz = g.min(6);
         group[0] = i;
-        for (slot, &(idx, _)) in nbrs.iter().take(gsz - 1).enumerate() {
-            group[slot + 1] = idx;
+        for slot in 0..(gsz - 1) {
+            group[slot + 1] = k_best[slot].0;
         }
 
         // Emit every 4-subset of the group.
