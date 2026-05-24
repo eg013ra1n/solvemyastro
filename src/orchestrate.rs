@@ -537,19 +537,10 @@ pub fn solve(
     let t0 = Instant::now();
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
-    // 1. Detect stars. Phase 3: opt into the rustafits saturation gate by
-    //    setting `saturation_fraction = 0.92` (limit ≈ 60 292 ADU). Pixels
-    //    at/above the limit are excluded from the centroid sum inside
-    //    `adaptive_detection.rs::hfd_at` — fixing the biased-centroid
-    //    problem that prevented frame 0023 from solving (42% of its top-600
-    //    detections had saturated cores → biased centroids → every solver
-    //    trial got 0-13 inliers when 30 required). Peak/flux/SNR are
-    //    unchanged. Frames with few saturated detections (Pane 4/7, 0010
-    //    at 1-3% saturated) are essentially unaffected.
+    // 1. Detect stars.
     let result = astroimage::ImageAnalyzer::new()
         .with_detection_sigma(5.0)
         .with_max_stars(600)
-        .with_saturation_fraction(0.92)
         .detect_fast(image)
         .map_err(|e| anyhow::anyhow!("detect_fast failed: {e}"))?;
 
