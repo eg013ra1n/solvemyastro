@@ -58,7 +58,7 @@ pub struct SolveHints {
 pub struct SolveConfig {
     /// Continuous quad-ratio tolerance for quad matching.
     pub quad_tolerance: f64,
-    /// Catalog read magnitude ceiling (deep — covers Gaia G≤16).
+    /// Catalog read magnitude ceiling (covers the Gaia G<19 build).
     pub catalog_mag_limit: f32,
     /// Fit SIP distortion after the linear solve (precise WCS).
     pub fit_sip: bool,
@@ -70,7 +70,7 @@ impl Default for SolveConfig {
     fn default() -> Self {
         Self {
             quad_tolerance: 0.007,
-            catalog_mag_limit: 18.0,
+            catalog_mag_limit: 19.0,
             fit_sip: true,
             sip_order: 3,
         }

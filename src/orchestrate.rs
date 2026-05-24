@@ -625,11 +625,42 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                 if stars.len() < 4 {
                     return None;
                 }
-                // Cap deep set to avoid quad explosion, keeping brightest.
-                let stars = if stars.len() > MAX_CAT_STARS {
+                // ASTAP-style brightness-rank-aligned cap on the catalog quad
+                // pool. Without it, a deep catalog (e.g. Gaia G<19, ~1200
+                // stars per typical narrow-field cone) builds 6–10× more
+                // catalog quads than the image side does, and `match_quads`'
+                // median-scale-ratio outlier filter gets pulled toward the
+                // false-positive mode — true matches are then dropped as
+                // outliers and the affine fit returns garbage.
+                //
+                // Two-tier cap:
+                //
+                //   - **Primary pass** (`balance=false`): tight cap at
+                //     image depth (count-matched). Restores correct
+                //     matching for filtered/narrowband frames where the
+                //     image detects far fewer correspondences than the
+                //     deep catalog offers.
+                //   - **Fallback pass** (`balance=true`): loose cap at
+                //     `MAX_CAT_STARS`. For sparse fields (M51-class
+                //     narrowband, ~140 detections in a 30′ FOV) the tight
+                //     cap cuts too aggressively into the catalog and the
+                //     few true matches drop below the inlier floor; the
+                //     loose cap lets the existing image-side balance logic
+                //     (in `run_trial`) recover with a deeper catalog.
+                //
+                // Stars are mag-sorted (brightest first) before truncation
+                // so the surviving set is the bright-rank-aligned subset
+                // most likely to correspond to the image's bright
+                // detections, regardless of filter/band.
+                let pool_cap = if balance {
+                    MAX_CAT_STARS
+                } else {
+                    image_pts.len().min(MAX_CAT_STARS).max(50)
+                };
+                let stars = if stars.len() > pool_cap {
                     let mut s = stars;
                     s.sort_unstable_by(|a, b| a.mag.partial_cmp(&b.mag).unwrap_or(std::cmp::Ordering::Equal));
-                    s.truncate(MAX_CAT_STARS);
+                    s.truncate(pool_cap);
                     s
                 } else {
                     stars
