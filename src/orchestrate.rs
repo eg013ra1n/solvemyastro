@@ -10,11 +10,64 @@
 //! 7. Optional SIP fit (`sip.rs`).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::Result;
 use rayon::prelude::*;
+
+/// Per-stage timing accumulator for the solve pipeline. All fields are
+/// nanoseconds. Updated with `Relaxed` ordering from rayon workers; printed
+/// once at solve end when `SolveConfig::print_timing` is true.
+///
+/// Phase 1 instrumentation — the data drives the speed-fix targeting in
+/// Phase 3 (kd-tree on `match_quads` vs `count_inliers`).
+#[derive(Default, Debug)]
+pub(crate) struct TimingProfile {
+    pub cone_ns: AtomicU64,
+    pub cone_calls: AtomicU64,
+    pub project_ns: AtomicU64,
+    pub build_quads_cat_ns: AtomicU64,
+    pub match_quads_ns: AtomicU64,
+    pub match_quads_calls: AtomicU64,
+    pub fit_affine_ns: AtomicU64,
+    pub fit_affine_calls: AtomicU64,
+    pub count_inliers_ns: AtomicU64,
+    pub count_inliers_calls: AtomicU64,
+    pub refit_affine_ns: AtomicU64,
+    pub fit_sip_ns: AtomicU64,
+}
+
+impl TimingProfile {
+    fn add(target: &AtomicU64, dur: std::time::Duration) {
+        target.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+    }
+    fn print_summary(&self, total: std::time::Duration, frame: &str) {
+        let total_ms = total.as_millis() as u64;
+        let ms = |ns: u64| ns / 1_000_000;
+        let pct = |ns: u64| if total_ms > 0 { ms(ns) * 100 / total_ms } else { 0 };
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        eprintln!(
+            "[solvemyastro timing] {frame}: total {total_ms} ms — \
+             cone {cone}ms/{ccalls} ({cone_pct}%), \
+             project {proj}ms, \
+             build_quads_cat {bqc}ms, \
+             match_quads {mq}ms/{mqcalls} ({mq_pct}%), \
+             fit_affine {fa}ms/{facalls}, \
+             count_inliers {ci}ms/{cicalls} ({ci_pct}%), \
+             refit_affine {ra}ms, \
+             fit_sip {sip}ms",
+            cone = ms(g(&self.cone_ns)), ccalls = g(&self.cone_calls), cone_pct = pct(g(&self.cone_ns)),
+            proj = ms(g(&self.project_ns)),
+            bqc = ms(g(&self.build_quads_cat_ns)),
+            mq = ms(g(&self.match_quads_ns)), mqcalls = g(&self.match_quads_calls), mq_pct = pct(g(&self.match_quads_ns)),
+            fa = ms(g(&self.fit_affine_ns)), facalls = g(&self.fit_affine_calls),
+            ci = ms(g(&self.count_inliers_ns)), cicalls = g(&self.count_inliers_calls), ci_pct = pct(g(&self.count_inliers_ns)),
+            ra = ms(g(&self.refit_affine_ns)),
+            sip = ms(g(&self.fit_sip_ns)),
+        );
+    }
+}
 
 use crate::{
     math::great_circle_deg,
@@ -191,6 +244,7 @@ fn run_trial(
     cfg: &SolveConfig,
     min_quads: usize,
     balance: bool,
+    timing: &TimingProfile,
 ) -> Option<TrialResult> {
     let (ra0, dec0) = cell;
 
@@ -229,19 +283,29 @@ fn run_trial(
         return None;
     }
 
+    let t_proj = Instant::now();
     let projected = project_catalog(cat_stars, ra0, dec0);
+    TimingProfile::add(&timing.project_ns, t_proj.elapsed());
     if projected.len() < 4 {
         return None;
     }
+    let t_bq = Instant::now();
     let cat_quads = build_quads(&projected, projected.len(), gs);
+    TimingProfile::add(&timing.build_quads_cat_ns, t_bq.elapsed());
     if cat_quads.is_empty() {
         return None;
     }
+    let t_mq = Instant::now();
     let matches = match_quads(iquads, &cat_quads, cfg.quad_tolerance);
+    TimingProfile::add(&timing.match_quads_ns, t_mq.elapsed());
+    timing.match_quads_calls.fetch_add(1, Ordering::Relaxed);
     if matches.len() < mq {
         return None;
     }
+    let t_fa = Instant::now();
     let affine = fit_affine(&matches, iquads, &cat_quads)?;
+    TimingProfile::add(&timing.fit_affine_ns, t_fa.elapsed());
+    timing.fit_affine_calls.fetch_add(1, Ordering::Relaxed);
     let wcs = affine_to_wcs(&affine, image_center, (ra0, dec0));
 
     // Sanity: pixel scale must be in physical range (0.05"–120"/px).
@@ -506,6 +570,11 @@ pub fn solve(
     //    density-balanced quad pools — for frames whose detections
     //    out-resolve the catalog. Frames that solve never reach the
     //    fallback, so it cannot regress them.
+    let timing = TimingProfile::default();
+    let frame_name = image
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let ctx = SearchCtx {
         image_pts: &image_pts,
         image_quads: &image_quads,
@@ -524,8 +593,12 @@ pub fn solve(
         obs_epoch,
         t0,
         cancel,
+        timing: &timing,
     };
     if let Some(sol) = run_search(&ctx, false)? {
+        if cfg.print_timing {
+            timing.print_summary(t0.elapsed(), &frame_name);
+        }
         return Ok(sol);
     }
     if is_cancelled() {
@@ -536,7 +609,13 @@ pub fn solve(
          retrying with density-balanced quad pools"
     );
     if let Some(sol) = run_search(&ctx, true)? {
+        if cfg.print_timing {
+            timing.print_summary(t0.elapsed(), &frame_name);
+        }
         return Ok(sol);
+    }
+    if cfg.print_timing {
+        timing.print_summary(t0.elapsed(), &frame_name);
     }
     anyhow::bail!(
         "no trial passed verification across {} FOV rung(s) \
@@ -564,6 +643,7 @@ struct SearchCtx<'a> {
     obs_epoch: f64,
     t0: Instant,
     cancel: Option<&'a AtomicBool>,
+    timing: &'a TimingProfile,
 }
 
 /// One search pass over the autoFOV ladder × square spiral.
@@ -592,6 +672,7 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
         obs_epoch,
         t0,
         cancel,
+        timing,
     } = ctx;
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
@@ -619,9 +700,12 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                 {
                     return None; // Another thread verified, or cancelled.
                 }
+                let t_cone = Instant::now();
                 let stars = cache
                     .cone(cell.0, cell.1, cone_radius, cfg.catalog_mag_limit, obs_epoch)
                     .ok()?;
+                TimingProfile::add(&timing.cone_ns, t_cone.elapsed());
+                timing.cone_calls.fetch_add(1, Ordering::Relaxed);
                 if stars.len() < 4 {
                     return None;
                 }
@@ -675,6 +759,7 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                     cfg,
                     min_quads,
                     balance,
+                    timing,
                 )
             })
             .collect();
@@ -707,18 +792,39 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
             }
 
             // Verification uses bright stars to keep the expected-count denominator sensible.
-            // For sparse narrow-FOV fields (< 4 bright stars in the tiny FOV), step up the
-            // mag limit in 2-magnitude steps until we have enough reference stars.
-            // The deeper the fallback, the more stars we use — but we scale the expected
-            // count via `required_inliers` which caps on n_detected anyway.
+            // For sparse narrow-FOV fields, step up the mag limit until we have enough
+            // reference stars. Phase 1 fix (was: break at first tier with ≥4 stars):
+            // the ≥4 floor was too lax — a mislocated cone (false-positive quad seed
+            // points to a different sky region) can return 4-15 bright stars in the
+            // wrong location and short-circuit the escalation, never reaching the
+            // deeper catalog. New floor is `image_pts.len() / 4` (capped at 100,
+            // floored at 8) so a healthy density forces continue-to-next-tier.
+            // We *always* keep the deepest non-empty result so even if no tier hits
+            // the floor we still try verification rather than silently dropping.
+            let density_floor = (image_pts.len() / 4).clamp(8, 100);
             let verify_stars = {
                 let mut stars = Vec::new();
+                let mut hit_floor = false;
                 for &mag_lim in &[VERIFY_MAG_LIMIT, 14.0_f32, cfg.catalog_mag_limit] {
-                    match cache.cone(seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch) {
-                        Ok(s) if s.len() >= 4 => { stars = s; break; }
-                        Ok(_) | Err(_) => {}
+                    let t = Instant::now();
+                    let res = cache.cone(seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch);
+                    TimingProfile::add(&timing.cone_ns, t.elapsed());
+                    timing.cone_calls.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(s) = res {
+                        if !s.is_empty() {
+                            stars = s;
+                            if stars.len() >= density_floor {
+                                hit_floor = true;
+                                break;
+                            }
+                        }
                     }
                 }
+                // If no tier hit the floor and even the deepest came back near-empty,
+                // the seed-WCS is very likely mislocated. We keep whatever stars we
+                // got (≥4 required below) so the trial can still be rejected on
+                // inlier count rather than silently abandoned at this stage.
+                let _ = hit_floor;
                 stars
             };
             if verify_stars.len() < 4 {
@@ -726,6 +832,7 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
             }
 
             let tol_px = adaptive_tol_px(seed_scale, BASE_MATCH_ARCSEC);
+            let t_ci = Instant::now();
             let (seed_inliers, _seed_rss, seed_pairs) = count_inliers(
                 &trial.wcs,
                 &verify_stars,
@@ -734,6 +841,8 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                 height,
                 tol_px,
             );
+            TimingProfile::add(&timing.count_inliers_ns, t_ci.elapsed());
+            timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
 
             let required = required_inliers(verify_stars.len(), image_pts.len());
             if seed_inliers < required {
@@ -749,6 +858,7 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
             let final_wcs = if seed_pairs.len() >= 6 {
                 // Use looser tolerance for refit gathering.
                 let refit_tol = (tol_px * 2.0).min(MAX_MATCH_PX);
+                let t = Instant::now();
                 let (_, _, refit_pairs) = count_inliers(
                     &trial.wcs,
                     &verify_stars,
@@ -757,10 +867,18 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                     height,
                     refit_tol,
                 );
-                match refit_affine(&refit_pairs, image_center, &trial.wcs) {
+                TimingProfile::add(&timing.count_inliers_ns, t.elapsed());
+                timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
+                let t_ra = Instant::now();
+                let refit = refit_affine(&refit_pairs, image_center, &trial.wcs);
+                TimingProfile::add(&timing.refit_affine_ns, t_ra.elapsed());
+                match refit {
                     Some(refitted) => {
                         // Verify the refit is an improvement.
+                        let t = Instant::now();
                         let (ri, _, _) = count_inliers(&refitted, &verify_stars, &image_pts, width, height, tol_px);
+                        TimingProfile::add(&timing.count_inliers_ns, t.elapsed());
+                        timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
                         if ri >= seed_inliers {
                             refitted
                         } else {
@@ -774,6 +892,7 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
             };
 
             // Recount inliers with final WCS.
+            let t = Instant::now();
             let (final_inliers, final_rss, _) = count_inliers(
                 &final_wcs,
                 &verify_stars,
@@ -782,6 +901,8 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                 height,
                 tol_px,
             );
+            TimingProfile::add(&timing.count_inliers_ns, t.elapsed());
+            timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
 
             if final_inliers < MIN_ABSOLUTE_INLIERS {
                 continue 'candidates;
@@ -801,7 +922,8 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
 
             // 8. SIP fit (optional).
             let (sip_wcs, sip_rms_px, sip_rms_arcsec) = if cfg.fit_sip {
-                match crate::sip::fit_sip(
+                let t_sip = Instant::now();
+                let sip_result = crate::sip::fit_sip(
                     &final_wcs,
                     &verify_stars,
                     &image_pts,
@@ -809,9 +931,14 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                     height,
                     tol_px,
                     cfg.sip_order,
-                ) {
+                );
+                TimingProfile::add(&timing.fit_sip_ns, t_sip.elapsed());
+                match sip_result {
                     Some(w) => {
+                        let t = Instant::now();
                         let (si, srss, sip_pairs) = count_inliers(&w, &verify_stars, &image_pts, width, height, tol_px);
+                        TimingProfile::add(&timing.count_inliers_ns, t.elapsed());
+                        timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
                         let srms = if si > 0 { (srss / si as f64).sqrt() } else { f64::MAX };
                         // DIAGNOSTIC (P2b/0008): residual distribution — a few
                         // large residuals ⇒ nearest-neighbour mismatch; a broad

@@ -64,6 +64,11 @@ pub struct SolveConfig {
     pub fit_sip: bool,
     /// SIP polynomial order when `fit_sip` (2 or 3).
     pub sip_order: u8,
+    /// Phase 1 instrumentation — emit a per-stage timing breakdown at the
+    /// end of `solve()`. Default `false` (production runs stay quiet).
+    /// Set to `true` from `corpus_bench` and ad-hoc profiling to see where
+    /// wall-clock actually goes.
+    pub print_timing: bool,
 }
 
 impl Default for SolveConfig {
@@ -73,6 +78,7 @@ impl Default for SolveConfig {
             catalog_mag_limit: 19.0,
             fit_sip: true,
             sip_order: 3,
+            print_timing: false,
         }
     }
 }

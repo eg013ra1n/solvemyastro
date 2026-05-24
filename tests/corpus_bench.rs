@@ -328,7 +328,14 @@ fn corpus_bench() {
     }
 
     let cache = StarCache::open(smac_path).expect("open smac_gaia cache");
-    let cfg = SolveConfig::default();
+    let cfg = SolveConfig {
+        // Phase 1 instrumentation: print per-stage timing for each frame so we
+        // can validate where wall-clock actually goes before committing to the
+        // Phase 3 speed work. Strip this back to default() once the data is
+        // captured.
+        print_timing: true,
+        ..SolveConfig::default()
+    };
 
     // Enumerate corpus files (FITS/FIT/XISF), sorted.
     let mut files: Vec<PathBuf> = std::fs::read_dir(bench_dir)
