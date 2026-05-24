@@ -784,113 +784,110 @@ fn run_search(
         let cone_radius = (rung.fov_deg * CONE_OVERSIZE).min(89.0);
         let mut rt = RungTrace::new(rung_idx + 1, total_rungs, rung.fov_deg, cells.len());
 
-        // Early-exit flag: set once ANY trial passes verification (set below, not here).
-        // We collect ALL trial results per rung so that false quad matches don't block
-        // the correct cell — each candidate is verified in turn.
+        // Spiral-pruning chunk size. The spiral visits cells in order of
+        // increasing distance from the hint, so the correct cell is
+        // usually near the start. We process the spiral in chunks of
+        // `SPIRAL_CHUNK`: each chunk runs all its cells in parallel via
+        // rayon, then sequentially verifies any candidates. On the first
+        // verified solve we return immediately — skipping every remaining
+        // chunk in this rung.
+        //
+        // Tuning trade-off: smaller chunks give finer early-exit
+        // granularity (faster on hinted frames) but introduce more
+        // per-chunk barrier overhead (slower on sparse-field frames that
+        // must scan all chunks of the right-scale rung). 1024 was picked
+        // by corpus_bench A/B: it keeps the big hinted-frame wins
+        // (~30-70% reduction) while limiting sparse-field overhead.
+        const SPIRAL_CHUNK: usize = 1024;
+
+        // Early-exit flag: set once ANY trial passes verification.
+        // Workers in subsequent chunks check it at cell start.
         let any_verified = AtomicBool::new(false);
         let cells_mutex: Mutex<Vec<CellTrace>> = Mutex::new(Vec::with_capacity(cells.len()));
 
-        // Collect trial results in parallel (rayon `par_iter` + filter_map).
-        // No early-exit within the quad-match phase: all cells that produce a
-        // plausible affine are kept and verified sequentially below.
-        let results: Vec<TrialResult> = cells
-            .par_iter()
-            .filter_map(|&cell| {
-                if any_verified.load(Ordering::Relaxed)
-                    || cancel.is_some_and(|f| f.load(Ordering::Relaxed))
-                {
-                    return None; // Another thread verified, or cancelled.
-                }
-                let mut ct = CellTrace { ra: cell.0, dec: cell.1, ..Default::default() };
-                let t_cone = Instant::now();
-                let stars = match cache.cone_cached(pixel_cache, cell.0, cell.1, cone_radius, cfg.catalog_mag_limit, obs_epoch) {
-                    Ok(s) => s,
-                    Err(_) => {
+        // Iterate the spiral in chunks. Each chunk does the par_iter +
+        // verify pair; on the first verified solve we return immediately.
+        // Empty / no-candidate chunks fall through to the next chunk.
+        let mut total_candidates_in_rung = 0usize;
+        'chunks: for chunk in cells.chunks(SPIRAL_CHUNK) {
+            if is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            if any_verified.load(Ordering::Relaxed) {
+                break 'chunks; // Another chunk already solved (defensive — set on success below).
+            }
+
+            let chunk_results: Vec<TrialResult> = chunk
+                .par_iter()
+                .filter_map(|&cell| {
+                    if any_verified.load(Ordering::Relaxed)
+                        || cancel.is_some_and(|f| f.load(Ordering::Relaxed))
+                    {
+                        return None;
+                    }
+                    let mut ct = CellTrace { ra: cell.0, dec: cell.1, ..Default::default() };
+                    let t_cone = Instant::now();
+                    let stars = match cache.cone_cached(pixel_cache, cell.0, cell.1, cone_radius, cfg.catalog_mag_limit, obs_epoch) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            ct.stop = CellStop::ConeTooSparse;
+                            cells_mutex.lock().unwrap().push(ct);
+                            return None;
+                        }
+                    };
+                    TimingProfile::add(&timing.cone_ns, t_cone.elapsed());
+                    timing.cone_calls.fetch_add(1, Ordering::Relaxed);
+                    ct.cat_raw = stars.len();
+                    if stars.len() < 4 {
                         ct.stop = CellStop::ConeTooSparse;
                         cells_mutex.lock().unwrap().push(ct);
                         return None;
                     }
-                };
-                TimingProfile::add(&timing.cone_ns, t_cone.elapsed());
-                timing.cone_calls.fetch_add(1, Ordering::Relaxed);
-                ct.cat_raw = stars.len();
-                if stars.len() < 4 {
-                    ct.stop = CellStop::ConeTooSparse;
+                    let pool_cap = if balance {
+                        MAX_CAT_STARS
+                    } else {
+                        image_pts.len().min(MAX_CAT_STARS).max(50)
+                    };
+                    let stars = if stars.len() > pool_cap {
+                        let mut s = stars;
+                        s.sort_unstable_by(|a, b| a.mag.partial_cmp(&b.mag).unwrap_or(std::cmp::Ordering::Equal));
+                        s.truncate(pool_cap);
+                        s
+                    } else {
+                        stars
+                    };
+                    ct.cat_after_cap = stars.len();
+                    let trial = run_trial(
+                        image_quads,
+                        image_pts,
+                        image_center,
+                        cell,
+                        &stars,
+                        group_size,
+                        cfg,
+                        min_quads,
+                        balance,
+                        timing,
+                        center,
+                        &mut ct,
+                    );
                     cells_mutex.lock().unwrap().push(ct);
-                    return None;
-                }
-                // ASTAP-style brightness-rank-aligned cap on the catalog quad
-                // pool. Without it, a deep catalog (e.g. Gaia G<19, ~1200
-                // stars per typical narrow-field cone) builds 6–10× more
-                // catalog quads than the image side does, and `match_quads`'
-                // median-scale-ratio outlier filter gets pulled toward the
-                // false-positive mode — true matches are then dropped as
-                // outliers and the affine fit returns garbage.
-                //
-                // Two-tier cap:
-                //
-                //   - **Primary pass** (`balance=false`): tight cap at
-                //     image depth (count-matched). Restores correct
-                //     matching for filtered/narrowband frames where the
-                //     image detects far fewer correspondences than the
-                //     deep catalog offers.
-                //   - **Fallback pass** (`balance=true`): loose cap at
-                //     `MAX_CAT_STARS`. For sparse fields (M51-class
-                //     narrowband, ~140 detections in a 30′ FOV) the tight
-                //     cap cuts too aggressively into the catalog and the
-                //     few true matches drop below the inlier floor; the
-                //     loose cap lets the existing image-side balance logic
-                //     (in `run_trial`) recover with a deeper catalog.
-                //
-                // Stars are mag-sorted (brightest first) before truncation
-                // so the surviving set is the bright-rank-aligned subset
-                // most likely to correspond to the image's bright
-                // detections, regardless of filter/band.
-                let pool_cap = if balance {
-                    MAX_CAT_STARS
-                } else {
-                    image_pts.len().min(MAX_CAT_STARS).max(50)
-                };
-                let stars = if stars.len() > pool_cap {
-                    let mut s = stars;
-                    s.sort_unstable_by(|a, b| a.mag.partial_cmp(&b.mag).unwrap_or(std::cmp::Ordering::Equal));
-                    s.truncate(pool_cap);
-                    s
-                } else {
-                    stars
-                };
-                ct.cat_after_cap = stars.len();
-                let trial = run_trial(
-                    image_quads,
-                    image_pts,
-                    image_center,
-                    cell,
-                    &stars,
-                    group_size,
-                    cfg,
-                    min_quads,
-                    balance,
-                    timing,
-                    center,
-                    &mut ct,
-                );
-                cells_mutex.lock().unwrap().push(ct);
-                trial
-            })
-            .collect();
+                    trial
+                })
+                .collect();
 
-        rt.cells = cells_mutex.into_inner().unwrap();
-        rt.candidates_emitted = results.len();
+            total_candidates_in_rung += chunk_results.len();
+            if chunk_results.is_empty() {
+                continue 'chunks;
+            }
 
-        if results.is_empty() {
-            pass_trace.rungs.push(rt);
-            continue;
-        }
-
-        // Verify each trial candidate in turn; take the first that passes.
-        // Iterating sequentially is fine: verification is cheap (one cone lookup +
-        // O(n²) nearest-neighbour search), and we expect at most a handful of
-        // candidates per rung (false quad matches are rare after the affine sanity check).
+            // Verify this chunk's candidates inline. On the first verified
+            // solve, we `return Ok(Some(...))` immediately — skipping all
+            // remaining chunks in this rung AND all remaining rungs. This
+            // is the spiral-pruning early-exit. Sequential within-chunk
+            // verify is fine: candidates per chunk are rare (false quad
+            // matches survive the median-ratio filter only occasionally).
+            let results = chunk_results;
         'candidates: for trial in results {
             if is_cancelled() {
                 anyhow::bail!("cancelled");
@@ -1209,7 +1206,15 @@ fn run_search(
                 wcs: sip_wcs,
             }));
         } // end 'candidates loop
-        // No candidate solved this rung — snapshot it before moving on.
+            // This chunk's candidates didn't verify — fall through to the
+            // next chunk in the same rung.
+        } // end 'chunks loop
+
+        // Either every chunk failed to verify or we broke out due to
+        // any_verified being set externally. Snapshot trace counts and
+        // push the rung before moving on.
+        rt.cells = cells_mutex.into_inner().unwrap();
+        rt.candidates_emitted = total_candidates_in_rung;
         pass_trace.rungs.push(rt);
     } // end rung loop
 
