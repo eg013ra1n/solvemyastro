@@ -235,4 +235,145 @@ mod tests {
         assert!(matches!(dec, AcceptanceDecision::Accepted),
             "should accept a normal solve");
     }
+
+    // ===== FL-extreme stress tests =====
+    //
+    // The Bayesian gate is supposed to be density-adaptive across the full
+    // focal-length range users shoot (50mm wide-field down to 6500mm
+    // narrow-field). These tests parameterize the formula with realistic
+    // (NR, A, σ) values for several FL extremes and confirm the gate's
+    // accept/reject decisions are sensible.
+
+    /// Realistic per-FL probe: returns `log_odds` for a CORRECT-WCS scenario
+    /// (matches at typical `seed_rms` ≈ 0.7σ).
+    fn lo_for_correct_wcs(
+        n_matches: usize,
+        sigma_px: f64,
+        n_catalog_in_fov: usize,
+        area_px2: f64,
+    ) -> f64 {
+        let d = sigma_px * 0.7;
+        let distances: Vec<f64> = vec![d; n_matches];
+        log_odds(&distances, sigma_px, n_catalog_in_fov, area_px2, 0.25)
+    }
+
+    #[test]
+    fn ultra_wide_50mm_milky_way_accepts() {
+        // 50mm lens on full-frame ≈ 30° FOV. Image 6000×4000 px → A = 2.4e7.
+        // Dense Milky Way: ~500k catalog stars in 30° FOV at G<19.
+        // σ ≈ 2 px. Typical: ~200 matches when WCS correct.
+        let lo = lo_for_correct_wcs(200, 2.0, 500_000, 2.4e7);
+        assert!(lo > DEFAULT_LOG_ODDS_MIN,
+            "50mm Milky Way (200 matches, 500k cat, σ=2) must clear threshold; got {lo:.2}");
+    }
+
+    #[test]
+    fn ultra_wide_50mm_high_galactic_latitude_still_accepts() {
+        // Same lens away from MW plane: ~30k catalog stars in 30° FOV.
+        let lo = lo_for_correct_wcs(150, 2.0, 30_000, 2.4e7);
+        assert!(lo > DEFAULT_LOG_ODDS_MIN,
+            "50mm high-lat (150 matches, 30k cat) must clear threshold; got {lo:.2}");
+    }
+
+    #[test]
+    fn narrow_2000mm_typical_accepts() {
+        // C8/RC8 ~ 2000mm. FOV ~0.5°, NR ≈ 200 catalog stars in FOV.
+        // σ ≈ 1.5 px, ~50 matches typical.
+        let lo = lo_for_correct_wcs(50, 1.5, 200, 1.2e7);
+        assert!(lo > DEFAULT_LOG_ODDS_MIN,
+            "2000mm typical (50 matches, 200 cat) must clear threshold; got {lo:.2}");
+    }
+
+    #[test]
+    fn very_narrow_4000mm_sparse_accepts_with_few_matches() {
+        // C14/EdgeHD 14 + reducer ≈ 4000mm. FOV ~0.2°, NR ≈ 15 catalog
+        // stars in FOV. σ ≈ 1 px (good seeing), ~6 matches typical.
+        let lo = lo_for_correct_wcs(6, 1.0, 15, 1.2e7);
+        assert!(lo > DEFAULT_LOG_ODDS_MIN,
+            "4000mm sparse (6 matches, 15 cat) must clear threshold; got {lo:.2}");
+    }
+
+    #[test]
+    fn extremely_narrow_6500mm_marginal_passes_with_safety_floor() {
+        // 6500mm Cassegrain (FOV ~0.07°) with ~5 catalog stars in FOV.
+        // 4-of-5 perfect matches must pass both log_odds AND the
+        // absolute-inlier safety floor (≥4).
+        let lo = lo_for_correct_wcs(4, 1.0, 5, 1.2e7);
+        let cfg = BayesianGateConfig::default();
+        let dec = accept_bayesian(lo, 4, 0.7, 1.0, &cfg);
+        assert!(matches!(dec, AcceptanceDecision::Accepted),
+            "6500mm with 4 perfect matches must pass (log_odds={lo:.2}); decision={dec:?}");
+    }
+
+    #[test]
+    fn extremely_narrow_6500mm_too_few_inliers_rejects() {
+        // Same field, only 3 matches — below the absolute floor.
+        let lo = lo_for_correct_wcs(3, 1.0, 5, 1.2e7);
+        let cfg = BayesianGateConfig::default();
+        let dec = accept_bayesian(lo, 3, 0.7, 1.0, &cfg);
+        assert!(matches!(dec, AcceptanceDecision::Rejected(_)),
+            "3 inliers must be rejected by the safety floor regardless of log_odds; got {dec:?}");
+    }
+
+    #[test]
+    fn ultra_dense_field_resists_false_positive_with_few_matches() {
+        // Adversarial: 50mm Milky Way with only 5 inliers — could be
+        // a chance alignment. The gate MUST reject (high NR makes each
+        // match contribute less; 5 matches alone shouldn't clear).
+        let lo = lo_for_correct_wcs(5, 2.0, 500_000, 2.4e7);
+        let cfg = BayesianGateConfig::default();
+        let dec = accept_bayesian(lo, 5, 1.4, 2.0, &cfg);
+        assert!(matches!(dec, AcceptanceDecision::Rejected(_)),
+            "5 inliers in 500k-cat dense field MUST be rejected (false-positive guard); got log_odds={lo:.2} decision={dec:?}");
+    }
+
+    #[test]
+    fn per_focal_length_match_count_sweep() {
+        // Sweep: in every FL regime, more matches → higher log_odds (monotonic).
+        // `typical_n_match_for_correct_wcs` is what the solver expects when
+        // the WCS is right; this number scales with FL because:
+        //   - Wide field (50mm MW): catalog has 500k stars, image caps at 600,
+        //     ~500+ inliers when WCS is correct (most detections match a
+        //     catalog star). The high NR also makes each match worth less
+        //     log_odds, so we NEED hundreds of matches to clear — which we
+        //     also HAVE.
+        //   - Narrow field: very few catalog stars but a high fraction match.
+        //
+        // The "typical" column below reflects what realistically passes
+        // through the corpus and the user's frames.
+        let scenarios: &[(&str, usize, f64, f64, usize)] = &[
+            // (label,    NR,        A,     σ,   typical_matches_for_correct_wcs)
+            ("50mm MW",   500_000,   2.4e7, 2.0, 500),
+            ("50mm hi-l", 30_000,    2.4e7, 2.0, 200),
+            ("200mm",     50_000,    1.5e7, 1.5, 200),
+            ("500mm",     5_000,     1.5e7, 1.5, 100),
+            ("2000mm",    200,       1.2e7, 1.5, 30),
+            ("4000mm",    15,        1.2e7, 1.0, 6),
+        ];
+        for (label, nr, area, sigma, typical_n) in scenarios {
+            let lo_1  = lo_for_correct_wcs(1,  *sigma, *nr, *area);
+            let lo_5  = lo_for_correct_wcs(5,  *sigma, *nr, *area);
+            let lo_typ = lo_for_correct_wcs(*typical_n, *sigma, *nr, *area);
+            assert!(lo_5 > lo_1, "{label}: 5 matches should exceed 1");
+            assert!(lo_typ > lo_5, "{label}: typical {typical_n} matches should exceed 5");
+            assert!(lo_typ > DEFAULT_LOG_ODDS_MIN,
+                "{label}: typical {typical_n} matches must clear log(1e6)=13.8; got {lo_typ:.2}");
+        }
+    }
+
+    #[test]
+    fn gate_requires_more_matches_in_denser_fields() {
+        // Empirical property: for the same `n_matches`, the gate gets
+        // STRICTER as catalog density increases. This is the explicit
+        // anti-false-positive design — dense fields need more evidence.
+        let nr_sparse  = 100;
+        let nr_dense   = 500_000;
+        let lo_sparse  = lo_for_correct_wcs(20, 1.5, nr_sparse, 1.2e7);
+        let lo_dense   = lo_for_correct_wcs(20, 1.5, nr_dense,  1.2e7);
+        assert!(lo_sparse > lo_dense,
+            "sparse should clear more easily than dense for same #matches: sparse={lo_sparse:.2}, dense={lo_dense:.2}");
+        // And specifically: 20 matches passes in sparse, fails in dense.
+        assert!(lo_sparse > DEFAULT_LOG_ODDS_MIN, "20 matches must pass in sparse field");
+        assert!(lo_dense < DEFAULT_LOG_ODDS_MIN, "20 matches must FAIL in dense field (anti-FP guard)");
+    }
 }
