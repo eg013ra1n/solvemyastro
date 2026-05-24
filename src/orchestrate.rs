@@ -76,7 +76,7 @@ use crate::{
     select::select_fast_stars,
     wcs::WcsSolution,
     wcs_fit::affine_to_wcs,
-    CatalogStar, SolveConfig, SolveHints, SolveSolution, StarCache,
+    CatalogStar, PixelCache, SolveConfig, SolveHints, SolveSolution, StarCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -571,6 +571,7 @@ pub fn solve(
     //    out-resolve the catalog. Frames that solve never reach the
     //    fallback, so it cannot regress them.
     let timing = TimingProfile::default();
+    let pixel_cache = PixelCache::new(obs_epoch);
     let frame_name = image
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -589,6 +590,7 @@ pub fn solve(
         center,
         search_radius,
         cache,
+        pixel_cache: &pixel_cache,
         cfg,
         obs_epoch,
         t0,
@@ -639,6 +641,10 @@ struct SearchCtx<'a> {
     center: Option<(f64, f64)>,
     search_radius: f64,
     cache: &'a StarCache,
+    /// Phase 2: per-solve PM-propagated pixel cache, shared across rayon
+    /// trial workers. Created once in `solve()`; reused for every cone
+    /// query (primary and verify passes alike).
+    pixel_cache: &'a PixelCache,
     cfg: &'a SolveConfig,
     obs_epoch: f64,
     t0: Instant,
@@ -668,6 +674,7 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
         center,
         search_radius,
         cache,
+        pixel_cache,
         cfg,
         obs_epoch,
         t0,
@@ -702,7 +709,7 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                 }
                 let t_cone = Instant::now();
                 let stars = cache
-                    .cone(cell.0, cell.1, cone_radius, cfg.catalog_mag_limit, obs_epoch)
+                    .cone_cached(pixel_cache, cell.0, cell.1, cone_radius, cfg.catalog_mag_limit, obs_epoch)
                     .ok()?;
                 TimingProfile::add(&timing.cone_ns, t_cone.elapsed());
                 timing.cone_calls.fetch_add(1, Ordering::Relaxed);
@@ -807,7 +814,7 @@ fn run_search(ctx: &SearchCtx, balance: bool) -> Result<Option<SolveSolution>> {
                 let mut hit_floor = false;
                 for &mag_lim in &[VERIFY_MAG_LIMIT, 14.0_f32, cfg.catalog_mag_limit] {
                     let t = Instant::now();
-                    let res = cache.cone(seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch);
+                    let res = cache.cone_cached(pixel_cache, seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch);
                     TimingProfile::add(&timing.cone_ns, t.elapsed());
                     timing.cone_calls.fetch_add(1, Ordering::Relaxed);
                     if let Ok(s) = res {

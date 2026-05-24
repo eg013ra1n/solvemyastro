@@ -24,7 +24,7 @@ pub mod sip;
 pub mod wcs;
 pub mod wcs_fit;
 
-pub use cache::{StarCache, StarRecord};
+pub use cache::{PixelCache, StarCache, StarRecord};
 pub use wcs::{SipCoefficients, WcsSolution};
 
 /// A catalog star with epoch-corrected sky position.

@@ -31,9 +31,11 @@
 //! `pmra`/`pmdec` are stored as `f32` (acceptable PM precision; cast on
 //! write/read).
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -244,6 +246,179 @@ impl StarCache {
         }
 
         Ok(results)
+    }
+
+    /// Same as [`Self::cone`] but reuses a [`PixelCache`] to amortise the
+    /// per-pixel record decode + PM propagation across overlapping cones
+    /// in the same solve.
+    ///
+    /// Phase 2 of the speed re-engineering. The unchached `cone` was 69%
+    /// of parallel wall-clock on the corpus (~9 500 calls/frame, each
+    /// re-reading + re-PM-propagating the same ~120 HEALPix-6 pixels).
+    /// With a per-pixel cache, the first read of each pixel pays the
+    /// decode+propagate cost once, then every subsequent cone-call for
+    /// the same pixel is just the mag-limit filter + great-circle filter
+    /// over an in-memory Vec.
+    ///
+    /// **Caller invariant**: every call against a given `PixelCache`
+    /// instance must use the same `epoch`. The cache asserts this.
+    /// `PixelCache` is single-solve-scoped — create a fresh one in
+    /// `solve()` and drop at end.
+    ///
+    /// # Errors
+    ///
+    /// `Err` if `epoch` disagrees with the cache's epoch, or if the mmap
+    /// slice is internally inconsistent on a cache miss.
+    pub fn cone_cached(
+        &self,
+        cache: &PixelCache,
+        ra: f64,
+        dec: f64,
+        radius_deg: f64,
+        mag_limit: f32,
+        epoch: f64,
+    ) -> Result<Vec<CatalogStar>> {
+        anyhow::ensure!(
+            (cache.epoch - epoch).abs() < 1e-9,
+            "PixelCache epoch {} != requested epoch {} (cache is single-epoch per solve)",
+            cache.epoch,
+            epoch
+        );
+
+        let pixels = cone_search_pixels(ra, dec, radius_deg);
+        let mut results: Vec<CatalogStar> = Vec::new();
+
+        // Pre-compute the dec-window for the cheap bounding-box reject. A
+        // HEALPix-6 pixel is ~0.84 deg² (≈0.9° on a side); for typical
+        // narrow-field cones (r < 0.1°) the cone covers <1 % of the pixel,
+        // so >99 % of cached records are rejected by a simple dec compare
+        // BEFORE the expensive great-circle trig. Δdec ≤ r is a strict
+        // requirement of being within great-circle radius r, so this
+        // pre-filter has zero false rejects.
+        let dec_min = dec - radius_deg;
+        let dec_max = dec + radius_deg;
+
+        for px in pixels {
+            // Get or insert the pixel's PM-propagated records.
+            //
+            // Fast path: read lock, hit → Arc::clone, release. Concurrent
+            // readers don't block each other (`RwLock` semantics).
+            //
+            // Slow path (cache miss): upgrade to write lock, double-check
+            // under exclusive access (another thread may have raced ahead),
+            // then decode+propagate the pixel and insert. The
+            // double-check makes the cold path idempotent under
+            // contention without holding the write lock during the slow
+            // decode.
+            let recs: Arc<Vec<PropagatedRecord>> = {
+                let map = cache.map.read().expect("PixelCache RwLock poisoned");
+                if let Some(arc) = map.get(&px) {
+                    Arc::clone(arc)
+                } else {
+                    drop(map);
+                    // Cache miss: decode first WITHOUT holding any lock, so
+                    // concurrent readers of OTHER pixels are not blocked
+                    // during the (~6 ms) decode+propagate.
+                    let propagated = self.read_pixel_propagated(px, epoch)?;
+                    let arc = Arc::new(propagated);
+                    let mut map = cache.map.write().expect("PixelCache RwLock poisoned");
+                    // Another worker may have inserted while we decoded;
+                    // prefer theirs to keep the cache canonical.
+                    Arc::clone(map.entry(px).or_insert_with(|| Arc::clone(&arc)))
+                }
+            };
+
+            // Per-cone filtering: mag-limit (mag-sorted ascending →
+            // early-exit) + cheap dec-box reject + precise great-circle.
+            for star in recs.iter() {
+                if star.mag > mag_limit {
+                    break;
+                }
+                // Cheap reject: outside the dec window cannot be inside
+                // the great-circle radius (Δdec > r ⇒ separation > r).
+                if star.dec < dec_min || star.dec > dec_max {
+                    continue;
+                }
+                // Precise filter only for the small subset that survives
+                // the dec window.
+                if great_circle_deg(star.ra, star.dec, ra, dec) <= radius_deg {
+                    results.push(CatalogStar { ra: star.ra, dec: star.dec, mag: star.mag });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Decode + PM-propagate every record in pixel `px` to `epoch`.
+    /// Internal helper used by [`Self::cone_cached`] on cache miss.
+    fn read_pixel_propagated(&self, px: u64, epoch: f64) -> Result<Vec<PropagatedRecord>> {
+        let (offset, count) = self.directory[px as usize];
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let byte_start = offset as usize;
+        let byte_end = byte_start + count as usize * RECORD_SIZE;
+        anyhow::ensure!(
+            byte_end <= self.mmap.len(),
+            "pixel {px} directory entry points beyond mmap ({byte_end} > {})",
+            self.mmap.len()
+        );
+        let slice = &self.mmap[byte_start..byte_end];
+        let mut cur = std::io::Cursor::new(slice);
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let rec_ra = cur.read_f64::<LittleEndian>().context("read rec ra")?;
+            let rec_dec = cur.read_f64::<LittleEndian>().context("read rec dec")?;
+            let rec_mag = cur.read_f32::<LittleEndian>().context("read rec mag")?;
+            let rec_pmra = cur.read_f32::<LittleEndian>().context("read rec pmra")? as f64;
+            let rec_pmdec = cur.read_f32::<LittleEndian>().context("read rec pmdec")? as f64;
+            let (pm_ra, pm_dec) =
+                propagate(rec_ra, rec_dec, rec_pmra, rec_pmdec, self.catalog_epoch, epoch);
+            out.push(PropagatedRecord { ra: pm_ra, dec: pm_dec, mag: rec_mag });
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PixelCache — per-solve PM-propagated pixel-record cache
+// ---------------------------------------------------------------------------
+
+/// One catalog record after PM-propagation to a fixed epoch. Lighter than
+/// the on-disk record (no `pm*` fields — those collapse into `ra`/`dec`).
+#[derive(Clone, Copy, Debug)]
+struct PropagatedRecord {
+    ra: f64,
+    dec: f64,
+    mag: f32,
+}
+
+/// Per-solve cache of PM-propagated pixel records. Shared across rayon
+/// workers via `&PixelCache` (interior `RwLock`).
+///
+/// See [`StarCache::cone_cached`] for the design rationale.
+pub struct PixelCache {
+    /// All cone calls in this solve use this epoch. Asserted on each call.
+    epoch: f64,
+    /// pixel_id → Arc-shared decoded + PM-propagated records (mag-sorted
+    /// ascending — same order as the on-disk records, since PM doesn't
+    /// affect magnitudes).
+    map: RwLock<HashMap<u64, Arc<Vec<PropagatedRecord>>>>,
+}
+
+impl PixelCache {
+    /// Create an empty cache scoped to one solve at `epoch`.
+    pub fn new(epoch: f64) -> Self {
+        Self { epoch, map: RwLock::new(HashMap::new()) }
+    }
+
+    /// Number of cached pixels (diagnostic).
+    pub fn pixel_count(&self) -> usize {
+        self.map
+            .read()
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 }
 
@@ -861,6 +1036,101 @@ mod tests {
             "cone should return exactly {} star(s); got {}",
             expected.len(),
             results.len()
+        );
+    }
+
+    /// Phase 2 regression gate: `cone_cached` must return the same star set
+    /// as `cone` for every query, both on a cold cache and on a warm cache
+    /// (the second call hits the in-memory pixel map). Otherwise the
+    /// solver's behaviour changes silently.
+    #[test]
+    fn cone_cached_matches_cone() {
+        // Spread stars across multiple HEALPix pixels so the cache exercises
+        // its multi-pixel collection path on each query.
+        let mut stars = Vec::new();
+        for ra_deg in (0i32..360).step_by(15) {
+            for dec_deg in (-60i32..=60).step_by(15) {
+                stars.push(StarRecord {
+                    ra: ra_deg as f64,
+                    dec: dec_deg as f64,
+                    mag: (ra_deg as f32 % 19.0).clamp(5.0, 18.0),
+                    pmra_mas_yr: ((ra_deg % 7) as f64) * 0.5,
+                    pmdec_mas_yr: ((dec_deg.abs() % 5) as f64) * -0.3,
+                });
+            }
+        }
+        let epoch = 2024.0;
+        let (cache, _tmp) = build_and_open(stars.clone(), epoch);
+
+        let pixel_cache = PixelCache::new(epoch);
+
+        // Ten query points across the sky at varied radii / mag-limits.
+        let queries: Vec<(f64, f64, f64, f32)> = vec![
+            (30.0, 20.0, 0.5, 99.0),
+            (30.0, 20.0, 5.0, 12.0),
+            (180.0, -45.0, 1.0, 17.0),
+            (350.0, 30.0, 0.3, 99.0),
+            (45.0, 0.0, 10.0, 8.0),
+            (220.0, 50.0, 0.1, 99.0),
+            (90.0, -30.0, 2.0, 14.0),
+            (270.0, 60.0, 0.5, 99.0),
+            (0.0, 0.0, 0.8, 16.0),
+            // Run two queries hitting the same patch — the second is a warm-cache hit.
+            (30.0, 20.0, 0.5, 99.0),
+        ];
+
+        for &(ra, dec, radius, mag_lim) in &queries {
+            let mut a = cache.cone(ra, dec, radius, mag_lim, epoch).expect("cone");
+            let mut b = cache
+                .cone_cached(&pixel_cache, ra, dec, radius, mag_lim, epoch)
+                .expect("cone_cached");
+            // Order is not specified — sort by (ra, dec, mag) for comparison.
+            let key = |s: &CatalogStar| (s.ra.to_bits(), s.dec.to_bits(), s.mag.to_bits());
+            a.sort_by_key(key);
+            b.sort_by_key(key);
+            assert_eq!(
+                a.len(),
+                b.len(),
+                "cone vs cone_cached count mismatch at ({ra}, {dec}, r={radius}, mag<{mag_lim}): {} vs {}",
+                a.len(),
+                b.len()
+            );
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!((x.ra - y.ra).abs() < 1e-9, "ra mismatch at ({ra}, {dec}): {x:?} vs {y:?}");
+                assert!((x.dec - y.dec).abs() < 1e-9, "dec mismatch at ({ra}, {dec}): {x:?} vs {y:?}");
+                assert_eq!(x.mag, y.mag, "mag mismatch at ({ra}, {dec}): {x:?} vs {y:?}");
+            }
+        }
+
+        // Warm-cache invariant: after running 10 queries, the cache holds at
+        // least one pixel (every query touched at least one).
+        assert!(
+            pixel_cache.pixel_count() > 0,
+            "PixelCache should have populated pixels after queries"
+        );
+    }
+
+    /// Mixed-epoch use is a programmer error and must be detected.
+    #[test]
+    fn cone_cached_rejects_epoch_mismatch() {
+        let stars = vec![StarRecord {
+            ra: 10.0,
+            dec: 10.0,
+            mag: 8.0,
+            pmra_mas_yr: 0.0,
+            pmdec_mas_yr: 0.0,
+        }];
+        let (cache, _tmp) = build_and_open(stars, 2016.0);
+        let pixel_cache = PixelCache::new(2016.0);
+        // Same epoch: ok.
+        cache.cone_cached(&pixel_cache, 10.0, 10.0, 1.0, 99.0, 2016.0).expect("ok");
+        // Different epoch: must error, not silently propagate to a different epoch.
+        let err = cache
+            .cone_cached(&pixel_cache, 10.0, 10.0, 1.0, 99.0, 2024.0)
+            .expect_err("epoch mismatch must error");
+        assert!(
+            err.to_string().contains("PixelCache epoch"),
+            "expected PixelCache epoch error, got: {err}"
         );
     }
 
