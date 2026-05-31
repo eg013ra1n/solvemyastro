@@ -175,6 +175,27 @@ fn fov_rungs(long_px: usize, hints: &SolveHints) -> Vec<FovRung> {
     rungs
 }
 
+/// FOV ladder over an explicit `[lo_arcsec, hi_arcsec]` scale band (B2 of the
+/// scale-recovery fallback). Rungs descend from the coarse (hi) bound by
+/// `FOV_DIV`, clamped to `[FOV_MIN_DEG, FOV_MAX_DEG]`. Always includes a rung at
+/// (or just below) the fine bound so a finer-than-hint true scale is reached.
+fn fov_rungs_bounded(long_px: usize, lo_arcsec: f64, hi_arcsec: f64) -> Vec<FovRung> {
+    let lp = long_px.max(1) as f64;
+    let mk = |fov: f64| FovRung { fov_deg: fov, scale_arcsec: fov * 3600.0 / lp };
+    let lo_fov = (lo_arcsec * lp / 3600.0).clamp(FOV_MIN_DEG, FOV_MAX_DEG);
+    let hi_fov = (hi_arcsec * lp / 3600.0).clamp(FOV_MIN_DEG, FOV_MAX_DEG);
+    let (lo_fov, hi_fov) = if lo_fov <= hi_fov { (lo_fov, hi_fov) } else { (hi_fov, lo_fov) };
+
+    let mut rungs = Vec::new();
+    let mut fov = hi_fov;
+    while fov > lo_fov {
+        rungs.push(mk(fov));
+        fov /= FOV_DIV;
+    }
+    rungs.push(mk(lo_fov)); // guarantee the fine end is tried
+    rungs
+}
+
 // ---------------------------------------------------------------------------
 // Square-spiral sky-cell generator
 // ---------------------------------------------------------------------------
@@ -1295,4 +1316,33 @@ fn run_search(
         anyhow::bail!("cancelled");
     }
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod bounded_ladder_tests {
+    use super::{fov_rungs_bounded, FOV_MIN_DEG, FOV_MAX_DEG};
+
+    #[test]
+    fn bounded_span_is_clamped_and_descending() {
+        // long_px=5496, hint 3.52"/px -> bounds ÷8..×2 = 0.44..7.04"/px.
+        let lo = 0.44_f64;
+        let hi = 7.04_f64;
+        let rungs = fov_rungs_bounded(5496, lo, hi);
+        assert!(!rungs.is_empty());
+        // Descending in FOV.
+        for w in rungs.windows(2) {
+            assert!(w[0].fov_deg > w[1].fov_deg, "rungs must descend");
+        }
+        // Every rung inside the global clamp.
+        for r in &rungs {
+            assert!(r.fov_deg >= FOV_MIN_DEG - 1e-9 && r.fov_deg <= FOV_MAX_DEG + 1e-9);
+        }
+        // Reaches near the finer (lo) end: smallest scale ≤ ~1.5× lo.
+        let smallest = rungs.last().unwrap().scale_arcsec;
+        assert!(smallest <= lo * 1.5 + 1e-6, "must reach the fine end: {smallest}");
+    }
 }
