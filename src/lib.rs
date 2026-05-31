@@ -134,6 +134,20 @@ pub struct SolveConfig {
     /// set to `usize::MAX` to always fall back (effectively disabling
     /// the bright path).
     pub bright_fallback_threshold: usize,
+    /// Enable the scale-recovery fallback ladder (B1 harvest + B2 bounded
+    /// sweep) on hinted-solve failure with a position prior. Default `true`.
+    /// Set `false` to restore the prior degrade-to-blind-position behaviour.
+    pub scale_fallback_enabled: bool,
+    /// Minimum inliers in the failed attempt's best candidate before B1 trusts
+    /// its recovered scale. Default `2`. Safe to keep low: B1's retry must pass
+    /// full verification, so a wrong estimate only costs one extra pass.
+    pub b1_min_inliers: usize,
+    /// B2 bounded-sweep lower scale factor (× the hint). Default `0.125` (÷8) —
+    /// covers focal-length-as-aperture errors, which always make the true scale
+    /// finer than the hint.
+    pub b2_scale_lo_factor: f64,
+    /// B2 bounded-sweep upper scale factor (× the hint). Default `2.0` (×2).
+    pub b2_scale_hi_factor: f64,
 }
 
 impl Default for SolveConfig {
@@ -148,6 +162,10 @@ impl Default for SolveConfig {
             log_odds_threshold: verify::DEFAULT_LOG_ODDS_MIN,
             distractor_fraction: verify::DEFAULT_DISTRACTOR_FRACTION,
             bright_fallback_threshold: 30,
+            scale_fallback_enabled: true,
+            b1_min_inliers: 2,
+            b2_scale_lo_factor: 0.125,
+            b2_scale_hi_factor: 2.0,
         }
     }
 }
@@ -253,4 +271,18 @@ pub fn register(
     _sub_detections: &[(f64, f64)],
 ) -> Result<WcsSolution> {
     anyhow::bail!("solvemyastro::register not implemented (future registration layer)")
+}
+
+#[cfg(test)]
+mod fallback_config_tests {
+    use super::SolveConfig;
+
+    #[test]
+    fn scale_fallback_defaults() {
+        let c = SolveConfig::default();
+        assert!(c.scale_fallback_enabled);
+        assert_eq!(c.b1_min_inliers, 2);
+        assert_eq!(c.b2_scale_lo_factor, 0.125);
+        assert_eq!(c.b2_scale_hi_factor, 2.0);
+    }
 }
