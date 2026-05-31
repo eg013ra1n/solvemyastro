@@ -269,33 +269,76 @@ pub fn solve(
     cfg: &SolveConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SolveSolution> {
+    // Step A — hinted (or blind) solve.
     let result = orchestrate::solve(image, hints, caches, cfg, cancel);
+    if result.is_ok() {
+        return result;
+    }
 
-    // Degrade-to-blind: if a positional prior was present and the hinted solve
-    // failed, the prior may be wrong (stale/mis-synced mount, or a leaked
-    // neighbour coordinate). Retry once with the position cleared — the scale
-    // hint is kept, so a known-scale wrong-pointing frame stays fast. Only
-    // fires on failure, so correctly-hinted frames pay nothing.
-    if result.is_err() && (hints.ra.is_some() || hints.dec.is_some()) {
-        let cancelled = cancel
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(false);
-        if !cancelled {
+    let has_position = hints.ra.is_some() || hints.dec.is_some();
+    let cancelled = || cancel
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
+
+    // Scale-recovery fallback (B1 harvest, then B2 bounded sweep) — position
+    // kept. Only fires after step A failed, so correctly-hinted frames pay
+    // nothing. Each retry must still pass full verification.
+    if cfg.scale_fallback_enabled && has_position && !cancelled() {
+        // B1 — retry once at the scale recovered from step A's best attempt.
+        let harvested = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<SolveFailure>())
+            .and_then(|f| harvest_scale(f, cfg.b1_min_inliers, hints.pixel_scale_arcsec));
+        if let Some(scale) = harvested {
             eprintln!(
-                "[solvemyastro] hinted solve failed — retrying with the position prior cleared \
-                 (blind position, scale kept)"
+                "[solvemyastro] hinted solve failed — retrying at recovered scale \
+                 {scale:.3}\"/px (position kept)"
             );
-            let blind_hints = SolveHints {
-                ra: None,
-                dec: None,
+            let b1_hints = SolveHints {
+                pixel_scale_arcsec: Some(scale),
+                fov_deg: None,
                 ..*hints
             };
-            if let Ok(sol) = orchestrate::solve(image, &blind_hints, caches, cfg, cancel) {
+            if let Ok(sol) = orchestrate::solve(image, &b1_hints, caches, cfg, cancel) {
                 return Ok(sol);
             }
-            // Both failed — fall through to surface the original (richer) error.
+        }
+
+        // B2 — bounded scale sweep at the known position.
+        if !cancelled() {
+            if let Some((lo, hi)) = b2_bounds(hints, cfg) {
+                eprintln!(
+                    "[solvemyastro] retrying with bounded scale sweep \
+                     [{lo:.3}..{hi:.3}]\"/px (position kept)"
+                );
+                let sweep_hints = SolveHints {
+                    pixel_scale_arcsec: None,
+                    fov_deg: None,
+                    ..*hints
+                };
+                if let Ok(sol) =
+                    orchestrate::solve_inner(image, &sweep_hints, caches, cfg, cancel, Some((lo, hi)))
+                {
+                    return Ok(sol);
+                }
+            }
         }
     }
+
+    // Step C — existing degrade-to-blind: clear the position prior, keep scale.
+    if has_position && !cancelled() {
+        eprintln!(
+            "[solvemyastro] hinted solve failed — retrying with the position prior cleared \
+             (blind position, scale kept)"
+        );
+        let blind_hints = SolveHints { ra: None, dec: None, ..*hints };
+        if let Ok(sol) = orchestrate::solve(image, &blind_hints, caches, cfg, cancel) {
+            return Ok(sol);
+        }
+    }
+
+    // All rungs failed — surface step A's original (richest) error.
     result
 }
 
