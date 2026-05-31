@@ -240,6 +240,17 @@ fn harvest_scale(
     Some(s)
 }
 
+/// B2: derive the bounded scale band `[lo, hi]` (arcsec/px) from the supplied
+/// hint. Returns `None` when no scale hint was given — step A already ran the
+/// full position-constrained ladder in that case, so a sweep adds nothing.
+fn b2_bounds(hints: &SolveHints, cfg: &SolveConfig) -> Option<(f64, f64)> {
+    let hint = hints.pixel_scale_arcsec?;
+    if !hint.is_finite() || hint <= 0.0 {
+        return None;
+    }
+    Some((hint * cfg.b2_scale_lo_factor, hint * cfg.b2_scale_hi_factor))
+}
+
 /// Solve an image to a precise (SIP) WCS.
 ///
 /// `image` is a path to a FITS/XISF file (decoded + detected via rustafits
@@ -350,5 +361,28 @@ mod harvest_tests {
     fn rejects_unphysical_scale() {
         assert_eq!(harvest_scale(&failure_with(0.0, 5), 2, Some(3.52)), None);
         assert_eq!(harvest_scale(&failure_with(500.0, 5), 2, Some(3.52)), None);
+    }
+}
+
+#[cfg(test)]
+mod b2_bounds_tests {
+    use super::b2_bounds;
+    use crate::{SolveConfig, SolveHints};
+
+    #[test]
+    fn bounds_from_pixel_scale_hint() {
+        let cfg = SolveConfig::default(); // ÷8 .. ×2
+        let hints = SolveHints { pixel_scale_arcsec: Some(3.52), ..Default::default() };
+        let (lo, hi) = b2_bounds(&hints, &cfg).expect("bounds");
+        assert!((lo - 3.52 * 0.125).abs() < 1e-9);
+        assert!((hi - 3.52 * 2.0).abs() < 1e-9);
+    }
+    #[test]
+    fn none_when_no_scale_hint() {
+        // No scale hint -> step A already ran the full position-constrained
+        // ladder, so B2 adds nothing.
+        let cfg = SolveConfig::default();
+        let hints = SolveHints { ra: Some(1.0), dec: Some(2.0), ..Default::default() };
+        assert_eq!(b2_bounds(&hints, &cfg), None);
     }
 }
