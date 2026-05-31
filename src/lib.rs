@@ -27,6 +27,7 @@ pub mod wcs;
 pub mod wcs_fit;
 
 pub use cache::{PixelCache, StarCache, StarRecord};
+pub use diag::{BestAttempt, FailureClass, SolveFailure};
 pub use wcs::{SipCoefficients, WcsSolution};
 
 /// Bundle of star caches passed to [`solve`]. Always carries a `deep`
@@ -91,6 +92,10 @@ pub struct SolveHints {
     pub pixel_scale_arcsec: Option<f64>,
     /// Positional search radius around (ra,dec), degrees.
     pub search_radius_deg: Option<f64>,
+    /// Observation epoch (Julian year, e.g. 2024.04) used to propagate catalog
+    /// proper motions from the catalog epoch (Gaia 2016.0) to when the frame
+    /// was shot. `None` ⇒ solver default (~2024.0). Pass the frame's DATE-OBS.
+    pub epoch: Option<f64>,
 }
 
 /// Solver tuning.
@@ -209,7 +214,34 @@ pub fn solve(
     cfg: &SolveConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SolveSolution> {
-    orchestrate::solve(image, hints, caches, cfg, cancel)
+    let result = orchestrate::solve(image, hints, caches, cfg, cancel);
+
+    // Degrade-to-blind: if a positional prior was present and the hinted solve
+    // failed, the prior may be wrong (stale/mis-synced mount, or a leaked
+    // neighbour coordinate). Retry once with the position cleared — the scale
+    // hint is kept, so a known-scale wrong-pointing frame stays fast. Only
+    // fires on failure, so correctly-hinted frames pay nothing.
+    if result.is_err() && (hints.ra.is_some() || hints.dec.is_some()) {
+        let cancelled = cancel
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false);
+        if !cancelled {
+            eprintln!(
+                "[solvemyastro] hinted solve failed — retrying with the position prior cleared \
+                 (blind position, scale kept)"
+            );
+            let blind_hints = SolveHints {
+                ra: None,
+                dec: None,
+                ..*hints
+            };
+            if let Ok(sol) = orchestrate::solve(image, &blind_hints, caches, cfg, cancel) {
+                return Ok(sol);
+            }
+            // Both failed — fall through to surface the original (richer) error.
+        }
+    }
+    result
 }
 
 /// Future seam (NOT in scope for this plan): register a sub-frame's

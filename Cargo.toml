@@ -35,3 +35,6 @@ byteorder = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Machine-readable corpus-bench baseline (precision+speed regression gate).
+# Pinned to the workspace version to avoid duplicate crate versions.
+serde_json = "1"

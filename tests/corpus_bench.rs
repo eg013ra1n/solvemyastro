@@ -223,6 +223,21 @@ fn parse_dec_dms(s: &str) -> Option<f64> {
     Some(if neg { -v } else { v })
 }
 
+/// Parse the observation epoch (Julian year) from DATE-OBS for proper-motion
+/// propagation. Month/day precision is ample for PM (mas/yr over years).
+fn parse_obs_epoch(hdr: &HashMap<String, String>) -> Option<f64> {
+    let date = hdr.get("DATE-OBS").or_else(|| hdr.get("DATE_OBS"))?;
+    let date_part = date.split('T').next()?; // "YYYY-MM-DD..."
+    let mut it = date_part.split('-');
+    let y: f64 = it.next()?.trim().parse().ok()?;
+    let mo: f64 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(1.0);
+    let d: f64 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(1.0);
+    if !(1900.0..3000.0).contains(&y) {
+        return None;
+    }
+    Some(y + ((mo - 1.0) * 30.4 + (d - 1.0)) / 365.25)
+}
+
 /// Extract solve hints from a FITS header map.
 /// Follows the same precedence as athenaeum's hints.rs.
 fn hints_from_fits(hdr: &HashMap<String, String>, long_px: u32) -> SolveHints {
@@ -299,6 +314,7 @@ fn hints_from_fits(hdr: &HashMap<String, String>, long_px: u32) -> SolveHints {
         fov_deg,
         pixel_scale_arcsec,
         search_radius_deg: Some(15.0), // generous radius around the prior
+        epoch: parse_obs_epoch(hdr),
     }
 }
 
@@ -406,6 +422,14 @@ fn corpus_bench() {
         correct: bool,
         has_sip: bool,
         notes: String,
+        // Phase-0 instrumentation: precision + speed metrics for the
+        // machine-readable baseline (corpus_run.json / corpus_baseline.json).
+        rms_px: f64,        // sol.rms_residual_px; -1.0 if unsolved
+        inlier_ratio: f64,  // -1.0 if unsolved
+        matched_stars: usize,
+        total_detected: usize,
+        sip_order: i32,     // 0 if no SIP
+        elapsed_ms: u64,
     }
 
     let mut results: Vec<FrameResult> = Vec::new();
@@ -459,12 +483,29 @@ fn corpus_bench() {
 
         let elapsed_ms = t0.elapsed().as_millis() as u64;
 
+        // Phase-0 metric capture (set in the solved arm; defaults = unsolved).
+        let mut m_rms = -1.0_f64;
+        let mut m_inlier = -1.0_f64;
+        let mut m_matched = 0usize;
+        let mut m_total = 0usize;
+        let mut m_sip_order = 0i32;
+
         let (smc_solved, smc_ra, smc_dec, smc_scale, has_sip, notes) = match solve_result {
             Ok(Ok(sol)) => {
                 let ra = sol.wcs.crval.0;
                 let dec = sol.wcs.crval.1;
                 let scale = sol.pixel_scale_arcsec;
                 let sip = sol.wcs.sip_forward.is_some();
+                m_rms = sol.rms_residual_px;
+                m_inlier = sol.inlier_ratio;
+                m_matched = sol.matched_stars;
+                m_total = sol.total_detected;
+                m_sip_order = sol
+                    .wcs
+                    .sip_forward
+                    .as_ref()
+                    .map(|(a, _)| a.order as i32)
+                    .unwrap_or(0);
                 (true, ra, dec, scale, sip, String::new())
             }
             Ok(Err(e)) => {
@@ -535,8 +576,48 @@ fn corpus_bench() {
             correct,
             has_sip,
             notes: format!("{notes}{sip_note}"),
+            rms_px: m_rms,
+            inlier_ratio: m_inlier,
+            matched_stars: m_matched,
+            total_detected: m_total,
+            sip_order: m_sip_order,
+            elapsed_ms,
         });
     }
+
+    // -----------------------------------------------------------------------
+    // Phase-0 instrumentation: machine-readable per-frame run + regression gate
+    // -----------------------------------------------------------------------
+    // Always write tests/corpus_run.json (precision + speed, diffable). If a
+    // schema-2 tests/corpus_baseline.json exists, gate per-frame rms_px and
+    // elapsed_ms against it (no-worse). Freeze a new baseline after a clean run
+    // with: cp tests/corpus_run.json tests/corpus_baseline.json
+    let f64_or_null = |v: f64| -> serde_json::Value {
+        if v >= 0.0 { serde_json::Value::from(v) } else { serde_json::Value::Null }
+    };
+    let run_rows: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "frame": r.name,
+                "solved": r.smc_solved,
+                "dpos_arcsec": f64_or_null(r.dpos_arcsec),
+                "dscale_pct": f64_or_null(r.dscale_pct),
+                "rms_px": f64_or_null(r.rms_px),
+                "inlier_ratio": f64_or_null(r.inlier_ratio),
+                "matched_stars": r.matched_stars,
+                "total_detected": r.total_detected,
+                "sip_order": r.sip_order,
+                "has_sip": r.has_sip,
+                "elapsed_ms": r.elapsed_ms,
+            })
+        })
+        .collect();
+    let run_doc = serde_json::json!({ "schema_version": 2, "frames": run_rows });
+    let run_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus_run.json");
+    std::fs::write(&run_path, serde_json::to_string_pretty(&run_doc).unwrap())
+        .expect("write corpus_run.json");
+    println!("\nPhase-0: wrote machine-readable run to {}", run_path.display());
 
     // Summary
     println!("{}", "-".repeat(130));
@@ -637,6 +718,77 @@ fn corpus_bench() {
         panics.len(),
         panics.iter().map(|r| &r.name).collect::<Vec<_>>()
     );
+
+    // Regression gate vs a frozen schema-2 baseline (skipped if absent/old).
+    let baseline_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus_baseline.json");
+    match std::fs::read_to_string(&baseline_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    {
+        Some(base) if base.get("schema_version").and_then(|v| v.as_u64()) == Some(2) => {
+            let base_frames: Vec<serde_json::Value> =
+                base["frames"].as_array().cloned().unwrap_or_default();
+            // Precision is gated per-frame and strictly (rms is deterministic).
+            // Speed is gated on the NET wall-clock total, not per-frame: per-frame
+            // wall-clock varies ~2x under machine load, so a strict per-frame gate
+            // trips on noise. The deterministic per-frame search-breadth signal is
+            // `cone_calls` in the `[solvemyastro timing]` stderr lines.
+            let mut rms_regressions: Vec<String> = Vec::new();
+            let mut base_ms_total = 0u64;
+            let mut new_ms_total = 0u64;
+            for r in &results {
+                let Some(b) = base_frames
+                    .iter()
+                    .find(|b| b["frame"].as_str() == Some(r.name.as_str()))
+                else {
+                    continue;
+                };
+                if r.rms_px >= 0.0 {
+                    if let Some(brms) = b["rms_px"].as_f64() {
+                        if r.rms_px > brms * 1.15 + 0.05 {
+                            rms_regressions.push(format!(
+                                "{}: rms {:.2}px > 1.15x baseline {:.2}px",
+                                r.name, r.rms_px, brms
+                            ));
+                        }
+                    }
+                }
+                if let Some(bms) = b["elapsed_ms"].as_u64() {
+                    base_ms_total += bms;
+                    new_ms_total += r.elapsed_ms;
+                }
+            }
+            let speed_ratio = new_ms_total as f64 / base_ms_total.max(1) as f64;
+            println!(
+                "\nGATE vs baseline — precision: {} rms regression(s); speed (net wall): \
+                 {}ms vs {}ms ({:.2}x)",
+                rms_regressions.len(),
+                new_ms_total,
+                base_ms_total,
+                speed_ratio
+            );
+            for x in &rms_regressions {
+                println!("  rms-regression: {x}");
+            }
+            assert!(
+                rms_regressions.is_empty(),
+                "GATE FAIL: {} precision regression(s) vs baseline",
+                rms_regressions.len()
+            );
+            assert!(
+                speed_ratio <= 1.30,
+                "GATE FAIL: net wall {:.2}x baseline (>1.30x) — investigate (re-run on a quiet \
+                 machine; wall-clock is noise-sensitive, cone_calls is the deterministic signal)",
+                speed_ratio
+            );
+        }
+        _ => {
+            println!(
+                "\nNote: no schema-2 corpus_baseline.json — freeze this run with:\n  \
+                 cp solvemyastro/tests/corpus_run.json solvemyastro/tests/corpus_baseline.json"
+            );
+        }
+    }
 
     println!("\nGATE: ALL assertions PASSED");
 }

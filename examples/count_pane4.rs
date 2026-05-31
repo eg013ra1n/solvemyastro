@@ -10,6 +10,7 @@ fn main() {
         fov_deg: None,
         pixel_scale_arcsec: None,
         search_radius_deg: Some(15.0),
+        epoch: None,
     };
     let cfg = solvemyastro::SolveConfig::default();
     let path = std::path::Path::new("/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench/Light_Pane 4_300.0s_Bin1_O_gain111_20211011-024956_-10.0C_0002_c_lps_r.xisf");

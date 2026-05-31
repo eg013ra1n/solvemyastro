@@ -141,8 +141,11 @@ fn fov_rungs(long_px: usize, hints: &SolveHints) -> Vec<FovRung> {
             // clamped to [FOV_MIN_DEG, FOV_MAX_DEG].
             // This handles stacked/drizzled images where the stored FOCALLEN or CDELT1
             // may differ from the actual per-pixel scale by 2–4×.
+            // Centre-first, expanding outward (centre, ÷1.5, ×1.5, ÷1.5², …).
+            // The hinted scale is the most likely rung, so the first-verify
+            // early-exit fires on it immediately instead of after several
+            // dense wrong-scale spirals (the finest rungs have the most cells).
             let mut rungs = Vec::new();
-            // Centre rung.
             rungs.push(mk(fov.clamp(FOV_MIN_DEG, FOV_MAX_DEG)));
             let mut up = fov;
             let mut down = fov;
@@ -150,7 +153,7 @@ fn fov_rungs(long_px: usize, hints: &SolveHints) -> Vec<FovRung> {
                 down /= FOV_DIV;
                 up *= FOV_DIV;
                 if down >= FOV_MIN_DEG {
-                    rungs.insert(0, mk(down));
+                    rungs.push(mk(down));
                 }
                 if up <= FOV_MAX_DEG {
                     rungs.push(mk(up));
@@ -406,19 +409,21 @@ fn count_inliers(
         if px < 0.0 || px >= width || py < 0.0 || py >= height {
             continue;
         }
-        // Find the nearest detected star.
-        let mut best_dist = f64::MAX;
+        // Find the nearest detected star. Compare squared distances — no sqrt
+        // in the hot loop; only the ordering matters, and `rss` wants the
+        // squared residual anyway.
+        let mut best_d2 = f64::MAX;
         let mut best_img = (0.0_f64, 0.0_f64);
         for &(ix, iy) in image_pts {
-            let d = ((ix - px).powi(2) + (iy - py).powi(2)).sqrt();
-            if d < best_dist {
-                best_dist = d;
+            let d2 = (ix - px).powi(2) + (iy - py).powi(2);
+            if d2 < best_d2 {
+                best_d2 = d2;
                 best_img = (ix, iy);
             }
         }
-        if best_dist <= tol_px {
+        if best_d2 <= tol_px * tol_px {
             count += 1;
-            rss += best_dist.powi(2);
+            rss += best_d2;
             pairs.push(((px, py), best_img));
         }
     }
@@ -609,8 +614,10 @@ pub fn solve(
 
     // Catalog epoch: assume current Gaia (2016.0); observation epoch from hints or now.
     let _cat_epoch = cache.catalog_epoch();
-    // Observation epoch: ~2024 (hardcoded reasonable default; can be refined later).
-    let obs_epoch = 2024.04_f64;
+    // Observation epoch for proper-motion propagation: the frame's DATE-OBS
+    // (Julian year, via hints.epoch), else a ~2024 default. Wrong-by-construction
+    // before this — every frame was propagated to a hardcoded 2024.04.
+    let obs_epoch = hints.epoch.unwrap_or(2024.04_f64);
 
     // 4. autoFOV ladder.
     let rungs = fov_rungs(long_px, hints);
@@ -750,7 +757,13 @@ pub fn solve(
     trace.outcome = TraceOutcome::Failed(msg.clone());
     trace.total_ms = t0.elapsed().as_millis() as u64;
     eprintln!("{trace}");
-    anyhow::bail!(msg)
+    // Return the structured failure so callers can render a precise reason
+    // (the trace is otherwise only printed to stderr and dropped here).
+    Err(anyhow::Error::new(crate::diag::SolveFailure {
+        class: trace.classify(),
+        best_attempt: trace.best_attempt(),
+        message: msg,
+    }))
 }
 
 /// Bundled inputs for one search pass — avoids a 17-argument function.

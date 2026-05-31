@@ -50,6 +50,7 @@ fn main() -> Result<()> {
                 fov_deg: opt_f64(rest, "--fov"),
                 pixel_scale_arcsec: opt_f64(rest, "--scale"),
                 search_radius_deg: opt_f64(rest, "--radius"),
+                epoch: opt_f64(rest, "--epoch"),
             };
             let sol = solve(&image, &hints, &solvemyastro::Caches::deep_only(&cache), &SolveConfig::default(), None)?;
             if has(rest, "--json") {

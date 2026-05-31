@@ -228,6 +228,26 @@ impl FailureClass {
     }
 }
 
+/// Structured failure returned by `solve()` so callers can render a precise
+/// reason instead of a generic string. Carries the heuristic [`FailureClass`]
+/// and the best partial attempt seen during the search. `Display` yields the
+/// human `message`; callers can `downcast_ref::<SolveFailure>()` on the
+/// returned `anyhow::Error` to inspect `class` / `best_attempt`.
+#[derive(Debug, Clone)]
+pub struct SolveFailure {
+    pub class: FailureClass,
+    pub best_attempt: Option<BestAttempt>,
+    pub message: String,
+}
+
+impl fmt::Display for SolveFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SolveFailure {}
+
 impl SolveTrace {
     pub fn classify(&self) -> FailureClass {
         if matches!(self.outcome, TraceOutcome::Solved { .. }) {

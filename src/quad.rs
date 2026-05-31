@@ -165,6 +165,17 @@ pub fn build_quads(points: &[(f64, f64)], n: usize, group_size: usize) -> Vec<Qu
         return Vec::new();
     }
 
+    // Large pools (the catalog fallback cone is ~thousands of stars) — the
+    // O(n²) brute-force neighbour scan dominates wall-clock there
+    // (build_quads_cat is the #1 cost on the slow corpus frames). Route to the
+    // O(n·k) spatial-grid K-NN, which is an exact accelerator (identical quad
+    // set). Small pools (image ~600, primary catalog ~600) stay on the
+    // SIMD/scalar path where its tight inner loop wins and grid setup is moot.
+    const GRID_THRESHOLD: usize = 1000;
+    if n > GRID_THRESHOLD {
+        return build_quads_grid(points, n, g);
+    }
+
     // SIMD dispatch (rustafits convention): runtime-detect AVX2+FMA and
     // route to the SIMD-accelerated implementation on x86_64. Binary
     // stays portable — pre-AVX2 x86 CPUs and all non-x86 targets fall
@@ -229,6 +240,148 @@ fn build_quads_scalar(points: &[(f64, f64)], n: usize, g: usize) -> Vec<Quad> {
                 for c in (b + 1)..gsz {
                     for d in (c + 1)..gsz {
                         push_quad(points, [group[a], group[b], group[c], group[d]], &mut quads, &mut seen);
+                    }
+                }
+            }
+        }
+    }
+
+    quads
+}
+
+/// Spatial-grid K-NN for large pools — replaces the O(n²) brute-force
+/// neighbour scan when `n` is big (the catalog fallback cone is ~thousands of
+/// stars, where build_quads dominates wall-clock). Produces the EXACT same
+/// `group_size − 1` nearest neighbours per star as [`build_quads_scalar`]
+/// (ties broken by ascending index, matching the scalar's stable insertion),
+/// so the emitted quad set is bytewise identical — a drop-in accelerator
+/// gated on corpus quad/solution equality and the `grid_matches_scalar` test.
+///
+/// Cost: O(n · k) for roughly-uniform density (vs O(n²)) — a uniform grid of
+/// ~1 point/cell + expanding-ring search with an exact early-stop (once the
+/// next ring's guaranteed-minimum distance exceeds the current k-th best).
+fn build_quads_grid(points: &[(f64, f64)], n: usize, g: usize) -> Vec<Quad> {
+    let n_nbr = g - 1;
+    let mut quads: Vec<Quad> = Vec::with_capacity(n);
+    let mut seen: HashSet<[usize; 4]> = HashSet::new();
+
+    // Bounding box over the active points.
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for &(x, y) in &points[..n] {
+        if x < min_x {
+            min_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+    }
+    let span_x = (max_x - min_x).max(1e-9);
+    let span_y = (max_y - min_y).max(1e-9);
+    // Target ~1 point per cell on average.
+    let cell = ((span_x * span_y) / n as f64).sqrt().max(1e-9);
+    let ncols = ((span_x / cell).ceil() as usize + 1).max(1);
+    let nrows = ((span_y / cell).ceil() as usize + 1).max(1);
+
+    let col_of = |x: f64| -> usize { (((x - min_x) / cell) as usize).min(ncols - 1) };
+    let row_of = |y: f64| -> usize { (((y - min_y) / cell) as usize).min(nrows - 1) };
+
+    let mut grid: Vec<Vec<u32>> = vec![Vec::new(); ncols * nrows];
+    for (i, &(x, y)) in points[..n].iter().enumerate() {
+        grid[row_of(y) * ncols + col_of(x)].push(i as u32);
+    }
+
+    let mut cand: Vec<(f64, usize)> = Vec::with_capacity(64);
+    // Sort by (d² asc, index asc) — the second key makes ties resolve to the
+    // lower index, exactly as the scalar's strict-`>` stable insertion does.
+    let cmp = |a: &(f64, usize), b: &(f64, usize)| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    };
+
+    for i in 0..n {
+        let pi = points[i];
+        let ci = col_of(pi.0);
+        let cj = row_of(pi.1);
+        cand.clear();
+
+        let mut ring: usize = 0;
+        loop {
+            let c0 = ci.saturating_sub(ring);
+            let c1 = (ci + ring).min(ncols - 1);
+            let r0 = cj.saturating_sub(ring);
+            let r1 = (cj + ring).min(nrows - 1);
+            for rr in r0..=r1 {
+                for cc in c0..=c1 {
+                    // Scan a cell only when its EXACT Chebyshev distance from
+                    // (ci,cj) equals this ring — earlier rings covered the
+                    // interior. Using the true distance (not the clamped box
+                    // edge) means a cell is scanned exactly once even when the
+                    // ring is clamped against a grid boundary (the bug the
+                    // `grid_matches_scalar` test caught: clamped edges were
+                    // re-scanned each ring → duplicate neighbours).
+                    let cheb = (cc as isize - ci as isize)
+                        .unsigned_abs()
+                        .max((rr as isize - cj as isize).unsigned_abs());
+                    if cheb != ring {
+                        continue;
+                    }
+                    for &ju in &grid[rr * ncols + cc] {
+                        let j = ju as usize;
+                        if j == i {
+                            continue;
+                        }
+                        cand.push((squared_distance(pi, points[j]), j));
+                    }
+                }
+            }
+
+            let covered_all = c0 == 0 && r0 == 0 && c1 == ncols - 1 && r1 == nrows - 1;
+            if cand.len() >= n_nbr {
+                cand.sort_unstable_by(cmp);
+                cand.truncate(n_nbr.max(8).min(cand.len())); // keep a small margin
+                // Any point in an unscanned cell is ≥ ring*cell away.
+                let ring_min_d = ring as f64 * cell;
+                if ring_min_d * ring_min_d > cand[n_nbr - 1].0 || covered_all {
+                    break;
+                }
+            } else if covered_all {
+                cand.sort_unstable_by(cmp);
+                break;
+            }
+            ring += 1;
+        }
+
+        if cand.len() < n_nbr {
+            continue; // pool too small for this star
+        }
+
+        let mut group = [0usize; 6];
+        let gsz = g.min(6);
+        group[0] = i;
+        for slot in 0..(gsz - 1) {
+            group[slot + 1] = cand[slot].1;
+        }
+
+        for a in 0..gsz {
+            for b in (a + 1)..gsz {
+                for c in (b + 1)..gsz {
+                    for d in (c + 1)..gsz {
+                        push_quad(
+                            points,
+                            [group[a], group[b], group[c], group[d]],
+                            &mut quads,
+                            &mut seen,
+                        );
                     }
                 }
             }
@@ -546,6 +699,58 @@ mod tests {
     fn build_quads_fewer_than_4_returns_empty() {
         let pts = vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)];
         assert!(build_quads(&pts, pts.len(), 4).is_empty());
+    }
+
+    #[test]
+    fn grid_matches_scalar() {
+        // The grid K-NN must be an EXACT accelerator: identical quad set to the
+        // brute-force scalar path (the corpus gate relies on this end-to-end).
+        // Deterministic pseudo-random points (LCG — no rand dep).
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64)
+        };
+        let n = 2000usize;
+        let pts: Vec<(f64, f64)> = (0..n)
+            .map(|_| (next() * 4000.0, next() * 3000.0))
+            .collect();
+
+        for &g in &[4usize, 5, 6] {
+            let scalar = build_quads_scalar(&pts, n, g);
+            let grid = build_quads_grid(&pts, n, g);
+            assert_eq!(
+                grid.len(),
+                scalar.len(),
+                "g={g}: quad count differs (grid {} vs scalar {})",
+                grid.len(),
+                scalar.len()
+            );
+            let mut sm: std::collections::HashMap<[usize; 4], &Quad> =
+                std::collections::HashMap::new();
+            for q in &scalar {
+                sm.insert(q.star_idx, q);
+            }
+            for q in &grid {
+                let s = sm
+                    .get(&q.star_idx)
+                    .unwrap_or_else(|| panic!("g={g}: grid quad {:?} absent from scalar set", q.star_idx));
+                assert!(
+                    (q.longest - s.longest).abs() < 1e-9,
+                    "g={g}: longest differs for {:?}",
+                    q.star_idx
+                );
+                for k in 0..5 {
+                    assert!(
+                        (q.ratios[k] - s.ratios[k]).abs() < 1e-12,
+                        "g={g}: ratio[{k}] differs for {:?}",
+                        q.star_idx
+                    );
+                }
+            }
+        }
     }
 
     #[test]
