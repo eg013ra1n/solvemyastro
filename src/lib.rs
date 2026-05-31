@@ -214,6 +214,32 @@ pub struct SolveSolution {
     pub solve_time_ms: u64,
 }
 
+/// B1: decide the scale to retry at, given a failed attempt. Returns the
+/// recovered `best_attempt` scale only when it is physically plausible, backed
+/// by enough inliers, and meaningfully different from the supplied hint (so we
+/// don't re-search where step A already did). Correctness-safe: the caller's
+/// retry must still pass full verification.
+fn harvest_scale(
+    failure: &SolveFailure,
+    min_inliers: usize,
+    supplied_scale_arcsec: Option<f64>,
+) -> Option<f64> {
+    let ba = failure.best_attempt.as_ref()?;
+    let s = ba.scale_arcsec_per_px;
+    if !s.is_finite() || s < 0.05 || s > 120.0 {
+        return None;
+    }
+    if ba.inliers < min_inliers {
+        return None;
+    }
+    if let Some(hint) = supplied_scale_arcsec {
+        if hint > 0.0 && (s - hint).abs() / hint <= 0.15 {
+            return None;
+        }
+    }
+    Some(s)
+}
+
 /// Solve an image to a precise (SIP) WCS.
 ///
 /// `image` is a path to a FITS/XISF file (decoded + detected via rustafits
@@ -284,5 +310,45 @@ mod fallback_config_tests {
         assert_eq!(c.b1_min_inliers, 2);
         assert_eq!(c.b2_scale_lo_factor, 0.125);
         assert_eq!(c.b2_scale_hi_factor, 2.0);
+    }
+}
+
+#[cfg(test)]
+mod harvest_tests {
+    use super::harvest_scale;
+    use crate::diag::{BestAttempt, FailureClass, SolveFailure};
+
+    fn failure_with(scale: f64, inliers: usize) -> SolveFailure {
+        SolveFailure {
+            class: FailureClass::VerifyGap { best: inliers, required: 6 },
+            message: String::new(),
+            best_attempt: Some(BestAttempt {
+                pass_balance: true, pass_idx: 1, rung_idx: 4, rung_total: 6,
+                seed_ra: 36.7, seed_dec: 60.8, scale_arcsec_per_px: scale,
+                cat_in_fov: 237, inliers, required: 6, rms_px: 0.0,
+                seed_rms_px: 2.7, log_odds: 12.9,
+                dist_from_truth_deg: None, scale_ratio_to_truth: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn harvests_when_scale_diverges_and_inliers_ok() {
+        // true 0.879 vs supplied 3.52 (4x) -> harvest.
+        assert_eq!(harvest_scale(&failure_with(0.879, 2), 2, Some(3.52)), Some(0.879));
+    }
+    #[test]
+    fn rejects_low_inliers() {
+        assert_eq!(harvest_scale(&failure_with(0.879, 1), 2, Some(3.52)), None);
+    }
+    #[test]
+    fn rejects_when_scale_matches_hint() {
+        // recovered scale within 15% of the supplied hint -> A already searched there.
+        assert_eq!(harvest_scale(&failure_with(3.50, 5), 2, Some(3.52)), None);
+    }
+    #[test]
+    fn rejects_unphysical_scale() {
+        assert_eq!(harvest_scale(&failure_with(0.0, 5), 2, Some(3.52)), None);
+        assert_eq!(harvest_scale(&failure_with(500.0, 5), 2, Some(3.52)), None);
     }
 }
