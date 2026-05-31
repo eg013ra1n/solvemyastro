@@ -17,3 +17,6 @@ Thumbs.db
 
 # Internal docs (not published)
 /docs/
+
+# Regeneratable corpus-bench run output (the frozen baseline is corpus_baseline.json)
+/tests/corpus_run.json
