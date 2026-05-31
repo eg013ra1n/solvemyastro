@@ -583,17 +583,26 @@ fn required_inliers(expected_bright_in_fov: usize, n_detected: usize) -> usize {
 // Main solve entry point
 // ---------------------------------------------------------------------------
 
-/// Solve an image to a WCS. Called from `lib.rs::solve`.
-///
-/// `cancel`: optional cooperative cancellation flag — checked at three
-/// responsive points (rung top, inside each rayon trial, before each
-/// candidate verify). On observed cancel, returns `Err("cancelled")`.
+/// Public solve entry — hint-derived/blind FOV ladder (no scale-bound override).
 pub fn solve(
     image: &Path,
     hints: &SolveHints,
     caches: &crate::Caches<'_>,
     cfg: &SolveConfig,
     cancel: Option<&AtomicBool>,
+) -> Result<SolveSolution> {
+    solve_inner(image, hints, caches, cfg, cancel, None)
+}
+
+/// Internal entry: `scale_bounds = Some((lo_arcsec, hi_arcsec))` drives a
+/// bounded FOV ladder (B2); `None` uses the hint-derived/blind ladder.
+pub(crate) fn solve_inner(
+    image: &Path,
+    hints: &SolveHints,
+    caches: &crate::Caches<'_>,
+    cfg: &SolveConfig,
+    cancel: Option<&AtomicBool>,
+    scale_bounds: Option<(f64, f64)>,
 ) -> Result<SolveSolution> {
     // The deep cache is the only one used by every stage; the optional
     // bright cache is consulted for quad matching with auto-fallback.
@@ -641,7 +650,10 @@ pub fn solve(
     let obs_epoch = hints.epoch.unwrap_or(2024.04_f64);
 
     // 4. autoFOV ladder.
-    let rungs = fov_rungs(long_px, hints);
+    let rungs = match scale_bounds {
+        Some((lo, hi)) => fov_rungs_bounded(long_px, lo, hi),
+        None => fov_rungs(long_px, hints),
+    };
 
     // Search center + radius.
     let center = match (hints.ra, hints.dec) {
