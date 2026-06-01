@@ -724,6 +724,7 @@ pub(crate) fn solve_inner(
         cancel,
         timing: &timing,
         truth,
+        frame_name: &frame_name,
     };
     let mut primary_pass = PassTrace::new(false);
     let primary_result = run_search(&ctx, false, &mut primary_pass);
@@ -834,6 +835,9 @@ struct SearchCtx<'a> {
     /// answer "did any trial seed land near the true answer?" — never
     /// influences solver decisions.
     truth: Option<KnownTruth>,
+    /// Frame file name, threaded for the Phase-0 residual-field dump
+    /// (`SOLVEMYASTRO_DUMP_RESIDUALS=1`). Diagnostic only.
+    frame_name: &'a str,
 }
 
 /// One search pass over the autoFOV ladder × square spiral.
@@ -871,6 +875,7 @@ fn run_search(
         cancel,
         timing,
         truth,
+        frame_name,
     } = ctx;
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
@@ -1293,6 +1298,17 @@ fn run_search(
 
             // Mark verified so remaining parallel trials in this rung stop early.
             any_verified.store(true, Ordering::Relaxed);
+
+            // Phase-0 diagnostic (SOLVEMYASTRO_DUMP_RESIDUALS=1): dump the
+            // per-star residual vector field at the final (SIP-or-linear) WCS
+            // so we can read centroid-bound (random scatter) vs distortion-bound
+            // (radial/quadrant structure) before any precision work. Gated —
+            // zero cost in normal solves.
+            if crate::diag::dump_residuals_enabled() {
+                let (_, _, resid_pairs) =
+                    count_inliers(&sip_wcs, &verify_stars, &image_pts, width, height, tol_px);
+                crate::diag::dump_residual_field(frame_name, &resid_pairs);
+            }
 
             // Successful return: snapshot this rung into pass_trace before
             // exiting so the funnel includes the rung that ultimately solved.

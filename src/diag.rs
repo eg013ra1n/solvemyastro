@@ -15,6 +15,61 @@ pub fn debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Honour `SOLVEMYASTRO_DUMP_RESIDUALS=1` — emit a per-star residual vector
+/// field (catalog-predicted vs detected pixel positions) for each solved
+/// frame. A pre-flight diagnostic to decide whether the precision ceiling is
+/// **centroid-bound** (residuals scatter randomly) or **distortion-bound**
+/// (residuals show radial / quadrant structure across the image plane).
+pub fn dump_residuals_enabled() -> bool {
+    std::env::var("SOLVEMYASTRO_DUMP_RESIDUALS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Write the per-star residual vector field for `frame` to
+/// `<SOLVEMYASTRO_DUMP_DIR or .>/residual-vector-<frame>.csv`.
+///
+/// `pairs` are `((predicted_px, predicted_py), (detected_px, detected_py))`
+/// exactly as produced by `count_inliers`. Emitted columns:
+/// `det_x,det_y,res_x,res_y,res_mag` where `res = detected - predicted` — the
+/// vector from where the catalog says the star is to where it was measured.
+/// Plot `(det_x, det_y)` coloured/quivered by `(res_x, res_y)` to read the
+/// spatial structure. Best-effort: I/O errors log to stderr and never
+/// propagate (this is a diagnostic, not a solve dependency).
+pub fn dump_residual_field(frame: &str, pairs: &[((f64, f64), (f64, f64))]) {
+    use std::io::Write;
+    let dir = std::env::var("SOLVEMYASTRO_DUMP_DIR").unwrap_or_else(|_| ".".to_string());
+    let safe: String = frame
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = std::path::Path::new(&dir).join(format!("residual-vector-{safe}.csv"));
+    let mut out = String::with_capacity(pairs.len() * 48 + 64);
+    out.push_str("det_x,det_y,res_x,res_y,res_mag\n");
+    for &((px, py), (dx, dy)) in pairs {
+        let (rx, ry) = (dx - px, dy - py);
+        let mag = (rx * rx + ry * ry).sqrt();
+        out.push_str(&format!("{dx:.4},{dy:.4},{rx:.5},{ry:.5},{mag:.5}\n"));
+    }
+    match std::fs::File::create(&path).and_then(|mut f| f.write_all(out.as_bytes())) {
+        Ok(()) => eprintln!(
+            "[solvemyastro] residual field ({} stars) → {}",
+            pairs.len(),
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "[solvemyastro] failed to write residual field to {}: {e}",
+            path.display()
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SolveTrace {
     pub frame: String,
