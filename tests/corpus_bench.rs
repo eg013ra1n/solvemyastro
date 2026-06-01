@@ -370,12 +370,28 @@ fn corpus_bench() {
         None
     };
 
+    // SOLVEMYASTRO_PRECISE=1 — opt-in "precise" profile for Phase-1 measurement.
+    // Enables PSF-refined centroids (Moffat LM via rustafits) in the detection
+    // stage. Results are printed per-frame (RMS, FWHM) but NOT gated — the hard
+    // gate always runs on the default fast profile. Run as:
+    //   SOLVEMYASTRO_PRECISE=1 cargo test -p solvemyastro --release \
+    //     --test corpus_bench -- --ignored --nocapture
+    let precise_mode = std::env::var("SOLVEMYASTRO_PRECISE").ok().as_deref() == Some("1");
+    if precise_mode {
+        println!("\n[corpus_bench] Running in PRECISE mode (PSF centroid refinement ON)");
+    }
+
     let cfg = SolveConfig {
         // Phase 1 instrumentation: print per-stage timing for each frame so we
         // can validate where wall-clock actually goes before committing to the
         // Phase 3 speed work. Strip this back to default() once the data is
         // captured.
         print_timing: true,
+        centroid_refinement: if precise_mode {
+            solvemyastro::CentroidRefinement::Auto
+        } else {
+            solvemyastro::CentroidRefinement::Off
+        },
         ..SolveConfig::default()
     };
 
@@ -430,6 +446,8 @@ fn corpus_bench() {
         total_detected: usize,
         sip_order: i32,     // 0 if no SIP
         elapsed_ms: u64,
+        // Phase-1 PSF refinement metrics (precise-mode only).
+        psf_fwhm_px: Option<f64>,
     }
 
     let mut results: Vec<FrameResult> = Vec::new();
@@ -490,6 +508,8 @@ fn corpus_bench() {
         let mut m_total = 0usize;
         let mut m_sip_order = 0i32;
 
+        let mut m_psf_fwhm: Option<f64> = None;
+
         let (smc_solved, smc_ra, smc_dec, smc_scale, has_sip, notes) = match solve_result {
             Ok(Ok(sol)) => {
                 let ra = sol.wcs.crval.0;
@@ -506,6 +526,7 @@ fn corpus_bench() {
                     .as_ref()
                     .map(|(a, _)| a.order as i32)
                     .unwrap_or(0);
+                m_psf_fwhm = sol.psf_fwhm_px;
                 (true, ra, dec, scale, sip, String::new())
             }
             Ok(Err(e)) => {
@@ -548,9 +569,20 @@ fn corpus_bench() {
         let flag = if truth_solved && !correct && smc_solved { "  <-- WRONG" }
                    else if truth_solved && !smc_solved { "  <-- MISSED" }
                    else { "" };
+        // Precise-mode suffix: show per-frame RMS and PSF FWHM when available.
+        let precise_suffix = if precise_mode {
+            let rms_s = if m_rms >= 0.0 { format!(" rms={:.3}px", m_rms) } else { String::new() };
+            let fwhm_s = match m_psf_fwhm {
+                Some(f) => format!(" fwhm={:.2}px", f),
+                None    => " fwhm=--".to_string(),
+            };
+            format!("{rms_s}{fwhm_s}")
+        } else {
+            String::new()
+        };
 
         println!(
-            "{:52} {} {} {} {} {} {:>7}  {}{}{}",
+            "{:52} {} {} {} {} {} {:>7}  {}{}{}{}",
             &name[..name.len().min(52)],
             truth_tag, smc_tag,
             dpos_str, dscale_str,
@@ -558,7 +590,8 @@ fn corpus_bench() {
             elapsed_ms,
             notes,
             sip_note,
-            flag
+            flag,
+            precise_suffix
         );
 
         results.push(FrameResult {
@@ -582,6 +615,7 @@ fn corpus_bench() {
             total_detected: m_total,
             sip_order: m_sip_order,
             elapsed_ms,
+            psf_fwhm_px: m_psf_fwhm,
         });
     }
 
@@ -791,4 +825,44 @@ fn corpus_bench() {
     }
 
     println!("\nGATE: ALL assertions PASSED");
+
+    // -----------------------------------------------------------------------
+    // Phase-1 precise-mode summary (printed after the gate so it doesn't
+    // clutter normal runs). Shows per-frame RMS for the two key targets.
+    // -----------------------------------------------------------------------
+    if precise_mode {
+        println!("\n=== PRECISE-MODE SUMMARY (PSF centroid refinement) ===");
+        println!("{:52} {:>10} {:>10}", "Frame", "RMS (px)", "FWHM (px)");
+        println!("{}", "-".repeat(75));
+        for r in &results {
+            if r.rms_px >= 0.0 {
+                let fwhm_s = match r.psf_fwhm_px {
+                    Some(f) => format!("{:10.3}", f),
+                    None    => "        --".to_string(),
+                };
+                println!("{:52} {:10.3} {}", &r.name[..r.name.len().min(52)], r.rms_px, fwhm_s);
+            }
+        }
+
+        // Focus targets.
+        let frame_0008 = results.iter().find(|r| r.name.contains("_0008"));
+        let frame_m78  = results.iter().find(|r| r.name.contains("2024-01-13_20-27-32_L_-10.00_120.00s_0081"));
+
+        println!("\n--- Phase-1 targets ---");
+        if let Some(r) = frame_0008 {
+            println!("  _0008: rms={:.3}px fwhm={}",
+                r.rms_px,
+                r.psf_fwhm_px.map(|f| format!("{:.2}px", f)).unwrap_or("--".to_string()));
+        } else {
+            println!("  _0008: not in results");
+        }
+        if let Some(r) = frame_m78 {
+            println!("  M78 (_0081): rms={:.3}px fwhm={}",
+                r.rms_px,
+                r.psf_fwhm_px.map(|f| format!("{:.2}px", f)).unwrap_or("--".to_string()));
+        } else {
+            println!("  M78: not in results");
+        }
+        println!("=======================================================");
+    }
 }

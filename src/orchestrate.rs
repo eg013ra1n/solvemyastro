@@ -611,11 +611,54 @@ pub(crate) fn solve_inner(
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
     // 1. Detect stars.
-    let result = astroimage::ImageAnalyzer::new()
-        .with_detection_sigma(5.0)
-        .with_max_stars(600)
-        .detect_fast(image)
-        .map_err(|e| anyhow::anyhow!("detect_fast failed: {e}"))?;
+    //
+    // When centroid_refinement is Auto, run the Moffat LM refinement pass
+    // inside rustafits. After detection, the global fallback gate in
+    // `crate::refine` checks whether the field is amenable to PSF fitting
+    // (FWHM ≥ 1.5 px, median SNR ≥ 10). If the gate fires, we re-run
+    // detection without refinement to recover byte-identical pass-1 positions.
+    // The gate fires rarely (only undersampled or very faint fields).
+    let use_refine = cfg.centroid_refinement == crate::CentroidRefinement::Auto;
+
+    let (result, psf_fwhm_px) = if use_refine {
+        let r = astroimage::ImageAnalyzer::new()
+            .with_detection_sigma(5.0)
+            .with_max_stars(600)
+            .with_centroid_refine(true)
+            .detect_fast(image)
+            .map_err(|e| anyhow::anyhow!("detect_fast failed: {e}"))?;
+
+        let (decision, median_fwhm) = crate::refine::evaluate_refinement(&r.stars);
+        match decision {
+            crate::refine::RefineDecision::Accept => {
+                eprintln!(
+                    "[solvemyastro] PSF refinement accepted: median FWHM={:.2}px",
+                    median_fwhm
+                );
+                (r, Some(median_fwhm))
+            }
+            crate::refine::RefineDecision::Revert { reason } => {
+                eprintln!(
+                    "[solvemyastro] PSF refinement reverted ({:?}): re-detecting without refine",
+                    reason
+                );
+                // Re-run without refinement to get clean pass-1 positions.
+                let r2 = astroimage::ImageAnalyzer::new()
+                    .with_detection_sigma(5.0)
+                    .with_max_stars(600)
+                    .detect_fast(image)
+                    .map_err(|e| anyhow::anyhow!("detect_fast (pass-1 fallback) failed: {e}"))?;
+                (r2, None)
+            }
+        }
+    } else {
+        let r = astroimage::ImageAnalyzer::new()
+            .with_detection_sigma(5.0)
+            .with_max_stars(600)
+            .detect_fast(image)
+            .map_err(|e| anyhow::anyhow!("detect_fast failed: {e}"))?;
+        (r, None)
+    };
 
     let width = result.width as f64;
     let height = result.height as f64;
@@ -736,7 +779,8 @@ pub(crate) fn solve_inner(
             eprintln!("{trace}");
             return Err(e);
         }
-        Ok(Some(sol)) => {
+        Ok(Some(mut sol)) => {
+            sol.psf_fwhm_px = psf_fwhm_px;
             trace.outcome = TraceOutcome::Solved {
                 ra: sol.wcs.crval.0, dec: sol.wcs.crval.1,
                 inliers: sol.matched_stars, rms_px: sol.rms_residual_px,
@@ -767,7 +811,8 @@ pub(crate) fn solve_inner(
             eprintln!("{trace}");
             return Err(e);
         }
-        Ok(Some(sol)) => {
+        Ok(Some(mut sol)) => {
+            sol.psf_fwhm_px = psf_fwhm_px;
             trace.outcome = TraceOutcome::Solved {
                 ra: sol.wcs.crval.0, dec: sol.wcs.crval.1,
                 inliers: sol.matched_stars, rms_px: sol.rms_residual_px,
@@ -1326,6 +1371,9 @@ fn run_search(
                 algorithm: "solvemyastro".to_string(),
                 solve_time_ms,
                 wcs: sip_wcs,
+                // psf_fwhm_px is patched in by solve_inner after run_search returns,
+                // since only solve_inner has the PSF detection result in scope.
+                psf_fwhm_px: None,
             }));
         } // end 'candidates loop
             // This chunk's candidates didn't verify — fall through to the

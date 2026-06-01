@@ -20,6 +20,7 @@ pub(crate) mod math;
 pub mod orchestrate;
 pub mod project;
 pub mod quad;
+pub(crate) mod refine;
 pub mod select;
 pub mod sip;
 pub mod verify;
@@ -77,6 +78,31 @@ pub struct CatalogStar {
     pub dec: f64,
     /// Apparent magnitude (catalog native band).
     pub mag: f32,
+}
+
+/// Centroid refinement mode for the detection stage.
+///
+/// Controls whether PSF-refined centroids (Moffat LM fit via `rustafits`) are
+/// used for quad-building. The refined path produces sub-pixel centroids
+/// (~0.05 px at SNR≥20) at the cost of a per-star Moffat fit.
+///
+/// # Default
+///
+/// [`CentroidRefinement::Off`] — the fast pass-1 centroid path, byte-identical
+/// to the pre-Phase-1 behaviour. Refinement must be **explicitly opted in**.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CentroidRefinement {
+    /// Pass-1 intensity-weighted centroids only. Default. Zero extra cost.
+    #[default]
+    Off,
+    /// PSF refinement via Moffat LM fit (7-parameter, fixed β=3).
+    ///
+    /// After `detect_fast`, each star with SNR≥10 gets a Moffat fit on a
+    /// stamp window. Per-star gates (non-physical parameters, centre shift
+    /// > 2 px) fall back to the pass-1 centroid. Global field gates (median
+    /// FWHM < 1.5 px OR median SNR < 10) disable refinement for the whole
+    /// frame and revert to pass-1 positions.
+    Auto,
 }
 
 /// Optional priors from the image's metadata. All `None` ⇒ true blind.
@@ -148,6 +174,15 @@ pub struct SolveConfig {
     pub b2_scale_lo_factor: f64,
     /// B2 bounded-sweep upper scale factor (× the hint). Default `2.0` (×2).
     pub b2_scale_hi_factor: f64,
+    /// PSF centroid refinement mode for the detection stage.
+    ///
+    /// Default [`CentroidRefinement::Off`] — the fast pass-1 path, byte-identical
+    /// to pre-Phase-1 behaviour. Set to [`CentroidRefinement::Auto`] for the
+    /// "precise" profile (Moffat-refined centroids fed into quad building).
+    /// When [`CentroidRefinement::Auto`] is chosen but the global field gates
+    /// reject refinement (undersampled FWHM < 1.5 px, or median SNR < 10),
+    /// the solver logs a warning and uses pass-1 positions instead.
+    pub centroid_refinement: CentroidRefinement,
 }
 
 impl Default for SolveConfig {
@@ -166,6 +201,7 @@ impl Default for SolveConfig {
             b1_min_inliers: 2,
             b2_scale_lo_factor: 0.125,
             b2_scale_hi_factor: 2.0,
+            centroid_refinement: CentroidRefinement::Off,
         }
     }
 }
@@ -212,6 +248,12 @@ pub struct SolveSolution {
     /// Wall-clock time from `solve()` entry to return, milliseconds. Includes
     /// rustafits detection, blind search, and any SIP fit.
     pub solve_time_ms: u64,
+    /// Median fitted PSF FWHM across PSF-refined stars (pixels).
+    /// `Some(fwhm)` only when [`SolveConfig::centroid_refinement`] is
+    /// [`CentroidRefinement::Auto`] and the global field gates accepted
+    /// refinement. `None` when refinement is off or the field was rejected
+    /// by the undersampled/low-SNR gate.
+    pub psf_fwhm_px: Option<f64>,
 }
 
 /// B1: decide the scale to retry at, given a failed attempt. Returns the
