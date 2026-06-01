@@ -20,6 +20,7 @@ pub(crate) mod math;
 pub mod orchestrate;
 pub mod project;
 pub mod quad;
+pub mod register;
 pub(crate) mod refine;
 pub mod select;
 pub mod sip;
@@ -29,6 +30,7 @@ pub mod wcs_fit;
 
 pub use cache::{PixelCache, StarCache, StarRecord};
 pub use diag::{BestAttempt, FailureClass, SolveFailure};
+pub use register::{register, Registration};
 pub use wcs::{SipCoefficients, WcsSolution};
 
 /// Bundle of star caches passed to [`solve`]. Always carries a `deep`
@@ -384,16 +386,6 @@ pub fn solve(
     result
 }
 
-/// Future seam (NOT in scope for this plan): register a sub-frame's
-/// detections to an already-solved reference WCS and return the sub's
-/// propagated/refined WCS. Shape is fixed now so the later registration
-/// layer is not architecturally blocked.
-pub fn register(
-    _reference: &WcsSolution,
-    _sub_detections: &[(f64, f64)],
-) -> Result<WcsSolution> {
-    anyhow::bail!("solvemyastro::register not implemented (future registration layer)")
-}
 
 #[cfg(test)]
 mod fallback_config_tests {
