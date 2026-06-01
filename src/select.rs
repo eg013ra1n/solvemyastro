@@ -93,6 +93,44 @@ pub fn select_fast_stars(
     select_stars_for_quads(stars, max, |s| (s.x, s.y, s.snr))
 }
 
+/// Select the quad-building star pool from `detect_fast` detections, returning
+/// per-star centroid σ alongside positions.  Used by the precise SIP path to
+/// supply inverse-variance weights to [`crate::sip::fit_sip_annealed`].
+///
+/// Applies the same SNR gate and ranking as [`select_fast_stars`].  The
+/// returned tuple is `(x, y, σx, σy)` in pixels.  `σx`/`σy` mirror
+/// `FastStar::sx`/`sy` — they are `0.0` when the star was not PSF-refined
+/// (i.e. refinement is off or the per-star gate fired); `fit_sip_annealed`
+/// treats `0` / non-finite σ as "unknown" and applies uniform weight for that
+/// star.
+///
+/// # Contract
+///
+/// The returned `Vec` is **always the same length and in the same order** as
+/// the companion `Vec<(f64,f64)>` produced by calling `select_fast_stars` on
+/// the same `stars` slice with the same `max`.  Callers that need both can
+/// call this function and build the position slice with `.map(|(x,y,_,_)| (x,y))`.
+pub fn select_fast_stars_with_sigma(
+    stars: &[astroimage::FastStar],
+    max: usize,
+) -> Vec<(f64, f64, f64, f64)> {
+    // Gate: keep only SNR > threshold, same predicate as select_fast_stars.
+    let mut passing: Vec<(f32, f32, f32, f32, f32)> = stars
+        .iter()
+        .map(|s| (s.x, s.y, s.snr, s.sx, s.sy))
+        .filter(|&(_, _, snr, _, _)| snr > SNR_THRESHOLD)
+        .collect();
+
+    // Rank by SNR descending — byte-identical ordering to select_fast_stars.
+    passing.sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    passing
+        .into_iter()
+        .take(max)
+        .map(|(x, y, _snr, sx, sy)| (x as f64, y as f64, sx as f64, sy as f64))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

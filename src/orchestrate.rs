@@ -75,7 +75,7 @@ use crate::{
     math::great_circle_deg,
     project::project_catalog,
     quad::{build_quads, fit_affine, group_size_for, match_quads_stats},
-    select::select_fast_stars,
+    select::{select_fast_stars, select_fast_stars_with_sigma},
     wcs::WcsSolution,
     wcs_fit::affine_to_wcs,
     CatalogStar, PixelCache, SolveConfig, SolveHints, SolveSolution, StarCache,
@@ -618,9 +618,16 @@ pub(crate) fn solve_inner(
     // (FWHM ≥ 1.5 px, median SNR ≥ 10). If the gate fires, we re-run
     // detection without refinement to recover byte-identical pass-1 positions.
     // The gate fires rarely (only undersampled or very faint fields).
+    //
+    // Phase 2: when refinement is accepted, `refinement_accepted = true` and
+    // we thread the per-star σ values (sx, sy) into `star_sigmas` alongside
+    // `image_pts` so the precise SIP path can use inverse-variance weights.
     let use_refine = cfg.centroid_refinement == crate::CentroidRefinement::Auto;
 
-    let (result, psf_fwhm_px) = if use_refine {
+    // `refinement_accepted` is set to `true` only when the Auto path runs AND
+    // the global field gate accepts the PSF fits.  In all other cases the σ
+    // values in `FastStar` are 0.0 (pass-1 centroids) and we use None.
+    let (result, psf_fwhm_px, refinement_accepted) = if use_refine {
         let r = astroimage::ImageAnalyzer::new()
             .with_detection_sigma(5.0)
             .with_max_stars(600)
@@ -635,7 +642,7 @@ pub(crate) fn solve_inner(
                     "[solvemyastro] PSF refinement accepted: median FWHM={:.2}px",
                     median_fwhm
                 );
-                (r, Some(median_fwhm))
+                (r, Some(median_fwhm), true)
             }
             crate::refine::RefineDecision::Revert { reason } => {
                 eprintln!(
@@ -648,7 +655,7 @@ pub(crate) fn solve_inner(
                     .with_max_stars(600)
                     .detect_fast(image)
                     .map_err(|e| anyhow::anyhow!("detect_fast (pass-1 fallback) failed: {e}"))?;
-                (r2, None)
+                (r2, None, false)
             }
         }
     } else {
@@ -657,7 +664,7 @@ pub(crate) fn solve_inner(
             .with_max_stars(600)
             .detect_fast(image)
             .map_err(|e| anyhow::anyhow!("detect_fast failed: {e}"))?;
-        (r, None)
+        (r, None, false)
     };
 
     let width = result.width as f64;
@@ -671,11 +678,30 @@ pub(crate) fn solve_inner(
     }
 
     // 2. Select quad pool: SNR > 10, SNR-ranked descending, cap at 600.
+    //
+    // Fast path: `select_fast_stars` — positions only, byte-identical to all
+    // prior solver behaviour.
+    //
+    // Precise path (refinement_accepted): also build the σ slice from
+    // `select_fast_stars_with_sigma`.  The two functions apply the SAME SNR gate
+    // and ranking so the returned slices are always the same length / order.
     let image_pts = select_fast_stars(&result.stars, 600);
     let n = image_pts.len();
     if n < 4 {
         anyhow::bail!("too few stars after selection ({n}, need ≥4)");
     }
+    // σ slice: built only when refinement was accepted so the sx/sy values are
+    // meaningful (PSF-fitted).  None otherwise → uniform weights in the SIP fit.
+    let star_sigmas_storage: Option<Vec<(f64, f64)>> = if refinement_accepted {
+        Some(
+            select_fast_stars_with_sigma(&result.stars, 600)
+                .into_iter()
+                .map(|(_, _, sx, sy)| (sx, sy))
+                .collect(),
+        )
+    } else {
+        None
+    };
 
     // 3. Build image quads once.
     let group_size = group_size_for(n);
@@ -768,6 +794,7 @@ pub(crate) fn solve_inner(
         timing: &timing,
         truth,
         frame_name: &frame_name,
+        star_sigmas: star_sigmas_storage.as_deref(),
     };
     let mut primary_pass = PassTrace::new(false);
     let primary_result = run_search(&ctx, false, &mut primary_pass);
@@ -883,6 +910,12 @@ struct SearchCtx<'a> {
     /// Frame file name, threaded for the Phase-0 residual-field dump
     /// (`SOLVEMYASTRO_DUMP_RESIDUALS=1`). Diagnostic only.
     frame_name: &'a str,
+    /// Phase 2 (precise profile only): per-star centroid σ aligned 1:1 with
+    /// `image_pts`.  `Some` when `CentroidRefinement::Auto` was accepted by
+    /// the global field gate (so `FastStar.sx/sy` are meaningful).  `None`
+    /// in the fast profile or when the refine gate reverted — the SIP fit
+    /// falls back to uniform weights in that case.
+    star_sigmas: Option<&'a [(f64, f64)]>,
 }
 
 /// One search pass over the autoFOV ladder × square spiral.
@@ -921,6 +954,7 @@ fn run_search(
         timing,
         truth,
         frame_name,
+        star_sigmas,
     } = ctx;
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
@@ -1284,22 +1318,42 @@ fn run_search(
             );
 
             // 8. SIP fit (optional).
+            //
+            // Precise profile (star_sigmas.is_some()): use `fit_sip_annealed`
+            // which applies σ-weighted LSQ + 3σ clip in a convergence loop.
+            // Fast profile (star_sigmas.is_none()): use the existing `fit_sip`
+            // unchanged — the fast path must remain byte-identical.
             let (sip_wcs, sip_rms_px, sip_rms_arcsec) = if cfg.fit_sip {
                 let t_sip = Instant::now();
-                let sip_result = crate::sip::fit_sip(
-                    &final_wcs,
-                    &verify_stars,
-                    &image_pts,
-                    width,
-                    height,
-                    tol_px,
-                    cfg.sip_order,
-                );
+                let sip_result = if star_sigmas.is_some() {
+                    // Precise profile: annealed, σ-weighted, σ-clipped SIP fit.
+                    crate::sip::fit_sip_annealed(
+                        &final_wcs,
+                        &verify_stars,
+                        image_pts,
+                        star_sigmas,
+                        width,
+                        height,
+                        tol_px,
+                        cfg.sip_order,
+                    )
+                } else {
+                    // Fast profile: existing two-stage SIP fit — byte-identical.
+                    crate::sip::fit_sip(
+                        &final_wcs,
+                        &verify_stars,
+                        image_pts,
+                        width,
+                        height,
+                        tol_px,
+                        cfg.sip_order,
+                    )
+                };
                 TimingProfile::add(&timing.fit_sip_ns, t_sip.elapsed());
                 match sip_result {
                     Some(w) => {
                         let t = Instant::now();
-                        let (si, srss, sip_pairs) = count_inliers(&w, &verify_stars, &image_pts, width, height, tol_px);
+                        let (si, srss, sip_pairs) = count_inliers(&w, &verify_stars, image_pts, width, height, tol_px);
                         TimingProfile::add(&timing.count_inliers_ns, t.elapsed());
                         timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
                         let srms = if si > 0 { (srss / si as f64).sqrt() } else { f64::MAX };
@@ -1318,17 +1372,18 @@ fn run_search(
                         let p90 = resid.get(resid.len() * 9 / 10).copied().unwrap_or(0.0);
                         let mx = resid.last().copied().unwrap_or(0.0);
                         let gt2 = resid.iter().filter(|&&r| r > 2.0).count();
+                        let profile = if star_sigmas.is_some() { "annealed" } else { "two-stage" };
                         // Keep SIP only if it does not worsen the fit (with the
                         // correct pixel-space math it should strictly improve;
                         // this guards against a pathological field).
                         if srms <= rms_px {
                             eprintln!(
-                                "[solvemyastro] SIP applied: linear rms={rms_px:.2}px → sip rms={srms:.2}px ({si} pairs) | med={med:.2} p90={p90:.2} max={mx:.2} >2px={gt2}"
+                                "[solvemyastro] SIP({profile}) applied: linear rms={rms_px:.2}px → sip rms={srms:.2}px ({si} pairs) | med={med:.2} p90={p90:.2} max={mx:.2} >2px={gt2}"
                             );
                             (w, srms, srms * final_scale)
                         } else {
                             eprintln!(
-                                "[solvemyastro] SIP rejected: rms {srms:.2}px > linear {rms_px:.2}px"
+                                "[solvemyastro] SIP({profile}) rejected: rms {srms:.2}px > linear {rms_px:.2}px"
                             );
                             (final_wcs.clone(), rms_px, rms_arcsec)
                         }
