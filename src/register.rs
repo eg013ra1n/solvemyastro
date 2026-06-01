@@ -452,7 +452,7 @@ mod tests {
             let nearest = ref_pts
                 .iter()
                 .map(|&r| (sq_dist((rx_pred, ry_pred), r), r))
-                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(_, r)| r)
                 .unwrap();
             let err = sq_dist((rx_pred, ry_pred), nearest).sqrt();

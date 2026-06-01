@@ -32,6 +32,10 @@ anyhow = "1"
 memmap2 = "0.9"
 cdshealpix = "0.9"
 byteorder = "1"
+# PROSAC RANSAC deterministic RNG (Phase 3). Seeded from SolveConfig::ransac_seed
+# so the corpus gate produces identical results across repeated runs.
+rand = "0.8"
+rand_xoshiro = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

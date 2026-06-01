@@ -185,6 +185,15 @@ pub struct SolveConfig {
     /// reject refinement (undersampled FWHM < 1.5 px, or median SNR < 10),
     /// the solver logs a warning and uses pass-1 positions instead.
     pub centroid_refinement: CentroidRefinement,
+    /// RNG seed for the PROSAC RANSAC robust-seed path (Phase 3).
+    ///
+    /// The PROSAC path only fires on weak seeds (seed_inliers < 30 OR
+    /// quad_match_pairs < 10); it is completely bypassed on easy frames.
+    /// Using a fixed seed makes the corpus gate deterministic across repeated
+    /// runs. Change this to explore different PROSAC sample paths.
+    ///
+    /// Default `0x5F3759DF_5F3759DF` (an arbitrary non-zero constant).
+    pub ransac_seed: u64,
 }
 
 impl Default for SolveConfig {
@@ -204,6 +213,7 @@ impl Default for SolveConfig {
             b2_scale_lo_factor: 0.125,
             b2_scale_hi_factor: 2.0,
             centroid_refinement: CentroidRefinement::Off,
+            ransac_seed: 0x5F3759DF_5F3759DF,
         }
     }
 }

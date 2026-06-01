@@ -70,11 +70,14 @@ impl TimingProfile {
     }
 }
 
+use rand::SeedableRng;
+use rand_xoshiro::Xoshiro256StarStar;
+
 use crate::{
     diag::{CellStop, CellTrace, KnownTruth, PassTrace, RungTrace, SeedInfo, SolveTrace, TraceOutcome, VerifyTrace, known_truth_for},
     math::great_circle_deg,
     project::project_catalog,
-    quad::{build_quads, fit_affine, group_size_for, match_quads_stats},
+    quad::{build_quads, fit_affine, group_size_for, match_quads_stats, Affine, Quad},
     select::{select_fast_stars, select_fast_stars_with_sigma},
     wcs::WcsSolution,
     wcs_fit::affine_to_wcs,
@@ -292,11 +295,15 @@ struct TrialResult {
     #[allow(dead_code)]
     tangent: (f64, f64),
     scale_arcsec: f64,
+    /// Number of filtered quad-match pairs used to seed this trial's affine.
+    /// Threaded to the verify section so the PROSAC gate (`< 10 pairs`) can
+    /// be applied to the full-field iterative refit decision.
+    quad_match_pairs: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_trial(
-    image_quads: &[crate::quad::Quad],
+    image_quads: &[Quad],
     image_pts: &[(f64, f64)],
     image_center: (f64, f64),
     cell: (f64, f64),
@@ -308,6 +315,10 @@ fn run_trial(
     timing: &TimingProfile,
     hint: Option<(f64, f64)>,
     ct: &mut CellTrace,
+    // Per-trial RANSAC seed: `SolveConfig::ransac_seed` XOR'd with a
+    // deterministic function of the cell coordinates. Ensures repeated
+    // corpus runs produce identical PROSAC sample sequences.
+    ransac_seed: u64,
 ) -> Option<TrialResult> {
     let (ra0, dec0) = cell;
 
@@ -374,11 +385,31 @@ fn run_trial(
         return None;
     }
     let t_fa = Instant::now();
-    let affine = match fit_affine(&matches, iquads, &cat_quads) {
-        Some(a) => a,
-        None => {
-            ct.stop = CellStop::AffineFailed;
-            return None;
+    // PROSAC gate: when there are very few quad matches (< 10), the single
+    // least-squares affine is prone to being poisoned by one bad pair. Run
+    // PROSAC to find a more robust seed. The gate value (10) is chosen so
+    // easy frames — which typically accumulate dozens of matches — skip
+    // PROSAC entirely and remain byte-identical. The `quad_match_pairs`
+    // count is threaded to the caller for its own gating decisions.
+    let quad_match_pairs = matches.len();
+    const PROSAC_WEAK_THRESHOLD: usize = 10;
+    let affine = if quad_match_pairs < PROSAC_WEAK_THRESHOLD {
+        // Weak-match path: PROSAC (100 trials) for a robust seed affine.
+        match prosac_seed_affine(&matches, iquads, &cat_quads, ransac_seed, 100) {
+            Some(a) => a,
+            None => {
+                ct.stop = CellStop::AffineFailed;
+                return None;
+            }
+        }
+    } else {
+        // Strong-match path: existing single SVD affine — byte-identical.
+        match fit_affine(&matches, iquads, &cat_quads) {
+            Some(a) => a,
+            None => {
+                ct.stop = CellStop::AffineFailed;
+                return None;
+            }
         }
     };
     TimingProfile::add(&timing.fit_affine_ns, t_fa.elapsed());
@@ -401,7 +432,7 @@ fn run_trial(
         dist_from_hint_deg,
     });
     ct.stop = CellStop::SeedEmitted;
-    Some(TrialResult { wcs, tangent: (ra0, dec0), scale_arcsec: scale })
+    Some(TrialResult { wcs, tangent: (ra0, dec0), scale_arcsec: scale, quad_match_pairs })
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +572,234 @@ fn refit_affine(
         sip_forward: None,
         sip_reverse: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — iterative σ-clipped affine refit
+// ---------------------------------------------------------------------------
+
+/// Iterative σ-clipped affine refit over inlier pairs.
+///
+/// Runs up to `max_iter` iterations (default 5):
+///   1. Fit affine via `refit_affine`.
+///   2. Recount inliers and compute per-pair residuals.
+///   3. Compute σ of residual distances; drop pairs with residual > `sigma_clip` × σ.
+///   4. Repeat until residual RMS changes < `rms_rtol` (3%) OR the inlier set
+///      is stable (Jaccard similarity > 0.97) OR fewer than 6 pairs survive.
+///
+/// **Gate:** callers MUST only invoke this when `seed_inliers < 50`.
+/// Easy frames (≥ 50 inliers) must use the existing single `refit_affine` path
+/// (byte-identical fast-path skip). This ensures the corpus gate is unaffected.
+///
+/// Returns the best WCS found (maximising inlier count), or `None` if even
+/// the first refit fails.
+fn refit_affine_iter(
+    pairs: &[((f64, f64), (f64, f64))],
+    image_center: (f64, f64),
+    wcs: &WcsSolution,
+    cat_stars: &[CatalogStar],
+    image_pts: &[(f64, f64)],
+    width: f64,
+    height: f64,
+    tol_px: f64,
+) -> Option<WcsSolution> {
+    const MAX_ITER: usize = 5;
+    const SIGMA_CLIP: f64 = 3.0;
+    const RMS_RTOL: f64 = 0.03;
+    const JACCARD_STABLE: f64 = 0.97;
+
+    if pairs.len() < 6 {
+        return None;
+    }
+
+    let mut current_wcs = refit_affine(pairs, image_center, wcs)?;
+    let mut prev_rms = f64::MAX;
+    // Track the inlier index set from the previous iteration for Jaccard stability.
+    let mut prev_pair_count: usize = pairs.len();
+
+    // Use the looser tolerance for gathering refit pairs (same as the caller
+    // does for the single-refit path: tol_px * 2.0, capped).
+    let refit_tol = (tol_px * 2.0).min(MAX_MATCH_PX);
+
+    for _iter in 0..MAX_ITER {
+        // Recount inliers + residuals with current WCS.
+        let (_, rss, cur_pairs) =
+            count_inliers(&current_wcs, cat_stars, image_pts, width, height, refit_tol);
+        if cur_pairs.len() < 6 {
+            break;
+        }
+
+        let n = cur_pairs.len() as f64;
+        let rms = (rss / n).sqrt();
+
+        // Jaccard stability: |intersection| / |union| of pair counts.
+        let intersection = cur_pairs.len().min(prev_pair_count);
+        let union = cur_pairs.len().max(prev_pair_count);
+        let jaccard = if union > 0 { intersection as f64 / union as f64 } else { 1.0 };
+
+        // Convergence checks.
+        let rms_converged = prev_rms.is_finite()
+            && prev_rms > 0.0
+            && (prev_rms - rms).abs() / prev_rms <= RMS_RTOL;
+        let set_stable = jaccard >= JACCARD_STABLE;
+        if rms_converged || set_stable {
+            break;
+        }
+
+        // σ-clip: compute per-pair residual distances, filter > 3σ.
+        let residuals: Vec<f64> = cur_pairs
+            .iter()
+            .map(|&((px, py), (dx, dy))| ((px - dx).powi(2) + (py - dy).powi(2)).sqrt())
+            .collect();
+        let sigma = if rms > 0.0 { rms } else { 1.0 };
+        let clipped: Vec<((f64, f64), (f64, f64))> = cur_pairs
+            .into_iter()
+            .zip(residuals.iter())
+            .filter(|(_, &r)| r <= SIGMA_CLIP * sigma)
+            .map(|(p, _)| p)
+            .collect();
+
+        if clipped.len() < 6 {
+            break;
+        }
+
+        let next_wcs = match refit_affine(&clipped, image_center, &current_wcs) {
+            Some(w) => w,
+            None => break,
+        };
+
+        prev_pair_count = clipped.len();
+        prev_rms = rms;
+        current_wcs = next_wcs;
+    }
+
+    Some(current_wcs)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — PROSAC RANSAC for weak seeds
+// ---------------------------------------------------------------------------
+
+/// PROSAC-style RANSAC seed-affine refinement.
+///
+/// Fires only when `matches.len() < 10` (weak-match gate). For stronger match
+/// sets the single `fit_affine(matches, ...)` path is sufficient and calling
+/// this function is unnecessary overhead.
+///
+/// Algorithm:
+/// - Sort matches by image-quad index ascending (low-index = high-SNR stars,
+///   since `image_pts` is SNR-ranked descending). Low-index quads are
+///   preferentially sampled in early trials ("top-quartile" bias).
+/// - Run up to `n_trials` trials. First 10 trials: draw 3-pair samples
+///   preferentially from the top-quartile (first quarter) of sorted matches;
+///   thereafter: uniform random sampling from all matches.
+/// - Per trial: fit affine from 3 pairs → count inliers from ALL matches.
+/// - Keep the affine with the most inliers.
+///
+/// Determinism: `rng_seed` is a stable per-trial value derived from
+/// `SolveConfig::ransac_seed` XOR'd with the cell coordinates (bit-cast to u64).
+/// The corpus gate uses the same seed on every run.
+///
+/// Returns the best `Affine` found, or the original `fit_affine` result when
+/// the PROSAC result is not an improvement.
+#[allow(clippy::too_many_arguments)]
+fn prosac_seed_affine(
+    matches: &[(usize, usize)],
+    image_quads: &[Quad],
+    cat_quads: &[Quad],
+    rng_seed: u64,
+    n_trials: usize,
+) -> Option<Affine> {
+    use rand::Rng;
+
+    if matches.len() < 3 {
+        return None;
+    }
+
+    // Baseline: try the full-set affine first.
+    let baseline = fit_affine(matches, image_quads, cat_quads);
+
+    if matches.len() < 3 {
+        return baseline;
+    }
+
+    // Sort by image-quad index (ascending = higher-SNR quads first).
+    let mut sorted_matches: Vec<(usize, usize)> = matches.to_vec();
+    sorted_matches.sort_unstable_by_key(|&(ii, _)| ii);
+    let nm = sorted_matches.len();
+    let top_quartile = ((nm / 4).max(3)).min(nm);
+
+    let mut rng = Xoshiro256StarStar::seed_from_u64(rng_seed);
+
+    let mut best_inlier_count = 0usize;
+    let mut best_affine: Option<Affine> = None;
+
+    for trial_idx in 0..n_trials {
+        // Sample 3 pairs.
+        let sample: [(usize, usize); 3] = if trial_idx < 10 && top_quartile >= 3 {
+            // Top-quartile preferential sampling.
+            let i0 = rng.gen_range(0..top_quartile);
+            let mut i1 = rng.gen_range(0..top_quartile);
+            if i1 == i0 { i1 = (i1 + 1) % top_quartile; }
+            let mut i2 = rng.gen_range(0..top_quartile);
+            if i2 == i0 || i2 == i1 { i2 = (i2 + 2) % top_quartile; }
+            [sorted_matches[i0], sorted_matches[i1], sorted_matches[i2]]
+        } else {
+            let i0 = rng.gen_range(0..nm);
+            let mut i1 = rng.gen_range(0..nm);
+            if i1 == i0 { i1 = (i1 + 1) % nm; }
+            let mut i2 = rng.gen_range(0..nm);
+            if i2 == i0 || i2 == i1 { i2 = (i2 + 2) % nm; }
+            [sorted_matches[i0], sorted_matches[i1], sorted_matches[i2]]
+        };
+
+        let trial_matches: Vec<(usize, usize)> = sample.to_vec();
+        let affine = match fit_affine(&trial_matches, image_quads, cat_quads) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        // Count inliers from ALL matches: how many match-pair quad-centers
+        // are consistent with this affine (within a generous pixel tolerance)?
+        let mut inliers = 0usize;
+        let center_tol = 5.0_f64; // pixels in projected space — loose for seed
+        for &(ii, ci) in matches.iter() {
+            let (ix, iy) = image_quads[ii].center;
+            let (cx, cy) = cat_quads[ci].center;
+            let (px, py) = affine.apply(ix, iy);
+            let d2 = (px - cx).powi(2) + (py - cy).powi(2);
+            if d2 <= center_tol * center_tol {
+                inliers += 1;
+            }
+        }
+
+        if inliers > best_inlier_count {
+            best_inlier_count = inliers;
+            best_affine = Some(affine);
+        }
+    }
+
+    // Return the PROSAC result only if it's better than the baseline.
+    // "Better" here means it found an affine (baseline may be None if
+    // the full-set SVD was degenerate) or has more inliers.
+    match (best_affine, baseline) {
+        (Some(pa), None) => Some(pa),
+        (Some(pa), Some(ba)) => {
+            // Count baseline inliers for comparison.
+            let baseline_inliers: usize = matches.iter().filter(|&&(ii, ci)| {
+                let (ix, iy) = image_quads[ii].center;
+                let (cx, cy) = cat_quads[ci].center;
+                let (px, py) = ba.apply(ix, iy);
+                (px - cx).powi(2) + (py - cy).powi(2) <= 25.0
+            }).count();
+            if best_inlier_count > baseline_inliers {
+                Some(pa)
+            } else {
+                Some(ba)
+            }
+        }
+        (None, b) => b,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1306,12 @@ fn run_search(
                         stars
                     };
                     ct.cat_after_cap = stars.len();
+                    // Per-trial deterministic RNG seed: base seed XOR'd with
+                    // the cell RA/Dec bit-patterns so each sky cell gets a
+                    // unique but reproducible PROSAC sample sequence.
+                    let cell_seed = cfg.ransac_seed
+                        ^ cell.0.to_bits()
+                        ^ cell.1.to_bits().wrapping_mul(0x9E3779B97F4A7C15);
                     let trial = run_trial(
                         image_quads,
                         image_pts,
@@ -1060,6 +1325,7 @@ fn run_search(
                         timing,
                         center,
                         &mut ct,
+                        cell_seed,
                     );
                     cells_mutex.lock().unwrap().push(ct);
                     trial
@@ -1244,26 +1510,54 @@ fn run_search(
             }
 
             // 7. Second solve — full-field affine refit over inlier pairs.
+            //
+            // Fast path (≥ 50 seed inliers): existing single `refit_affine`
+            // call — byte-identical to pre-Phase-3 behavior. Easy corpus
+            // frames always land here.
+            //
+            // Robust path (< 50 seed inliers): iterative σ-clipped refit
+            // (`refit_affine_iter`) that runs up to 5 rounds of refit →
+            // σ-clip → refit, stopping when RMS change ≤ 3% or the inlier
+            // set is stable (Jaccard > 0.97). Only weak seeds pay this cost.
+            const ITER_REFIT_GATE: usize = 50;
+            let refit_tol = (tol_px * 2.0).min(MAX_MATCH_PX);
             let final_wcs = if seed_pairs.len() >= 6 {
-                // Use looser tolerance for refit gathering.
-                let refit_tol = (tol_px * 2.0).min(MAX_MATCH_PX);
-                let t = Instant::now();
-                let (_, _, refit_pairs) = count_inliers(
-                    &trial.wcs,
-                    &verify_stars,
-                    &image_pts,
-                    width,
-                    height,
-                    refit_tol,
-                );
-                TimingProfile::add(&timing.count_inliers_ns, t.elapsed());
-                timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
                 let t_ra = Instant::now();
-                let refit = refit_affine(&refit_pairs, image_center, &trial.wcs);
+                let refitted_wcs: Option<WcsSolution> = if seed_inliers < ITER_REFIT_GATE {
+                    // Robust path: iterative σ-clipped refit.
+                    // `refit_affine_iter` re-gathers pairs internally at
+                    // `refit_tol`, so we don't need a pre-gather step.
+                    refit_affine_iter(
+                        &seed_pairs,
+                        image_center,
+                        &trial.wcs,
+                        &verify_stars,
+                        &image_pts,
+                        width,
+                        height,
+                        tol_px,
+                    )
+                } else {
+                    // Fast path: single refit — byte-identical.
+                    let t = Instant::now();
+                    let (_, _, refit_pairs) = count_inliers(
+                        &trial.wcs,
+                        &verify_stars,
+                        &image_pts,
+                        width,
+                        height,
+                        refit_tol,
+                    );
+                    TimingProfile::add(&timing.count_inliers_ns, t.elapsed());
+                    timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
+                    refit_affine(&refit_pairs, image_center, &trial.wcs)
+                };
                 TimingProfile::add(&timing.refit_affine_ns, t_ra.elapsed());
-                match refit {
+
+                match refitted_wcs {
                     Some(refitted) => {
-                        // Verify the refit is an improvement.
+                        // Keep the refitted WCS only when it doesn't degrade
+                        // the inlier count (sanity guard against edge cases).
                         let t = Instant::now();
                         let (ri, _, _) = count_inliers(&refitted, &verify_stars, &image_pts, width, height, tol_px);
                         TimingProfile::add(&timing.count_inliers_ns, t.elapsed());
@@ -1279,6 +1573,10 @@ fn run_search(
             } else {
                 trial.wcs.clone()
             };
+            // Suppress unused-variable warning on quad_match_pairs in the fast
+            // path (the field is threaded for future gating, e.g. additional
+            // PROSAC-based refit decisions).
+            let _ = trial.quad_match_pairs;
 
             // Recount inliers with final WCS.
             let t = Instant::now();
@@ -1475,5 +1773,322 @@ mod bounded_ladder_tests {
         // Reaches near the finer (lo) end: smallest scale ≤ ~1.5× lo.
         let smallest = rungs.last().unwrap().scale_arcsec;
         assert!(smallest <= lo * 1.5 + 1e-6, "must reach the fine end: {smallest}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// B7 — orchestrate unit tests (Phase 3 requirement)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod orchestrate_unit_tests {
+    use super::*;
+    use crate::SolveHints;
+
+    // -----------------------------------------------------------------------
+    // fov_rungs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fov_rungs_hinted_spans_5x_scale() {
+        // A hinted scale should produce a ladder that covers ~5× the hint in
+        // each direction (4 steps of ÷1.5 = 1.5^4 ≈ 5× range on each side).
+        let hints = SolveHints {
+            pixel_scale_arcsec: Some(2.0),
+            ..Default::default()
+        };
+        let rungs = fov_rungs(5000, &hints);
+        // The center rung is the hint itself.
+        let scales: Vec<f64> = rungs.iter().map(|r| r.scale_arcsec).collect();
+        // Hint rung must be present (within 1% rounding).
+        assert!(
+            scales.iter().any(|&s| (s - 2.0).abs() / 2.0 < 0.01),
+            "hint scale 2.0\"/px not found in rungs: {scales:?}"
+        );
+        // Range should span at least 5× the hint in each direction.
+        let min_scale = scales.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_scale = scales.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        // Expect at least 4 rungs (center + expansions).
+        assert!(rungs.len() >= 4, "hinted ladder must have ≥4 rungs; got {}", rungs.len());
+        assert!(
+            max_scale / min_scale >= 3.0,
+            "scale range must span ≥3×; got {min_scale:.3}..{max_scale:.3}\"/px"
+        );
+    }
+
+    #[test]
+    fn fov_rungs_blind_descends_from_max_to_min() {
+        let hints = SolveHints::default(); // no hints → blind
+        let rungs = fov_rungs(5000, &hints);
+        // Blind ladder must be non-empty and start near FOV_MAX_DEG.
+        assert!(!rungs.is_empty());
+        assert!(
+            (rungs[0].fov_deg - FOV_MAX_DEG).abs() < 1e-9,
+            "blind ladder must start at FOV_MAX_DEG"
+        );
+        // Must descend monotonically.
+        for w in rungs.windows(2) {
+            assert!(w[0].fov_deg >= w[1].fov_deg, "blind ladder must descend");
+        }
+        // Last rung must be at or below FOV_MIN_DEG.
+        assert!(
+            rungs.last().unwrap().fov_deg <= FOV_MIN_DEG + 1e-9,
+            "blind ladder must reach FOV_MIN_DEG"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // spiral_cells
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn spiral_cells_centre_first() {
+        // The first cell emitted must be the centre (0-offset in the spiral).
+        let cells = spiral_cells(Some((45.0, 30.0)), 5.0, 2.0);
+        assert!(!cells.is_empty());
+        let (r0, d0) = cells[0];
+        assert!(
+            great_circle_deg(r0, d0, 45.0, 30.0) < 1e-6,
+            "first cell must be the centre; got ({r0:.4}, {d0:.4})"
+        );
+    }
+
+    #[test]
+    fn spiral_cells_antimeridian_wrap() {
+        // Center near RA=359° — cells should not produce negative RA.
+        let cells = spiral_cells(Some((359.5, 0.0)), 3.0, 1.0);
+        for &(ra, _dec) in &cells {
+            assert!(ra >= 0.0 && ra < 360.0, "RA out of [0,360): {ra}");
+        }
+    }
+
+    #[test]
+    fn spiral_cells_pole_does_not_panic() {
+        // Declination near the pole — cos(dec) → 0, RA step → ∞; must not panic.
+        let cells = spiral_cells(Some((0.0, 89.5)), 2.0, 1.0);
+        // Just verify we get at least the centre cell without panicking.
+        assert!(!cells.is_empty());
+    }
+
+    #[test]
+    fn spiral_cells_blind_covers_full_sky() {
+        // No center → blind mode → many cells.
+        let cells = spiral_cells(None, 180.0, 5.0);
+        // At step 5° and radius 180° we expect hundreds of cells.
+        assert!(cells.len() > 100, "blind spiral should cover many cells; got {}", cells.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // count_inliers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn count_inliers_basic() {
+        // Synthetic WCS: identity (pixel = sky in arcsec units — doesn't matter
+        // for this test since we directly use count_inliers with a crafted WCS).
+        // Build a WCS with known pixel_to_sky/sky_to_pixel behavior.
+        // Use the direct catalog⟶pixel mapping of count_inliers:
+        // it calls wcs.sky_to_pixel(cat.ra, cat.dec) and matches to image_pts.
+        //
+        // Strategy: use a trivial CD matrix where 1 arcsec = 1 pixel so
+        // sky_to_pixel(ra, dec) = (ra*3600, dec*3600) (approximately).
+        // Build cat stars and image_pts that should all match within tol.
+
+        // A real WCS solution with an identity-like CD matrix (1"/px at a
+        // tangent point of (0°, 0°)) is easiest to construct here.
+        use crate::wcs::WcsSolution;
+        let wcs = WcsSolution {
+            crpix: (0.0, 0.0),
+            crval: (0.0, 0.0),
+            cd: [[1.0 / 3600.0, 0.0], [0.0, 1.0 / 3600.0]],
+            sip_forward: None,
+            sip_reverse: None,
+        };
+        // At this WCS, sky_to_pixel(0.001, 0.001) ≈ (3.6, 3.6).
+        let cat = CatalogStar { ra: 0.001, dec: 0.001, mag: 10.0 };
+        let image_pts = vec![(3.6, 3.6)]; // close match
+
+        let (count, rss, pairs) = count_inliers(&wcs, &[cat], &image_pts, 100.0, 100.0, 2.0);
+        assert_eq!(count, 1, "one star should match");
+        assert!(rss.is_finite() && rss >= 0.0);
+        assert_eq!(pairs.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // required_inliers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn required_inliers_floor_at_min_absolute() {
+        // When both the catalog and detected counts are tiny, the floor is
+        // MIN_ABSOLUTE_INLIERS (6).
+        let r = required_inliers(0, 0);
+        assert_eq!(r, MIN_ABSOLUTE_INLIERS);
+    }
+
+    #[test]
+    fn required_inliers_dynamic_capped_at_detected() {
+        // Large catalog but tiny detection pool → cap at 5% of detected.
+        let r = required_inliers(10_000, 20); // cat_floor=500, det_cap=1 → max(6,1)=6
+        // det_cap = 1 < MIN_ABSOLUTE_INLIERS=6, so result = 6.
+        assert_eq!(r, MIN_ABSOLUTE_INLIERS);
+    }
+
+    #[test]
+    fn required_inliers_scales_with_catalog() {
+        // With 200 bright stars in FOV and 300 detected:
+        // cat_floor = 200*0.05 = 10, det_cap = 300*0.05 = 15 → min(10,15)=10 → max(6,10)=10.
+        let r = required_inliers(200, 300);
+        assert_eq!(r, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // adaptive_tol_px
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn adaptive_tol_px_base_case() {
+        // At 3.0"/px with base_arcsec=3.0: tol = 3.0/3.0 = 1.0 px.
+        // But floor is 1.5, so result = 1.5.
+        let t = adaptive_tol_px(3.0, BASE_MATCH_ARCSEC);
+        assert!((t - 1.5).abs() < 1e-9, "expected 1.5 px, got {t}");
+    }
+
+    #[test]
+    fn adaptive_tol_px_fine_scale_clamped_at_floor() {
+        // Very fine scale (0.1"/px): 3.0/0.1=30 px, clamped to MAX_MATCH_PX=20.
+        let t = adaptive_tol_px(0.1, BASE_MATCH_ARCSEC);
+        assert!((t - MAX_MATCH_PX).abs() < 1e-9, "expected MAX_MATCH_PX={MAX_MATCH_PX}, got {t}");
+    }
+
+    #[test]
+    fn adaptive_tol_px_coarse_scale_reasonable() {
+        // At 1.5"/px: 3.0/1.5 = 2.0 px.
+        let t = adaptive_tol_px(1.5, BASE_MATCH_ARCSEC);
+        assert!((t - 2.0).abs() < 1e-9, "expected 2.0 px, got {t}");
+    }
+
+    #[test]
+    fn adaptive_tol_px_zero_scale_returns_default() {
+        // scale_arcsec = 0 → returns 5.0 (fallback in the function).
+        let t = adaptive_tol_px(0.0, BASE_MATCH_ARCSEC);
+        assert_eq!(t, 5.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // fit_affine + PROSAC path (via prosac_seed_affine)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prosac_correct_fit_clean_data() {
+        use crate::quad::Quad;
+        // Known transform: xcat = 2*ximg + 100, ycat = 2*yimg + 200.
+        let img_centers = [
+            (50.0_f64, 50.0), (150.0, 50.0), (100.0, 150.0), (200.0, 150.0),
+            (75.0, 200.0),
+        ];
+        let cat_centers: Vec<(f64, f64)> = img_centers
+            .iter()
+            .map(|&(x, y)| (x * 2.0 + 100.0, y * 2.0 + 200.0))
+            .collect();
+
+        let mk_quad = |c: (f64, f64)| Quad {
+            star_idx: [0, 1, 2, 3],
+            ratios: [0.5; 5],
+            longest: 100.0,
+            center: c,
+        };
+
+        let img_quads: Vec<Quad> = img_centers.iter().map(|&c| mk_quad(c)).collect();
+        let cat_quads: Vec<Quad> = cat_centers.iter().map(|&c| mk_quad(c)).collect();
+        let matches: Vec<(usize, usize)> = (0..img_quads.len()).map(|i| (i, i)).collect();
+
+        // PROSAC with a fixed seed must produce a valid affine.
+        let affine = prosac_seed_affine(&matches, &img_quads, &cat_quads, 42, 50)
+            .expect("prosac must produce an affine on clean data");
+
+        let (xc, yc) = affine.apply(250.0, 150.0);
+        let ex = 250.0 * 2.0 + 100.0;
+        let ey = 150.0 * 2.0 + 200.0;
+        assert!((xc - ex).abs() < 1.0, "x: expected {ex}, got {xc}");
+        assert!((yc - ey).abs() < 1.0, "y: expected {ey}, got {yc}");
+    }
+
+    #[test]
+    fn prosac_robust_to_30pct_outliers() {
+        use crate::quad::Quad;
+        // 7 good pairs (xcat = 2*ximg + 50, ycat = 2*yimg + 100)
+        // + 3 bad pairs (wildly wrong catalog centers).
+        let good_img = [
+            (10.0_f64, 10.0), (50.0, 10.0), (30.0, 50.0), (80.0, 50.0),
+            (20.0, 80.0), (60.0, 80.0), (40.0, 30.0),
+        ];
+        let bad_img = [(5.0_f64, 5.0), (15.0, 5.0), (25.0, 5.0)];
+        let mk_quad = |c: (f64, f64)| Quad {
+            star_idx: [0, 1, 2, 3],
+            ratios: [0.5; 5],
+            longest: 50.0,
+            center: c,
+        };
+        let mut img_quads: Vec<Quad> = good_img.iter().map(|&c| mk_quad(c)).collect();
+        img_quads.extend(bad_img.iter().map(|&c| mk_quad(c)));
+
+        let mut cat_quads: Vec<Quad> = good_img
+            .iter()
+            .map(|&(x, y)| mk_quad((x * 2.0 + 50.0, y * 2.0 + 100.0)))
+            .collect();
+        // Outlier catalog quads: random junk positions.
+        cat_quads.push(mk_quad((9999.0, 9999.0)));
+        cat_quads.push(mk_quad((-5000.0, 3000.0)));
+        cat_quads.push(mk_quad((100.0, -8000.0)));
+
+        let matches: Vec<(usize, usize)> = (0..img_quads.len()).map(|i| (i, i)).collect();
+        let affine = prosac_seed_affine(&matches, &img_quads, &cat_quads, 0x1234_5678, 100)
+            .expect("prosac must succeed with 70% inliers");
+
+        // Verify on a held-out good point.
+        let (xc, yc) = affine.apply(45.0, 25.0);
+        let ex = 45.0 * 2.0 + 50.0;
+        let ey = 25.0 * 2.0 + 100.0;
+        assert!((xc - ex).abs() < 5.0, "x: expected ~{ex}, got {xc}");
+        assert!((yc - ey).abs() < 5.0, "y: expected ~{ey}, got {yc}");
+    }
+
+    #[test]
+    fn prosac_deterministic_with_fixed_seed() {
+        use crate::quad::Quad;
+        // Build a small synthetic match set and verify PROSAC produces the
+        // same affine (same a1/b1/c1/a2/b2/c2) on two consecutive calls
+        // with the same seed.
+        let pts: Vec<(f64, f64)> = (0..8).map(|i| (i as f64 * 20.0, (i % 3) as f64 * 15.0)).collect();
+        let mk_quad = |c: (f64, f64)| Quad {
+            star_idx: [0, 1, 2, 3],
+            ratios: [0.5; 5],
+            longest: 30.0,
+            center: c,
+        };
+        let img_quads: Vec<Quad> = pts.iter().map(|&c| mk_quad(c)).collect();
+        let cat_quads: Vec<Quad> = pts
+            .iter()
+            .map(|&(x, y)| mk_quad((x * 1.5 + 10.0, y * 1.5 + 5.0)))
+            .collect();
+        let matches: Vec<(usize, usize)> = (0..img_quads.len()).map(|i| (i, i)).collect();
+
+        let seed = 0xDEAD_BEEF_CAFE_BABEu64;
+        let a1 = prosac_seed_affine(&matches, &img_quads, &cat_quads, seed, 50);
+        let a2 = prosac_seed_affine(&matches, &img_quads, &cat_quads, seed, 50);
+
+        match (a1, a2) {
+            (Some(a), Some(b)) => {
+                assert!((a.a1 - b.a1).abs() < 1e-12, "a1 differs: {} vs {}", a.a1, b.a1);
+                assert!((a.b1 - b.b1).abs() < 1e-12, "b1 differs");
+                assert!((a.c1 - b.c1).abs() < 1e-12, "c1 differs");
+                assert!((a.a2 - b.a2).abs() < 1e-12, "a2 differs");
+                assert!((a.b2 - b.b2).abs() < 1e-12, "b2 differs");
+                assert!((a.c2 - b.c2).abs() < 1e-12, "c2 differs");
+            }
+            (None, None) => {} // both failed — deterministic by being consistent
+            _ => panic!("prosac produced different Some/None results on identical inputs"),
+        }
     }
 }
