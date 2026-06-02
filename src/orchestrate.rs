@@ -78,7 +78,7 @@ use crate::{
     math::great_circle_deg,
     project::project_catalog,
     quad::{build_quads, fit_affine, group_size_for, match_quads_stats, Affine, Quad},
-    select::{select_fast_stars, select_fast_stars_with_sigma},
+    select::{select_fast_stars, select_fast_stars_with_raw},
     wcs::WcsSolution,
     wcs_fit::affine_to_wcs,
     CatalogStar, PixelCache, SolveConfig, SolveHints, SolveSolution, StarCache,
@@ -949,17 +949,29 @@ pub(crate) fn solve_inner(
     if n < 4 {
         anyhow::bail!("too few stars after selection ({n}, need ≥4)");
     }
-    // σ slice: built only when refinement was accepted so the sx/sy values are
-    // meaningful (PSF-fitted).  None otherwise → uniform weights in the SIP fit.
-    let star_sigmas_storage: Option<Vec<(f64, f64)>> = if refinement_accepted {
-        Some(
-            select_fast_stars_with_sigma(&result.stars, 600)
-                .into_iter()
-                .map(|(_, _, sx, sy)| (sx, sy))
-                .collect(),
-        )
+    // σ slice + pass-1 raw positions: built only when refinement was accepted
+    // so the sx/sy/raw_x/raw_y values are meaningful (PSF-fitted).
+    // None otherwise → uniform weights + no raw comparison in the final fit.
+    //
+    // Phase 4: `image_pts_raw_storage` holds the pass-1 (intensity-weighted)
+    // centroids aligned 1:1 with `image_pts`.  Used by the compare-and-keep-
+    // better guard in the SIP final-fit stage.
+    let (star_sigmas_storage, image_pts_raw_storage): (
+        Option<Vec<(f64, f64)>>,
+        Option<Vec<(f64, f64)>>,
+    ) = if refinement_accepted {
+        let with_raw = select_fast_stars_with_raw(&result.stars, 600);
+        let sigmas: Vec<(f64, f64)> = with_raw
+            .iter()
+            .map(|&(_, _, _, _, sx, sy)| (sx, sy))
+            .collect();
+        let raw_pts: Vec<(f64, f64)> = with_raw
+            .iter()
+            .map(|&(_, _, rx, ry, _, _)| (rx, ry))
+            .collect();
+        (Some(sigmas), Some(raw_pts))
     } else {
-        None
+        (None, None)
     };
 
     // 3. Build image quads once.
@@ -1054,6 +1066,7 @@ pub(crate) fn solve_inner(
         truth,
         frame_name: &frame_name,
         star_sigmas: star_sigmas_storage.as_deref(),
+        image_pts_raw: image_pts_raw_storage.as_deref(),
     };
     let mut primary_pass = PassTrace::new(false);
     let primary_result = run_search(&ctx, false, &mut primary_pass);
@@ -1175,6 +1188,12 @@ struct SearchCtx<'a> {
     /// in the fast profile or when the refine gate reverted — the SIP fit
     /// falls back to uniform weights in that case.
     star_sigmas: Option<&'a [(f64, f64)]>,
+    /// Phase 4 (precise profile only): pass-1 (intensity-weighted) centroids
+    /// aligned 1:1 with `image_pts`.  `Some` iff `star_sigmas.is_some()`.
+    /// Used by the compare-and-keep-better guard: after the refined SIP fit,
+    /// also compute a pass-1 SIP fit and keep whichever has the lower RMS.
+    /// `None` in the fast profile — that path is completely untouched.
+    image_pts_raw: Option<&'a [(f64, f64)]>,
 }
 
 /// One search pass over the autoFOV ladder × square spiral.
@@ -1214,6 +1233,7 @@ fn run_search(
         truth,
         frame_name,
         star_sigmas,
+        image_pts_raw,
     } = ctx;
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
@@ -1621,6 +1641,21 @@ fn run_search(
             // which applies σ-weighted LSQ + 3σ clip in a convergence loop.
             // Fast profile (star_sigmas.is_none()): use the existing `fit_sip`
             // unchanged — the fast path must remain byte-identical.
+            //
+            // Phase-4 compare-and-keep-better guard (precise profile only):
+            // After computing the refined-centroid SIP solution, also compute a
+            // pass-1-centroid SIP solution (using uniform weights, same as the
+            // fast path) and keep whichever has the lower count_inliers RMS.
+            // This guarantees precise ≥ fast on every frame: even pathological
+            // frames where PSF-refined centroids are noisier (defocused _0008,
+            // sparse M51, _0023) will fall back to pass-1 and be no worse than
+            // the fast profile.  The expensive quad-search/seed uses refined
+            // positions throughout; only this cheap final fit runs twice.
+            // Guard: only attempt the comparison when rms_ref > 0.3 px — for
+            // already-excellent frames the pass-1 path cannot improve things and
+            // we skip the extra fit entirely.
+            const PHASE4_RMS_FLOOR: f64 = 0.3;
+
             let (sip_wcs, sip_rms_px, sip_rms_arcsec) = if cfg.fit_sip {
                 let t_sip = Instant::now();
                 let sip_result = if star_sigmas.is_some() {
@@ -1649,12 +1684,75 @@ fn run_search(
                 };
                 TimingProfile::add(&timing.fit_sip_ns, t_sip.elapsed());
                 match sip_result {
-                    Some(w) => {
+                    Some(w_ref) => {
                         let t = Instant::now();
-                        let (si, srss, sip_pairs) = count_inliers(&w, &verify_stars, image_pts, width, height, tol_px);
+                        let (si_ref, srss_ref, sip_pairs_ref) = count_inliers(&w_ref, &verify_stars, image_pts, width, height, tol_px);
                         TimingProfile::add(&timing.count_inliers_ns, t.elapsed());
                         timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
-                        let srms = if si > 0 { (srss / si as f64).sqrt() } else { f64::MAX };
+                        let srms_ref = if si_ref > 0 { (srss_ref / si_ref as f64).sqrt() } else { f64::MAX };
+
+                        // Phase-4: compare-and-keep-better (precise profile only).
+                        // Only run when: (a) we have pass-1 raw positions AND (b)
+                        // the refined rms is above the floor (otherwise the frame is
+                        // already excellent and the raw path cannot help).
+                        let (w, srms, sip_pairs) = if star_sigmas.is_some()
+                            && srms_ref > PHASE4_RMS_FLOOR
+                            && srms_ref < f64::MAX
+                        {
+                            if let Some(raw_pts) = image_pts_raw {
+                                // Fit pass-1 SIP (uniform weights — same as fast path).
+                                let w_raw_opt = crate::sip::fit_sip(
+                                    &final_wcs,
+                                    &verify_stars,
+                                    raw_pts,
+                                    width,
+                                    height,
+                                    tol_px,
+                                    cfg.sip_order,
+                                );
+                                match w_raw_opt {
+                                    Some(w_raw) => {
+                                        let t2 = Instant::now();
+                                        let (si_raw, srss_raw, _) = count_inliers(
+                                            &w_raw,
+                                            &verify_stars,
+                                            raw_pts,
+                                            width,
+                                            height,
+                                            tol_px,
+                                        );
+                                        TimingProfile::add(&timing.count_inliers_ns, t2.elapsed());
+                                        timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
+                                        let srms_raw = if si_raw > 0 {
+                                            (srss_raw / si_raw as f64).sqrt()
+                                        } else {
+                                            f64::MAX
+                                        };
+                                        if srms_raw < srms_ref {
+                                            eprintln!(
+                                                "[solvemyastro] Phase4 guard: pass-1 wins \
+                                                 rms={srms_raw:.3}px vs refined {srms_ref:.3}px \
+                                                 (inliers: raw={si_raw} ref={si_ref})"
+                                            );
+                                            (w_raw, srms_raw, sip_pairs_ref)
+                                        } else {
+                                            eprintln!(
+                                                "[solvemyastro] Phase4 guard: refined wins \
+                                                 rms={srms_ref:.3}px vs pass-1 {srms_raw:.3}px \
+                                                 (inliers: ref={si_ref} raw={si_raw})"
+                                            );
+                                            (w_ref, srms_ref, sip_pairs_ref)
+                                        }
+                                    }
+                                    None => (w_ref, srms_ref, sip_pairs_ref),
+                                }
+                            } else {
+                                (w_ref, srms_ref, sip_pairs_ref)
+                            }
+                        } else {
+                            (w_ref, srms_ref, sip_pairs_ref)
+                        };
+
                         // DIAGNOSTIC (P2b/0008): residual distribution — a few
                         // large residuals ⇒ nearest-neighbour mismatch; a broad
                         // ~rms spread ⇒ centroid systematic / distortion order.
@@ -1670,13 +1768,13 @@ fn run_search(
                         let p90 = resid.get(resid.len() * 9 / 10).copied().unwrap_or(0.0);
                         let mx = resid.last().copied().unwrap_or(0.0);
                         let gt2 = resid.iter().filter(|&&r| r > 2.0).count();
-                        let profile = if star_sigmas.is_some() { "annealed" } else { "two-stage" };
+                        let profile = if star_sigmas.is_some() { "annealed+guard" } else { "two-stage" };
                         // Keep SIP only if it does not worsen the fit (with the
                         // correct pixel-space math it should strictly improve;
                         // this guards against a pathological field).
                         if srms <= rms_px {
                             eprintln!(
-                                "[solvemyastro] SIP({profile}) applied: linear rms={rms_px:.2}px → sip rms={srms:.2}px ({si} pairs) | med={med:.2} p90={p90:.2} max={mx:.2} >2px={gt2}"
+                                "[solvemyastro] SIP({profile}) applied: linear rms={rms_px:.2}px → sip rms={srms:.2}px ({si_ref} pairs) | med={med:.2} p90={p90:.2} max={mx:.2} >2px={gt2}"
                             );
                             (w, srms, srms * final_scale)
                         } else {

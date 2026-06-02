@@ -770,6 +770,10 @@ fn corpus_bench() {
             let mut rms_regressions: Vec<String> = Vec::new();
             let mut base_ms_total = 0u64;
             let mut new_ms_total = 0u64;
+
+            // Collect baseline rms_px values for median computation.
+            let mut baseline_rms_vals: Vec<f64> = Vec::new();
+
             for r in &results {
                 let Some(b) = base_frames
                     .iter()
@@ -781,10 +785,11 @@ fn corpus_bench() {
                     if let Some(brms) = b["rms_px"].as_f64() {
                         if r.rms_px > brms * 1.15 + 0.05 {
                             rms_regressions.push(format!(
-                                "{}: rms {:.2}px > 1.15x baseline {:.2}px",
+                                "{}: rms {:.3}px > 1.15x baseline {:.3}px",
                                 r.name, r.rms_px, brms
                             ));
                         }
+                        baseline_rms_vals.push(brms);
                     }
                 }
                 if let Some(bms) = b["elapsed_ms"].as_u64() {
@@ -815,6 +820,53 @@ fn corpus_bench() {
                  machine; wall-clock is noise-sensitive, cone_calls is the deterministic signal)",
                 speed_ratio
             );
+
+            // Phase-4 gate: median per-frame rms_px ≤ 1.05× baseline median.
+            // This ensures the precise profile never degrades the *typical* frame's
+            // accuracy relative to the fast baseline, even if individual frames shift
+            // within the per-frame ±15% tolerance. Applied to the fast (default) run
+            // which matches the baseline profile byte-for-byte.
+            if !baseline_rms_vals.is_empty() {
+                baseline_rms_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let baseline_median = if baseline_rms_vals.len() % 2 == 0 {
+                    (baseline_rms_vals[baseline_rms_vals.len() / 2 - 1]
+                        + baseline_rms_vals[baseline_rms_vals.len() / 2])
+                        * 0.5
+                } else {
+                    baseline_rms_vals[baseline_rms_vals.len() / 2]
+                };
+
+                let mut run_rms_vals: Vec<f64> = results
+                    .iter()
+                    .filter_map(|r| if r.rms_px >= 0.0 { Some(r.rms_px) } else { None })
+                    .collect();
+                run_rms_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let run_median = if !run_rms_vals.is_empty() {
+                    if run_rms_vals.len() % 2 == 0 {
+                        (run_rms_vals[run_rms_vals.len() / 2 - 1]
+                            + run_rms_vals[run_rms_vals.len() / 2])
+                            * 0.5
+                    } else {
+                        run_rms_vals[run_rms_vals.len() / 2]
+                    }
+                } else {
+                    0.0
+                };
+
+                println!(
+                    "GATE median rms_px: run={:.3}px baseline={:.3}px ratio={:.3}x",
+                    run_median,
+                    baseline_median,
+                    if baseline_median > 0.0 { run_median / baseline_median } else { 1.0 }
+                );
+                assert!(
+                    run_median <= baseline_median * 1.05,
+                    "GATE FAIL: median rms {:.3}px > 1.05x baseline median {:.3}px (ratio={:.3}x)",
+                    run_median,
+                    baseline_median,
+                    run_median / baseline_median.max(1e-9)
+                );
+            }
         }
         _ => {
             println!(

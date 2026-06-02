@@ -128,6 +128,8 @@ mod tests {
         astroimage::FastStar {
             x: 0.0,
             y: 0.0,
+            raw_x: 0.0,
+            raw_y: 0.0,
             peak: 0.0,
             flux: 0.0,
             snr,

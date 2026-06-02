@@ -131,6 +131,46 @@ pub fn select_fast_stars_with_sigma(
         .collect()
 }
 
+/// Select the quad-building star pool, returning refined positions, pass-1
+/// positions, and per-star centroid σ in the same SNR-ranked order.
+///
+/// Used by the Phase-4 compare-and-keep-better guard in the precise profile.
+/// The returned tuple is `(refined_x, refined_y, raw_x, raw_y, σx, σy)`.
+///
+/// `raw_x`/`raw_y` mirror `FastStar::raw_x`/`raw_y` — the pass-1
+/// (intensity-weighted) centroid, always set regardless of whether refinement
+/// fired.  When refinement is off or the per-star gate rejected the fit,
+/// `raw_x == refined_x` and `raw_y == refined_y`.
+///
+/// # Contract
+///
+/// The returned `Vec` is **always the same length and in the same order** as
+/// the slice produced by `select_fast_stars_with_sigma` with the same
+/// `stars`/`max`.  The SNR gate and ranking are byte-identical.
+pub fn select_fast_stars_with_raw(
+    stars: &[astroimage::FastStar],
+    max: usize,
+) -> Vec<(f64, f64, f64, f64, f64, f64)> {
+    // Gate: keep only SNR > threshold, same predicate as select_fast_stars.
+    // Carry: (x, y, snr, raw_x, raw_y, sx, sy).
+    let mut passing: Vec<(f32, f32, f32, f32, f32, f32, f32)> = stars
+        .iter()
+        .map(|s| (s.x, s.y, s.snr, s.raw_x, s.raw_y, s.sx, s.sy))
+        .filter(|&(_, _, snr, _, _, _, _)| snr > SNR_THRESHOLD)
+        .collect();
+
+    // Rank by SNR descending — byte-identical ordering to the other selectors.
+    passing.sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    passing
+        .into_iter()
+        .take(max)
+        .map(|(x, y, _snr, rx, ry, sx, sy)| {
+            (x as f64, y as f64, rx as f64, ry as f64, sx as f64, sy as f64)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
