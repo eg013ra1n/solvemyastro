@@ -642,6 +642,96 @@ where
     Ok(total_records)
 }
 
+/// Build a `stars.smac` in parallel from a per-pixel, pre-sorted record provider.
+///
+/// `records_of(px)` returns the records to store at HEALPix-6 pixel `px`,
+/// **already mag-sorted ascending** and **already correctly partitioned** — every
+/// returned record's sky position must map to `px` (i.e. the input is pre-binned,
+/// like the `healpix_*.bin` tiles). Unlike [`build_cache`], this does NOT re-bin
+/// or re-sort and uses **no scratch files**: a parallel counting pass builds the
+/// pixel directory, then a parallel positioned-write pass (`pwrite`) scatters
+/// each pixel's records straight into the records region at disjoint offsets.
+/// Saturates all cores; memory is one pixel per worker.
+///
+/// `records_of` is called twice per pixel (count pass + write pass) and must be
+/// deterministic; reading only the needed prefix of a per-pixel tile keeps both
+/// passes cheap. Unix-only (positioned writes); the project targets macOS+Linux.
+pub fn build_cache_parallel<R>(out_dir: &Path, catalog_epoch: f64, records_of: R) -> Result<usize>
+where
+    R: Fn(u64) -> Vec<StarRecord> + Sync,
+{
+    use rayon::prelude::*;
+    use std::os::unix::fs::FileExt;
+
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("create cache dir {}", out_dir.display()))?;
+
+    // Pass A — counts (parallel). The directory follows from cumulative counts.
+    let counts: Vec<u32> = (0..N_PIXELS as u64)
+        .into_par_iter()
+        .map(|px| records_of(px).len() as u32)
+        .collect();
+    let total: u64 = counts.iter().map(|&c| c as u64).sum();
+
+    let mut directory: Vec<(u64, u32)> = Vec::with_capacity(N_PIXELS);
+    let mut offset = RECORDS_REGION_START;
+    for &count in &counts {
+        directory.push((offset, count));
+        offset += count as u64 * RECORD_SIZE as u64;
+    }
+    let file_len = offset;
+
+    // Write header + directory, then pre-size the file to its final length.
+    let smac_path = out_dir.join("stars.smac");
+    {
+        let mut smac = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&smac_path)
+            .with_context(|| format!("create {}", smac_path.display()))?;
+        write_header(&mut smac, total, catalog_epoch).context("write header")?;
+        for &(off, count) in &directory {
+            smac.write_u64::<LittleEndian>(off).context("write dir offset")?;
+            smac.write_u32::<LittleEndian>(count).context("write dir count")?;
+        }
+        smac.set_len(file_len).context("set file length")?;
+        smac.flush().context("flush header/dir")?;
+    }
+
+    // Pass B — parallel positioned writes of each pixel's records.
+    let smac = OpenOptions::new()
+        .write(true)
+        .open(&smac_path)
+        .with_context(|| format!("open {} for record writes", smac_path.display()))?;
+
+    (0..N_PIXELS as u64)
+        .into_par_iter()
+        .try_for_each(|px| -> Result<()> {
+            let (off, count) = directory[px as usize];
+            if count == 0 {
+                return Ok(());
+            }
+            let recs = records_of(px);
+            if recs.len() as u32 != count {
+                bail!(
+                    "pixel {px}: record count changed between passes ({} vs {count}) — \
+                     records_of must be deterministic",
+                    recs.len()
+                );
+            }
+            let mut buf: Vec<u8> = Vec::with_capacity(recs.len() * RECORD_SIZE);
+            for r in &recs {
+                write_record(&mut buf, r)?;
+            }
+            smac.write_all_at(&buf, off)
+                .with_context(|| format!("write records for pixel {px}"))?;
+            Ok(())
+        })?;
+
+    Ok(total as usize)
+}
+
 // ---------------------------------------------------------------------------
 // Legacy HEALPix format — parse helpers and high-level importers
 // ---------------------------------------------------------------------------
@@ -940,6 +1030,40 @@ mod tests {
     use super::*;
     use byteorder::WriteBytesExt;
     use tempfile::TempDir;
+
+    #[test]
+    fn parallel_builder_writes_correct_pixels() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("c");
+        // Records assigned to pixels 0 and 100 (already mag-sorted per pixel).
+        let provider = |px: u64| match px {
+            0 => vec![
+                StarRecord { ra: 1.0, dec: 2.0, mag: 8.0, pmra_mas_yr: 0.5, pmdec_mas_yr: -0.5 },
+                StarRecord { ra: 1.1, dec: 2.1, mag: 9.0, pmra_mas_yr: 0.0, pmdec_mas_yr: 0.0 },
+            ],
+            100 => vec![StarRecord { ra: 3.0, dec: 4.0, mag: 7.0, pmra_mas_yr: 0.0, pmdec_mas_yr: 0.0 }],
+            _ => Vec::new(),
+        };
+        let n = build_cache_parallel(&out, 2016.0, provider).unwrap();
+        assert_eq!(n, 3);
+
+        let cache = StarCache::open(&out).unwrap();
+        assert_eq!(cache.star_count(), 3);
+        assert_eq!(cache.catalog_epoch(), 2016.0);
+
+        // Records land at their assigned pixels, in the given order, via the
+        // directory offsets — verifies the parallel positioned-write layout.
+        let p0 = cache.iter_pixel_records(0).unwrap();
+        assert_eq!(p0.len(), 2);
+        assert_eq!(p0[0].mag, 8.0);
+        assert_eq!(p0[1].mag, 9.0);
+
+        let p100 = cache.iter_pixel_records(100).unwrap();
+        assert_eq!(p100.len(), 1);
+        assert_eq!(p100[0].mag, 7.0);
+
+        assert!(cache.iter_pixel_records(50).unwrap().is_empty());
+    }
 
     // -----------------------------------------------------------------------
     // Helpers
