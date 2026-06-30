@@ -1028,13 +1028,9 @@ pub(crate) fn solve_inner(
     // unconditionally (cheap — an empty map) to keep the borrows below simple;
     // it is unused in `Layered` mode.
     let deep_pixel_cache = PixelCache::new(obs_epoch);
-    let bright_pixel_cache: Option<PixelCache> = match *caches {
-        Caches::Legacy { bright, .. } => bright.map(|_| PixelCache::new(obs_epoch)),
-        Caches::Layered { .. } => None,
-    };
-    let layered: Option<LayeredCones> = match *caches {
-        Caches::Layered { layers } => Some(LayeredCones::new(layers, obs_epoch)),
-        Caches::Legacy { .. } => None,
+    let (bright_pixel_cache, layered): (Option<PixelCache>, Option<LayeredCones>) = match *caches {
+        Caches::Legacy { bright, .. } => (bright.map(|_| PixelCache::new(obs_epoch)), None),
+        Caches::Layered { layers } => (None, Some(LayeredCones::new(layers, obs_epoch))),
     };
     let cones = match *caches {
         Caches::Legacy { deep, bright } => ConeSource::Legacy {
@@ -1043,7 +1039,9 @@ pub(crate) fn solve_inner(
             bright,
             bright_pc: bright_pixel_cache.as_ref(),
         },
-        Caches::Layered { .. } => ConeSource::Layered(layered.as_ref().unwrap()),
+        Caches::Layered { .. } => {
+            ConeSource::Layered(layered.as_ref().expect("layered is Some in the Layered arm"))
+        }
     };
     let frame_name = image
         .file_name()
@@ -1179,6 +1177,49 @@ enum ConeSource<'a> {
     /// Additive density-tier stack. Quad-match uses the base layer with fallback
     /// to the full union; verify uses the full union.
     Layered(&'a LayeredCones<'a>),
+}
+
+impl<'a> ConeSource<'a> {
+    /// Quad-match cone: the base/bright cone with automatic fallback to the full
+    /// catalog when it is too sparse to seed quads. Localizes the legacy-vs-tier
+    /// branch so the call site stays flat.
+    fn cone_for_quad_match(
+        &self,
+        ra: f64,
+        dec: f64,
+        radius_deg: f64,
+        mag_limit: f32,
+        epoch: f64,
+        fallback_threshold: usize,
+    ) -> Result<Vec<CatalogStar>> {
+        match *self {
+            ConeSource::Legacy { deep, deep_pc, bright, bright_pc } => cone_for_quad_match(
+                deep, deep_pc, bright, bright_pc, ra, dec, radius_deg, mag_limit, epoch,
+                fallback_threshold,
+            ),
+            ConeSource::Layered(lc) => {
+                lc.cone_for_quad_match(ra, dec, radius_deg, mag_limit, epoch, fallback_threshold)
+            }
+        }
+    }
+
+    /// Verify cone: the full catalog depth — the deep cache for Legacy, the full
+    /// layer union for Layered.
+    fn verify_cone(
+        &self,
+        ra: f64,
+        dec: f64,
+        radius_deg: f64,
+        mag_limit: f32,
+        epoch: f64,
+    ) -> Result<Vec<CatalogStar>> {
+        match *self {
+            ConeSource::Legacy { deep, deep_pc, .. } => {
+                deep.cone_cached(deep_pc, ra, dec, radius_deg, mag_limit, epoch)
+            }
+            ConeSource::Layered(lc) => lc.cone(lc.n_layers(), ra, dec, radius_deg, mag_limit, epoch),
+        }
+    }
 }
 
 /// Bundled inputs for one search pass — avoids a 17-argument function.
@@ -1317,32 +1358,14 @@ fn run_search(
                     }
                     let mut ct = CellTrace { ra: cell.0, dec: cell.1, ..Default::default() };
                     let t_cone = Instant::now();
-                    let cone_result = match cones {
-                        ConeSource::Legacy { deep, deep_pc, bright, bright_pc } => {
-                            cone_for_quad_match(
-                                deep, deep_pc,
-                                bright, bright_pc,
-                                cell.0, cell.1, cone_radius,
-                                cfg.catalog_mag_limit, obs_epoch,
-                                cfg.bright_fallback_threshold,
-                            )
-                        }
-                        ConeSource::Layered(lc) => {
-                            // Base layer (fast) with fallback to the full union
-                            // when the base cone is too sparse to seed quads.
-                            let base = lc.cone(
-                                1, cell.0, cell.1, cone_radius,
-                                cfg.catalog_mag_limit, obs_epoch,
-                            );
-                            match base {
-                                Ok(b) if b.len() >= cfg.bright_fallback_threshold => Ok(b),
-                                _ => lc.cone(
-                                    lc.n_layers(), cell.0, cell.1, cone_radius,
-                                    cfg.catalog_mag_limit, obs_epoch,
-                                ),
-                            }
-                        }
-                    };
+                    let cone_result = cones.cone_for_quad_match(
+                        cell.0,
+                        cell.1,
+                        cone_radius,
+                        cfg.catalog_mag_limit,
+                        obs_epoch,
+                        cfg.bright_fallback_threshold,
+                    );
                     let stars = match cone_result {
                         Ok(s) => s,
                         Err(_) => {
@@ -1486,14 +1509,8 @@ fn run_search(
                 let mut hit_floor = false;
                 for &mag_lim in &[VERIFY_MAG_LIMIT, 14.0_f32, cfg.catalog_mag_limit] {
                     let t = Instant::now();
-                    let res = match cones {
-                        ConeSource::Legacy { deep, deep_pc, .. } => {
-                            deep.cone_cached(deep_pc, seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch)
-                        }
-                        ConeSource::Layered(lc) => {
-                            lc.cone(lc.n_layers(), seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch)
-                        }
-                    };
+                    let res =
+                        cones.verify_cone(seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch);
                     TimingProfile::add(&timing.cone_ns, t.elapsed());
                     timing.cone_calls.fetch_add(1, Ordering::Relaxed);
                     if let Ok(s) = res {

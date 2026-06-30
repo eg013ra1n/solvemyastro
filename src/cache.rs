@@ -505,19 +505,58 @@ impl<'a> LayeredCones<'a> {
         epoch: f64,
     ) -> Result<Vec<CatalogStar>> {
         let depth = depth.min(self.layers.len());
-        let mut out: Vec<CatalogStar> = Vec::new();
-        for i in 0..depth {
-            let part = self.layers[i].cone_cached(
+        if depth == 0 {
+            return Ok(Vec::new());
+        }
+        // Reuse the first layer's Vec as the accumulator — for a single-layer
+        // stack this returns its cone verbatim (no extra allocation/copy).
+        let mut out = self.layers[0]
+            .cone_cached(&self.pixel_caches[0], ra, dec, radius_deg, mag_limit, epoch)?;
+        for i in 1..depth {
+            out.extend(self.layers[i].cone_cached(
                 &self.pixel_caches[i],
                 ra,
                 dec,
                 radius_deg,
                 mag_limit,
                 epoch,
-            )?;
-            out.extend(part);
+            )?);
         }
         Ok(out)
+    }
+
+    /// Quad-match cone: the base layer alone when it already has at least
+    /// `fallback_threshold` stars (the common case), otherwise the full disjoint
+    /// union. Reuses the base result on fallback — layer 0 is never re-queried.
+    pub fn cone_for_quad_match(
+        &self,
+        ra: f64,
+        dec: f64,
+        radius_deg: f64,
+        mag_limit: f32,
+        epoch: f64,
+        fallback_threshold: usize,
+    ) -> Result<Vec<CatalogStar>> {
+        if self.layers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stars = self.layers[0]
+            .cone_cached(&self.pixel_caches[0], ra, dec, radius_deg, mag_limit, epoch)?;
+        if stars.len() >= fallback_threshold {
+            return Ok(stars);
+        }
+        // Base too sparse to seed quads — union the deeper layers onto it.
+        for i in 1..self.layers.len() {
+            stars.extend(self.layers[i].cone_cached(
+                &self.pixel_caches[i],
+                ra,
+                dec,
+                radius_deg,
+                mag_limit,
+                epoch,
+            )?);
+        }
+        Ok(stars)
     }
 }
 
