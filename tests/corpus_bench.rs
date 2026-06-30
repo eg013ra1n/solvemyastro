@@ -918,3 +918,86 @@ fn corpus_bench() {
         println!("=======================================================");
     }
 }
+
+/// Real-data Plan 2 guard: the new `Caches::Layered` path, with a SINGLE layer,
+/// must solve a frame byte-identically to the legacy `Caches::deep_only` path on
+/// the same cache. Uses the brightest tier (`tier_500`) as a usable standalone
+/// catalog and an easy wide-field frame.
+///
+/// Run with:
+///   SOLVEMYASTRO_TIER_DIR=/path/to/catalog_out \
+///     cargo test -p solvemyastro --release --test corpus_bench \
+///     -- --ignored layered_single_layer_solve_equals_legacy --nocapture
+#[test]
+#[ignore = "needs a tier cache (SOLVEMYASTRO_TIER_DIR=<dir with tier_*>) + corpus frame"]
+fn layered_single_layer_solve_equals_legacy() {
+    let tier_dir = match std::env::var("SOLVEMYASTRO_TIER_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => {
+            println!("SKIP: set SOLVEMYASTRO_TIER_DIR to a dir containing tier_*");
+            return;
+        }
+    };
+    let bench_dir = Path::new(BENCH_DIR);
+    if !bench_dir.is_dir() {
+        println!("SKIP: bench dir absent at {}", bench_dir.display());
+        return;
+    }
+    let layer_dir = tier_dir.join("tier_500");
+    let cache = match StarCache::open(&layer_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP: open {} failed: {e}", layer_dir.display());
+            return;
+        }
+    };
+    let frame = bench_dir.join("Light_veil_300.0s_Bin1_0015.fit");
+    if !frame.is_file() {
+        println!("SKIP: veil frame absent at {}", frame.display());
+        return;
+    }
+
+    let hdr = read_fits_header(&frame);
+    let naxis1 = hdr.get("NAXIS1").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let naxis2 = hdr.get("NAXIS2").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let hints = hints_from_fits(&hdr, naxis1.max(naxis2));
+    let cfg = SolveConfig { print_timing: false, ..SolveConfig::default() };
+
+    let legacy = solve(&frame, &hints, &solvemyastro::Caches::deep_only(&cache), &cfg, None)
+        .expect("legacy deep_only solve");
+    let layers = [&cache];
+    let layered = solve(&frame, &hints, &solvemyastro::Caches::layered(&layers), &cfg, None)
+        .expect("layered 1-layer solve");
+
+    assert!(
+        (legacy.wcs.crval.0 - layered.wcs.crval.0).abs() < 1e-9,
+        "crval RA differs: {} vs {}",
+        legacy.wcs.crval.0,
+        layered.wcs.crval.0
+    );
+    assert!(
+        (legacy.wcs.crval.1 - layered.wcs.crval.1).abs() < 1e-9,
+        "crval Dec differs: {} vs {}",
+        legacy.wcs.crval.1,
+        layered.wcs.crval.1
+    );
+    assert_eq!(
+        legacy.matched_stars, layered.matched_stars,
+        "matched_stars differ"
+    );
+    assert!(
+        (legacy.rms_residual_px - layered.rms_residual_px).abs() < 1e-9,
+        "rms differs: {} vs {}",
+        legacy.rms_residual_px,
+        layered.rms_residual_px
+    );
+    assert_eq!(
+        legacy.wcs.sip_forward.is_some(),
+        layered.wcs.sip_forward.is_some(),
+        "SIP presence differs"
+    );
+    println!(
+        "OK: 1-layer Layered solve == deep_only solve (crval=({:.6},{:.6}), matched={}, rms={:.4}px)",
+        layered.wcs.crval.0, layered.wcs.crval.1, layered.matched_stars, layered.rms_residual_px
+    );
+}

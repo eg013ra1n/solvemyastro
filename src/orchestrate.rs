@@ -81,7 +81,7 @@ use crate::{
     select::{select_fast_stars, select_fast_stars_with_raw},
     wcs::WcsSolution,
     wcs_fit::affine_to_wcs,
-    CatalogStar, PixelCache, SolveConfig, SolveHints, SolveSolution, StarCache,
+    Caches, CatalogStar, LayeredCones, PixelCache, SolveConfig, SolveHints, SolveSolution, StarCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -863,9 +863,15 @@ pub(crate) fn solve_inner(
     cancel: Option<&AtomicBool>,
     scale_bounds: Option<(f64, f64)>,
 ) -> Result<SolveSolution> {
-    // The deep cache is the only one used by every stage; the optional
-    // bright cache is consulted for quad matching with auto-fallback.
-    let cache = caches.deep;
+    // A representative cache for the incidental catalog-epoch read below; the
+    // real cone queries go through `cones` (built later, per `Caches` variant).
+    let repr_cache: &StarCache = match *caches {
+        Caches::Legacy { deep, .. } => deep,
+        Caches::Layered { layers } => layers
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Caches::Layered with no layers"))?,
+    };
     let t0 = Instant::now();
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
@@ -983,7 +989,7 @@ pub(crate) fn solve_inner(
     let min_quads = minimum_quads(n);
 
     // Catalog epoch: assume current Gaia (2016.0); observation epoch from hints or now.
-    let _cat_epoch = cache.catalog_epoch();
+    let _cat_epoch = repr_cache.catalog_epoch();
     // Observation epoch for proper-motion propagation: the frame's DATE-OBS
     // (Julian year, via hints.epoch), else a ~2024 default. Wrong-by-construction
     // before this — every frame was propagated to a hardcoded 2024.04.
@@ -1016,13 +1022,29 @@ pub(crate) fn solve_inner(
     //    out-resolve the catalog. Frames that solve never reach the
     //    fallback, so it cannot regress them.
     let timing = TimingProfile::default();
-    let pixel_cache = PixelCache::new(obs_epoch);
-    // Bright cache mirrors the deep cache's per-solve PixelCache pattern
-    // — separate instance because each `cone_cached` call is bound to one
-    // PixelCache instance + epoch. Only constructed when a bright cache
-    // is provided; else `None` and the fallback path is never taken.
-    let bright_pixel_cache: Option<PixelCache> =
-        caches.bright.map(|_| PixelCache::new(obs_epoch));
+    // Per-solve cone source: either the legacy deep(+bright) PixelCaches or an
+    // additive density-tier `LayeredCones`. Built once here and shared
+    // (read-only) across the rayon trial workers. `deep_pixel_cache` is built
+    // unconditionally (cheap — an empty map) to keep the borrows below simple;
+    // it is unused in `Layered` mode.
+    let deep_pixel_cache = PixelCache::new(obs_epoch);
+    let bright_pixel_cache: Option<PixelCache> = match *caches {
+        Caches::Legacy { bright, .. } => bright.map(|_| PixelCache::new(obs_epoch)),
+        Caches::Layered { .. } => None,
+    };
+    let layered: Option<LayeredCones> = match *caches {
+        Caches::Layered { layers } => Some(LayeredCones::new(layers, obs_epoch)),
+        Caches::Legacy { .. } => None,
+    };
+    let cones = match *caches {
+        Caches::Legacy { deep, bright } => ConeSource::Legacy {
+            deep,
+            deep_pc: &deep_pixel_cache,
+            bright,
+            bright_pc: bright_pixel_cache.as_ref(),
+        },
+        Caches::Layered { .. } => ConeSource::Layered(layered.as_ref().unwrap()),
+    };
     let frame_name = image
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1054,10 +1076,7 @@ pub(crate) fn solve_inner(
         rungs: &rungs,
         center,
         search_radius,
-        cache,
-        pixel_cache: &pixel_cache,
-        bright_cache: caches.bright,
-        bright_pixel_cache: bright_pixel_cache.as_ref(),
+        cones,
         cfg,
         obs_epoch,
         t0,
@@ -1144,6 +1163,24 @@ pub(crate) fn solve_inner(
     }))
 }
 
+/// Per-solve cone source — the legacy deep(+bright) pair or an additive
+/// density-tier stack. Encapsulates the two cone strategies: quad-match uses
+/// the bright/base cone with fallback, verify uses the deep/union cone.
+#[derive(Clone, Copy)]
+enum ConeSource<'a> {
+    /// Legacy: deep cache (+ optional bright sub-catalog) with per-solve pixel
+    /// caches. Quad-match tries bright then falls back to deep; verify uses deep.
+    Legacy {
+        deep: &'a StarCache,
+        deep_pc: &'a PixelCache,
+        bright: Option<&'a StarCache>,
+        bright_pc: Option<&'a PixelCache>,
+    },
+    /// Additive density-tier stack. Quad-match uses the base layer with fallback
+    /// to the full union; verify uses the full union.
+    Layered(&'a LayeredCones<'a>),
+}
+
 /// Bundled inputs for one search pass — avoids a 17-argument function.
 struct SearchCtx<'a> {
     image_pts: &'a [(f64, f64)],
@@ -1158,17 +1195,10 @@ struct SearchCtx<'a> {
     rungs: &'a [FovRung],
     center: Option<(f64, f64)>,
     search_radius: f64,
-    cache: &'a StarCache,
-    /// Phase 2: per-solve PM-propagated pixel cache, shared across rayon
-    /// trial workers. Created once in `solve()`; reused for every cone
-    /// query (primary and verify passes alike).
-    pixel_cache: &'a PixelCache,
-    /// Optional bright sub-catalog for the quad-matching cone fast path.
-    /// `Some` when `Caches::tiered(..)` was passed to `solve()`.
-    bright_cache: Option<&'a StarCache>,
-    /// Per-solve PM-propagated pixel cache for the bright sub-catalog
-    /// (mirror of `pixel_cache`). `Some` iff `bright_cache.is_some()`.
-    bright_pixel_cache: Option<&'a PixelCache>,
+    /// Per-solve cone source (legacy deep+bright or additive tier stack),
+    /// shared read-only across rayon trial workers. Created once in
+    /// `solve_inner`; reused for every cone query (quad-match + verify).
+    cones: ConeSource<'a>,
     cfg: &'a SolveConfig,
     obs_epoch: f64,
     t0: Instant,
@@ -1221,10 +1251,7 @@ fn run_search(
         rungs,
         center,
         search_radius,
-        cache,
-        pixel_cache,
-        bright_cache,
-        bright_pixel_cache,
+        cones,
         cfg,
         obs_epoch,
         t0,
@@ -1290,13 +1317,33 @@ fn run_search(
                     }
                     let mut ct = CellTrace { ra: cell.0, dec: cell.1, ..Default::default() };
                     let t_cone = Instant::now();
-                    let stars = match cone_for_quad_match(
-                        cache, pixel_cache,
-                        bright_cache, bright_pixel_cache,
-                        cell.0, cell.1, cone_radius,
-                        cfg.catalog_mag_limit, obs_epoch,
-                        cfg.bright_fallback_threshold,
-                    ) {
+                    let cone_result = match cones {
+                        ConeSource::Legacy { deep, deep_pc, bright, bright_pc } => {
+                            cone_for_quad_match(
+                                deep, deep_pc,
+                                bright, bright_pc,
+                                cell.0, cell.1, cone_radius,
+                                cfg.catalog_mag_limit, obs_epoch,
+                                cfg.bright_fallback_threshold,
+                            )
+                        }
+                        ConeSource::Layered(lc) => {
+                            // Base layer (fast) with fallback to the full union
+                            // when the base cone is too sparse to seed quads.
+                            let base = lc.cone(
+                                1, cell.0, cell.1, cone_radius,
+                                cfg.catalog_mag_limit, obs_epoch,
+                            );
+                            match base {
+                                Ok(b) if b.len() >= cfg.bright_fallback_threshold => Ok(b),
+                                _ => lc.cone(
+                                    lc.n_layers(), cell.0, cell.1, cone_radius,
+                                    cfg.catalog_mag_limit, obs_epoch,
+                                ),
+                            }
+                        }
+                    };
+                    let stars = match cone_result {
                         Ok(s) => s,
                         Err(_) => {
                             ct.stop = CellStop::ConeTooSparse;
@@ -1439,7 +1486,14 @@ fn run_search(
                 let mut hit_floor = false;
                 for &mag_lim in &[VERIFY_MAG_LIMIT, 14.0_f32, cfg.catalog_mag_limit] {
                     let t = Instant::now();
-                    let res = cache.cone_cached(pixel_cache, seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch);
+                    let res = match cones {
+                        ConeSource::Legacy { deep, deep_pc, .. } => {
+                            deep.cone_cached(deep_pc, seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch)
+                        }
+                        ConeSource::Layered(lc) => {
+                            lc.cone(lc.n_layers(), seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch)
+                        }
+                    };
                     TimingProfile::add(&timing.cone_ns, t.elapsed());
                     timing.cone_calls.fetch_add(1, Ordering::Relaxed);
                     if let Ok(s) = res {

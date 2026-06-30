@@ -28,46 +28,64 @@ pub mod verify;
 pub mod wcs;
 pub mod wcs_fit;
 
-pub use cache::{PixelCache, StarCache, StarRecord};
+pub use cache::{LayeredCones, PixelCache, StarCache, StarRecord};
 pub use diag::{BestAttempt, FailureClass, SolveFailure};
 pub use register::{register, Registration};
 pub use wcs::{SipCoefficients, WcsSolution};
 
-/// Bundle of star caches passed to [`solve`]. Always carries a `deep`
-/// catalog (G<19 Gaia, full depth — needed by the verify stage so the
-/// Bayesian log-odds gate has correct `NR = catalog stars in FOV`).
-/// Optionally carries a `bright` sub-catalog (hybrid floor + density
-/// top-up) used only for the per-cell quad-matching cone — faster
-/// per-pixel decode + smaller working set, with automatic fallback to
-/// the deep cache when a cone returns fewer than
-/// [`SolveConfig::bright_fallback_threshold`] stars.
+/// Star caches passed to [`solve`]. Two modes:
 ///
-/// Construct with [`Caches::deep_only`] (current single-cache behaviour)
-/// or [`Caches::tiered`] (bright + deep). Both variants are byte-cheap
-/// (just two references).
+/// * [`Caches::Legacy`] — a `deep` catalog (G<19 Gaia, full depth — needed by
+///   the verify stage so the Bayesian log-odds gate has correct
+///   `NR = catalog stars in FOV`) plus an optional `bright` sub-catalog (hybrid
+///   floor + density top-up) used only for the per-cell quad-matching cone, with
+///   automatic fallback to the deep cache when a cone returns fewer than
+///   [`SolveConfig::bright_fallback_threshold`] stars. This is the pre-tier
+///   behaviour; construct with [`Caches::deep_only`] / [`Caches::tiered`].
+/// * [`Caches::Layered`] — an ordered stack of additive density-tier layers
+///   (disjoint magnitude bands, base → deepest). Quad matching uses the base
+///   layer with fallback to the full union; verify uses the full union.
+///   Construct with [`Caches::layered`].
+///
+/// Both variants are byte-cheap (just references).
 #[derive(Clone, Copy)]
-pub struct Caches<'a> {
-    /// Deep catalog (Gaia G<19). Used for: verify-stage inlier counting,
-    /// quad matching when no `bright` is configured OR when the bright
-    /// cone is too sparse.
-    pub deep: &'a StarCache,
-    /// Optional bright sub-catalog (hybrid floor + density top-up).
-    /// When present, quad matching tries this first and falls back to
-    /// `deep` only when the bright cone has < threshold stars.
-    pub bright: Option<&'a StarCache>,
+pub enum Caches<'a> {
+    /// Legacy deep (+ optional bright) pair.
+    Legacy {
+        /// Deep catalog (Gaia G<19). Used for: verify-stage inlier counting,
+        /// quad matching when no `bright` is configured OR when the bright
+        /// cone is too sparse.
+        deep: &'a StarCache,
+        /// Optional bright sub-catalog (hybrid floor + density top-up).
+        /// When present, quad matching tries this first and falls back to
+        /// `deep` only when the bright cone has < threshold stars.
+        bright: Option<&'a StarCache>,
+    },
+    /// Additive density-tier stack (base → deepest, disjoint magnitude bands).
+    Layered {
+        /// `layers[0]` is the fast base; the union of all layers is the full depth.
+        layers: &'a [&'a StarCache],
+    },
 }
 
 impl<'a> Caches<'a> {
     /// Single-cache mode — quad matching and verify both use `deep`.
     /// Byte-identical to pre-bright-cache behaviour.
     pub fn deep_only(deep: &'a StarCache) -> Self {
-        Self { deep, bright: None }
+        Self::Legacy { deep, bright: None }
     }
 
-    /// Tiered mode — quad matching tries `bright` first, falls back to
+    /// Legacy tiered mode — quad matching tries `bright` first, falls back to
     /// `deep` on under-population. Verify always uses `deep`.
     pub fn tiered(deep: &'a StarCache, bright: &'a StarCache) -> Self {
-        Self { deep, bright: Some(bright) }
+        Self::Legacy { deep, bright: Some(bright) }
+    }
+
+    /// Additive density-tier mode — `layers[0]` is the base, the union of all
+    /// layers is the full depth. A 1-element stack is byte-equivalent to
+    /// [`Caches::deep_only`].
+    pub fn layered(layers: &'a [&'a StarCache]) -> Self {
+        Self::Layered { layers }
     }
 }
 
@@ -156,7 +174,9 @@ pub struct SolveConfig {
     pub distractor_fraction: f64,
     /// Minimum bright-cache cone stars before the quad-matching path
     /// falls back to the deep cache for the same cone. Only honoured
-    /// when [`Caches::bright`] is `Some`. Default `30` — enough for
+    /// when a bright sub-catalog is configured ([`Caches::tiered`]) — or,
+    /// in [`Caches::layered`] mode, the base-layer cone before the union
+    /// fallback. Default `30` — enough for
     /// `minimum_quads = 3 + n/140` to clear with ~5-7 quads. Set to
     /// `0` to never fall back (trust the bright cache absolutely);
     /// set to `usize::MAX` to always fall back (effectively disabling

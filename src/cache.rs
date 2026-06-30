@@ -469,6 +469,59 @@ impl PixelCache {
 }
 
 // ---------------------------------------------------------------------------
+// LayeredCones — per-solve view over an additive density-tier stack
+// ---------------------------------------------------------------------------
+
+/// Per-solve view over an ordered stack of catalog layers (base → deepest).
+/// `cone(depth, ..)` unions the first `depth` layers; since layers are disjoint
+/// magnitude bands the union is a plain concatenation (no dedup), and each
+/// layer keeps its own per-solve [`PixelCache`].
+pub struct LayeredCones<'a> {
+    layers: &'a [&'a StarCache],
+    pixel_caches: Vec<PixelCache>,
+}
+
+impl<'a> LayeredCones<'a> {
+    /// Build a layer stack view at `epoch` — one fresh [`PixelCache`] per layer.
+    pub fn new(layers: &'a [&'a StarCache], epoch: f64) -> Self {
+        let pixel_caches = layers.iter().map(|_| PixelCache::new(epoch)).collect();
+        Self { layers, pixel_caches }
+    }
+
+    /// Number of layers in the stack.
+    pub fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Union the cone across the first `depth` layers (clamped to the stack).
+    /// Disjoint layers → the union is a concatenation (no dedup).
+    pub fn cone(
+        &self,
+        depth: usize,
+        ra: f64,
+        dec: f64,
+        radius_deg: f64,
+        mag_limit: f32,
+        epoch: f64,
+    ) -> Result<Vec<CatalogStar>> {
+        let depth = depth.min(self.layers.len());
+        let mut out: Vec<CatalogStar> = Vec::new();
+        for i in 0..depth {
+            let part = self.layers[i].cone_cached(
+                &self.pixel_caches[i],
+                ra,
+                dec,
+                radius_deg,
+                mag_limit,
+                epoch,
+            )?;
+            out.extend(part);
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_cache — streaming, RAM-bounded
 // ---------------------------------------------------------------------------
 
@@ -2611,5 +2664,71 @@ mod tests {
                 "brute-force missing pixel {p} that approx returned"
             );
         }
+    }
+
+    #[test]
+    fn layered_cone_unions_disjoint_layers() {
+        let tmp = TempDir::new().unwrap();
+        // layer 0: one bright star near (10,20); layer 1: one fainter star same area.
+        let l0 = tmp.path().join("l0");
+        let l1 = tmp.path().join("l1");
+        let mk = |dir: &std::path::Path, mag: f32| {
+            build_cache(
+                vec![StarRecord {
+                    ra: 10.0,
+                    dec: 20.0,
+                    mag,
+                    pmra_mas_yr: 0.0,
+                    pmdec_mas_yr: 0.0,
+                }],
+                dir,
+                2016.0,
+                |_| {},
+            )
+            .unwrap();
+        };
+        mk(&l0, 8.0);
+        mk(&l1, 12.0);
+        let c0 = StarCache::open(&l0).unwrap();
+        let c1 = StarCache::open(&l1).unwrap();
+        let layers = [&c0, &c1];
+        let lc = LayeredCones::new(&layers, 2016.0);
+        // depth 1 = base only; depth 2 = union of both.
+        assert_eq!(lc.cone(1, 10.0, 20.0, 1.0, 19.0, 2016.0).unwrap().len(), 1);
+        assert_eq!(lc.cone(2, 10.0, 20.0, 1.0, 19.0, 2016.0).unwrap().len(), 2);
+        assert_eq!(lc.n_layers(), 2);
+    }
+
+    #[test]
+    fn layered_single_layer_matches_cone_cached() {
+        // Plan 2 migration baseline: the 1-layer Layered path must be
+        // byte-identical to the legacy `cone_cached` call on the same cache.
+        let (cache, _tmp) = build_and_open(
+            vec![
+                StarRecord { ra: 10.00, dec: 20.00, mag: 8.0, pmra_mas_yr: 0.0, pmdec_mas_yr: 0.0 },
+                StarRecord { ra: 10.20, dec: 20.10, mag: 11.5, pmra_mas_yr: 0.0, pmdec_mas_yr: 0.0 },
+                StarRecord { ra: 9.85, dec: 19.90, mag: 14.2, pmra_mas_yr: 0.0, pmdec_mas_yr: 0.0 },
+                StarRecord { ra: 10.40, dec: 20.30, mag: 17.0, pmra_mas_yr: 0.0, pmdec_mas_yr: 0.0 },
+            ],
+            2016.0,
+        );
+        let pc = PixelCache::new(2016.0);
+        let direct = cache.cone_cached(&pc, 10.0, 20.0, 1.0, 19.0, 2016.0).unwrap();
+        let layers = [&cache];
+        let lc = LayeredCones::new(&layers, 2016.0);
+        let via_layer = lc.cone(1, 10.0, 20.0, 1.0, 19.0, 2016.0).unwrap();
+        assert_eq!(
+            direct.len(),
+            via_layer.len(),
+            "1-layer cone size must match cone_cached"
+        );
+        for (a, b) in direct.iter().zip(&via_layer) {
+            assert_eq!(a.ra, b.ra);
+            assert_eq!(a.dec, b.dec);
+            assert_eq!(a.mag, b.mag);
+        }
+        // Union over a 1-layer stack equals depth-1 (no extra layers to add).
+        let full = lc.cone(lc.n_layers(), 10.0, 20.0, 1.0, 19.0, 2016.0).unwrap();
+        assert_eq!(full.len(), direct.len());
     }
 }
