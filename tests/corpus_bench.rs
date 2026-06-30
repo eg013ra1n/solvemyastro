@@ -1101,9 +1101,11 @@ fn corpus_layered_tiers() {
         let n2 = hdr.get("NAXIS2").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
         let hints = hints_from_fits(&hdr, n1.max(n2));
 
+        let t0 = Instant::now();
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             solve(path, &hints, &caches, &cfg, None)
         }));
+        let elapsed_ms = t0.elapsed().as_millis();
         let (solved, ra, dec, scale, has_sip) = match res {
             Ok(Ok(s)) => (
                 true,
@@ -1122,10 +1124,21 @@ fn corpus_layered_tiers() {
             n_solved += 1;
         }
 
+        let dpos = if truth_solved && solved {
+            sep_arcsec(tra, tdec, ra, dec)
+        } else {
+            -1.0
+        };
+        let dscale = if truth_solved && solved && tscale > 0.0 {
+            (scale - tscale).abs() / tscale * 100.0
+        } else {
+            -1.0
+        };
         let correct = truth_solved
             && solved
-            && sep_arcsec(tra, tdec, ra, dec) < 30.0
-            && (tscale <= 0.0 || (scale - tscale).abs() / tscale * 100.0 < 2.0);
+            && dpos >= 0.0
+            && dpos < 30.0
+            && (tscale <= 0.0 || dscale < 2.0);
         if correct {
             n_correct += 1;
         }
@@ -1141,19 +1154,32 @@ fn corpus_layered_tiers() {
         }
 
         let tag = if solved {
-            if correct {
+            if !truth_solved {
+                "solved"
+            } else if correct {
                 "OK"
-            } else if truth_solved {
-                "WRONG"
             } else {
-                "solved(no-truth)"
+                "WRONG"
             }
         } else if truth_solved {
             "MISSED"
         } else {
             "unsolved"
         };
-        println!("{:54} {tag}", &name[..name.len().min(54)]);
+        let detail = if solved {
+            format!(
+                "ra={ra:8.3} dec={dec:+8.3} {scale:6.3}\"/px {sip} dpos={dpos_s} {elapsed_ms:>5}ms",
+                sip = if has_sip { "SIP" } else { "   " },
+                dpos_s = if dpos >= 0.0 {
+                    format!("{dpos:6.1}\"")
+                } else {
+                    "    -- ".to_string()
+                },
+            )
+        } else {
+            String::new()
+        };
+        println!("{:50} {tag:>8}  {detail}", &name[..name.len().min(50)]);
     }
 
     println!(
