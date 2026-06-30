@@ -1001,3 +1001,173 @@ fn layered_single_layer_solve_equals_legacy() {
         layered.wcs.crval.0, layered.wcs.crval.1, layered.matched_stars, layered.rms_residual_px
     );
 }
+
+/// Plan 2 real-data gate: the full additive density-tier union must solve the
+/// corpus. Opens `tier_500..tier_8000` from `SOLVEMYASTRO_TIER_DIR`, builds
+/// `Caches::layered`, and solves every corpus frame. Gates on CORRECTNESS only
+/// (M78 + SIP, 0 false positives, all truth frames solved, 0 panics) — not on
+/// the frozen `corpus_baseline.json`, because the tier catalog differs from the
+/// deep cache the baseline was frozen against.
+///
+/// Run with:
+///   SOLVEMYASTRO_TIER_DIR=/path/to/catalog_out \
+///     cargo test -p solvemyastro --release --test corpus_bench \
+///     -- --ignored corpus_layered_tiers --nocapture
+#[test]
+#[ignore = "needs tiers (SOLVEMYASTRO_TIER_DIR=<dir with tier_*>) + corpus; run --release --nocapture"]
+fn corpus_layered_tiers() {
+    let tier_dir = match std::env::var("SOLVEMYASTRO_TIER_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => {
+            println!("SKIP: set SOLVEMYASTRO_TIER_DIR to a dir containing tier_*");
+            return;
+        }
+    };
+    let bench_dir = Path::new(BENCH_DIR);
+    if !bench_dir.is_dir() {
+        println!("SKIP: bench dir absent at {}", bench_dir.display());
+        return;
+    }
+
+    // Open the additive tier stack (base → deepest).
+    let tier_names = ["tier_500", "tier_2000", "tier_5000", "tier_8000"];
+    let mut caches_vec: Vec<StarCache> = Vec::new();
+    for t in tier_names {
+        let dir = tier_dir.join(t);
+        match StarCache::open(&dir) {
+            Ok(c) => {
+                println!("opened {t} ({} stars)", c.star_count());
+                caches_vec.push(c);
+            }
+            Err(e) => {
+                println!("SKIP: open {} failed: {e}", dir.display());
+                return;
+            }
+        }
+    }
+    let layer_refs: Vec<&StarCache> = caches_vec.iter().collect();
+    let caches = solvemyastro::Caches::layered(&layer_refs);
+
+    let cfg = SolveConfig {
+        quad_tolerance: 0.007,
+        catalog_mag_limit: 19.0,
+        fit_sip: true,
+        print_timing: false,
+        ..SolveConfig::default()
+    };
+
+    let truth = cached_truth();
+    let mut files: Vec<PathBuf> = std::fs::read_dir(bench_dir)
+        .expect("read bench dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+                Some("fits" | "fit" | "xisf")
+            )
+        })
+        .collect();
+    files.sort();
+
+    let mut n_truth = 0usize;
+    let mut n_solved = 0usize;
+    let mut n_correct = 0usize;
+    let mut missed: Vec<String> = Vec::new();
+    let mut wrong: Vec<String> = Vec::new();
+    let mut panicked: Vec<String> = Vec::new();
+    let mut m78_correct = false;
+    let mut m78_sip = false;
+
+    for path in &files {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if SKIP_FRAMES.iter().any(|s| name.contains(*s)) {
+            continue;
+        }
+        let truth_entry = truth.iter().find(|&&(k, ..)| name.contains(k));
+        let (truth_solved, tra, tdec, tscale) = match truth_entry {
+            Some(&(_, ra, dec, sc)) => (true, ra, dec, sc),
+            None => (false, 0.0, 0.0, 0.0),
+        };
+        if truth_solved {
+            n_truth += 1;
+        }
+
+        let hdr = if name.ends_with(".xisf") {
+            read_xisf_header(path)
+        } else {
+            read_fits_header(path)
+        };
+        let n1 = hdr.get("NAXIS1").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let n2 = hdr.get("NAXIS2").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let hints = hints_from_fits(&hdr, n1.max(n2));
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            solve(path, &hints, &caches, &cfg, None)
+        }));
+        let (solved, ra, dec, scale, has_sip) = match res {
+            Ok(Ok(s)) => (
+                true,
+                s.wcs.crval.0,
+                s.wcs.crval.1,
+                s.pixel_scale_arcsec,
+                s.wcs.sip_forward.is_some(),
+            ),
+            Ok(Err(_)) => (false, 0.0, 0.0, 0.0, false),
+            Err(_) => {
+                panicked.push(name.clone());
+                (false, 0.0, 0.0, 0.0, false)
+            }
+        };
+        if solved {
+            n_solved += 1;
+        }
+
+        let correct = truth_solved
+            && solved
+            && sep_arcsec(tra, tdec, ra, dec) < 30.0
+            && (tscale <= 0.0 || (scale - tscale).abs() / tscale * 100.0 < 2.0);
+        if correct {
+            n_correct += 1;
+        }
+        if solved && truth_solved && !correct {
+            wrong.push(name.clone());
+        }
+        if !solved && truth_solved {
+            missed.push(name.clone());
+        }
+        if name.contains("2024-01-13_20-27-32_L_-10.00_120.00s_0081") {
+            m78_correct = correct;
+            m78_sip = has_sip;
+        }
+
+        let tag = if solved {
+            if correct {
+                "OK"
+            } else if truth_solved {
+                "WRONG"
+            } else {
+                "solved(no-truth)"
+            }
+        } else if truth_solved {
+            "MISSED"
+        } else {
+            "unsolved"
+        };
+        println!("{:54} {tag}", &name[..name.len().min(54)]);
+    }
+
+    println!(
+        "\nLAYERED TIERS: truth={n_truth} solved={n_solved} correct={n_correct} \
+         wrong={} missed={} panicked={}",
+        wrong.len(),
+        missed.len(),
+        panicked.len()
+    );
+
+    assert!(panicked.is_empty(), "GATE FAIL: panic(s): {panicked:?}");
+    assert!(m78_correct, "GATE FAIL: M78 did not solve correctly on the tier stack");
+    assert!(m78_sip, "GATE FAIL: M78 solved without SIP");
+    assert!(wrong.is_empty(), "GATE FAIL: false positive(s): {wrong:?}");
+    assert!(missed.is_empty(), "GATE FAIL: truth frame(s) not solved: {missed:?}");
+    println!("\nGATE: layered-tier corpus PASSED");
+}
