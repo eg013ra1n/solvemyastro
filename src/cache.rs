@@ -747,13 +747,12 @@ where
 ///
 /// `records_of` is called twice per pixel (count pass + write pass) and must be
 /// deterministic; reading only the needed prefix of a per-pixel tile keeps both
-/// passes cheap. Unix-only (positioned writes); the project targets macOS+Linux.
+/// passes cheap.
 pub fn build_cache_parallel<R>(out_dir: &Path, catalog_epoch: f64, records_of: R) -> Result<usize>
 where
     R: Fn(u64) -> Vec<StarRecord> + Sync,
 {
     use rayon::prelude::*;
-    use std::os::unix::fs::FileExt;
 
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create cache dir {}", out_dir.display()))?;
@@ -816,12 +815,45 @@ where
             for r in &recs {
                 write_record(&mut buf, r)?;
             }
-            smac.write_all_at(&buf, off)
+            write_all_at(&smac, &buf, off)
                 .with_context(|| format!("write records for pixel {px}"))?;
             Ok(())
         })?;
 
     Ok(total as usize)
+}
+
+/// Positioned write of the whole buffer at `offset`, safe for concurrent use on
+/// a shared handle at disjoint offsets. Unix: `pwrite` via `FileExt::write_all_at`.
+/// Windows: a `FileExt::seek_write` loop — positional `WriteFile`, so concurrent
+/// disjoint writes are fine; it does move the shared cursor, but every write in
+/// the parallel pass is positioned, so nothing reads the cursor.
+#[cfg(unix)]
+fn write_all_at(file: &fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let (mut buf, mut offset) = (buf, offset);
+    while !buf.is_empty() {
+        match file.seek_write(buf, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
