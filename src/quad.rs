@@ -444,8 +444,10 @@ unsafe fn build_quads_avx2(points: &[(f64, f64)], n: usize, g: usize) -> Vec<Qua
         for b in 0..n_batches {
             let j_base = b * 4;
 
-            let xs_4 = _mm256_loadu_pd(xs.as_ptr().add(j_base));
-            let ys_4 = _mm256_loadu_pd(ys.as_ptr().add(j_base));
+            // SAFETY: j_base + 4 <= n_batches * 4 <= n == xs.len() == ys.len(),
+            // so both unaligned 4-lane loads read fully in-bounds.
+            let xs_4 = unsafe { _mm256_loadu_pd(xs.as_ptr().add(j_base)) };
+            let ys_4 = unsafe { _mm256_loadu_pd(ys.as_ptr().add(j_base)) };
             let dx = _mm256_sub_pd(pix_b, xs_4);
             let dy = _mm256_sub_pd(piy_b, ys_4);
             // d² = dx*dx + dy*dy via FMA (one rounding error instead of two).
@@ -464,7 +466,9 @@ unsafe fn build_quads_avx2(points: &[(f64, f64)], n: usize, g: usize) -> Vec<Qua
 
             // Extract the 4 d²s for the rare-path scalar handling.
             let mut d2_arr = [0.0_f64; 4];
-            _mm256_storeu_pd(d2_arr.as_mut_ptr(), d2_v);
+            // SAFETY: d2_arr is a local [f64; 4] — exactly the 4 lanes the
+            // unaligned store writes.
+            unsafe { _mm256_storeu_pd(d2_arr.as_mut_ptr(), d2_v) };
 
             for k in 0..4 {
                 if (mask_bits & (1 << k)) == 0 {
