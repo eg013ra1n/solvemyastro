@@ -272,7 +272,7 @@ pub struct SolveSolution {
     /// crowded field or a partial match.
     pub inlier_ratio: f64,
     /// Identifier of the catalog used. Currently `"gaia_dr3"`. Reserved for
-    /// future support of alternative catalogs (Tycho-2 fallback, etc.).
+    /// future support of alternative catalogs (lower-density fallback, etc.).
     pub catalog_used: String,
     /// Solver-implementation identifier (e.g. `"solvemyastro"`). Opaque
     /// string; do not parse — it is for human-facing diagnostic logging.

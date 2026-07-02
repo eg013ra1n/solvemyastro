@@ -187,8 +187,9 @@ pub struct VerifyTrace {
     pub final_inliers: usize,
     pub final_rms_px: f64,
     /// Angular distance from this trial's seed center to a known-correct WCS
-    /// (e.g. an externally-verified ASTAP solve), in degrees. `None` if no
-    /// known truth is registered for this frame. See [`known_truth_for`].
+    /// (e.g. an externally-verified solve from another tool), in degrees.
+    /// `None` if no known truth is registered for this frame. See
+    /// [`known_truth_for`].
     pub dist_from_truth_deg: Option<f64>,
     /// Ratio of this trial's pixel scale to the known truth scale.
     /// `1.0` is perfect; values like 0.5 or 2.0 indicate a wrong-scale seed.
@@ -200,8 +201,8 @@ pub struct VerifyTrace {
 
 /// A known-correct WCS for a specific frame, used to ground-truth-check the
 /// solver's intermediate trial seeds. Populated by `known_truth_for` from
-/// externally-verified solves (e.g. ASTAP) so we can answer: "did solvemyastro
-/// briefly find the right WCS and then reject it?"
+/// externally-verified solves (from another tool) so we can answer: "did
+/// solvemyastro briefly find the right WCS and then reject it?"
 #[derive(Debug, Clone, Copy)]
 pub struct KnownTruth {
     pub ra: f64,
@@ -217,7 +218,7 @@ pub struct KnownTruth {
 /// solve has been captured.
 pub fn known_truth_for(frame_name: &str) -> Option<KnownTruth> {
     if frame_name.contains("_0023.fits") {
-        // ASTAP v2026.02.09 solved this frame in 0.1s. Captured 2026-05-24.
+        // Reference solver v2026.02.09 solved this frame in 0.1s. Captured 2026-05-24.
         return Some(KnownTruth {
             ra: 334.0989556839,
             dec: 74.22973718397,

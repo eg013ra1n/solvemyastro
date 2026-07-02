@@ -9,7 +9,7 @@ Used by Athenaeum as a library and runnable as a standalone CLI.
 
 ```
 solvemyastro solve <image.fits> --catalog <cache-dir> [--ra --dec --fov|--scale --radius] [--json]
-solvemyastro build-cache --from <gaia|tycho dir> --out <cache-dir>
+solvemyastro build-cache --from <gaia dir> --out <cache-dir>
 solvemyastro cache-info <cache-dir>
 ```
 
