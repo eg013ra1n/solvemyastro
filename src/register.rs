@@ -124,6 +124,44 @@ fn fit_affine_from_pairs(pairs: &[((f64, f64), (f64, f64))]) -> Option<Affine> {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Legacy fixed star-level inlier tolerance (pixels), used by [`register`]
+/// and whenever [`SolveConfig::register_inlier_tol_arcsec`] is `None`.
+/// Sufficient for typical dithered subs where the quad-based bootstrap
+/// brings the error below a few pixels. [`register_with_config`] exposes an
+/// arcsecond-scaled alternative derived from the reference WCS pixel scale.
+const INLIER_TOL_PX: f64 = 4.0;
+
+/// Reference-WCS pixel scale (arcsec/px) derived from the CD matrix
+/// determinant: `sqrt(|cd1_1 * cd2_2 - cd1_2 * cd2_1|) * 3600`. Returns
+/// `None` for a degenerate (near-singular) CD matrix so callers can fall
+/// back rather than dividing by zero.
+fn cd_pixel_scale_arcsec(wcs: &WcsSolution) -> Option<f64> {
+    let cd = wcs.cd;
+    let det = cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0];
+    if det.abs() < 1e-30 {
+        return None;
+    }
+    Some(det.abs().sqrt() * 3600.0)
+}
+
+/// Derive the star-level inlier pixel tolerance used by
+/// [`register_with_config`].
+///
+/// `config.register_inlier_tol_arcsec == None` ⇒ the legacy fixed
+/// [`INLIER_TOL_PX`]. `Some(tol_arcsec)` ⇒ `tol_arcsec / pixel_scale`,
+/// clamped to `[1.0, 12.0]` px. A degenerate (near-singular) reference CD
+/// matrix falls back to [`INLIER_TOL_PX`] since no pixel scale can be
+/// derived from it.
+pub(crate) fn inlier_tol_px_for(wcs: &WcsSolution, config: &SolveConfig) -> f64 {
+    match config.register_inlier_tol_arcsec {
+        None => INLIER_TOL_PX,
+        Some(tol_arcsec) => match cd_pixel_scale_arcsec(wcs) {
+            Some(scale_arcsec_per_px) => (tol_arcsec / scale_arcsec_per_px).clamp(1.0, 12.0),
+            None => INLIER_TOL_PX,
+        },
+    }
+}
+
 /// Align a sub frame's star detections to a reference frame, returning the
 /// sub→reference pixel transform and the sub frame's derived WCS.
 ///
@@ -134,6 +172,9 @@ fn fit_affine_from_pairs(pairs: &[((f64, f64), (f64, f64))]) -> Option<Affine> {
 /// * `sub_detections` — star centroids in the sub frame, pixel coords.
 /// * `cfg` — solver configuration; [`SolveConfig::quad_tolerance`] is reused
 ///   for the quad-ratio match tolerance.
+///
+/// Uses the legacy fixed [`INLIER_TOL_PX`] star-level inlier tolerance.
+/// See [`register_with_config`] for an arcsecond-scaled alternative.
 ///
 /// # Errors
 ///
@@ -147,6 +188,51 @@ pub fn register(
     ref_detections: &[(f64, f64)],
     sub_detections: &[(f64, f64)],
     cfg: &SolveConfig,
+) -> anyhow::Result<Registration> {
+    register_inner(
+        reference_wcs,
+        ref_detections,
+        sub_detections,
+        cfg,
+        INLIER_TOL_PX,
+    )
+}
+
+/// Same as [`register`], but derives the star-level inlier pixel tolerance
+/// from `config.register_inlier_tol_arcsec` (see [`inlier_tol_px_for`])
+/// instead of the legacy fixed [`INLIER_TOL_PX`].
+///
+/// `config.register_inlier_tol_arcsec == None` reproduces [`register`]
+/// exactly (same tolerance, same code path).
+///
+/// # Errors
+///
+/// Same failure modes as [`register`].
+pub fn register_with_config(
+    reference_wcs: &WcsSolution,
+    ref_detections: &[(f64, f64)],
+    sub_detections: &[(f64, f64)],
+    cfg: &SolveConfig,
+) -> anyhow::Result<Registration> {
+    let inlier_tol_px = inlier_tol_px_for(reference_wcs, cfg);
+    register_inner(
+        reference_wcs,
+        ref_detections,
+        sub_detections,
+        cfg,
+        inlier_tol_px,
+    )
+}
+
+/// Shared implementation behind [`register`] / [`register_with_config`]. See
+/// [`register`] for the algorithm description and argument documentation;
+/// `inlier_tol_px` is the star-level inlier tolerance (pixels) for Step 3.
+fn register_inner(
+    reference_wcs: &WcsSolution,
+    ref_detections: &[(f64, f64)],
+    sub_detections: &[(f64, f64)],
+    cfg: &SolveConfig,
+    inlier_tol_px: f64,
 ) -> anyhow::Result<Registration> {
     // ------------------------------------------------------------------
     // Step 1 — Build quads from both detection lists.
@@ -206,11 +292,10 @@ pub fn register(
     // ------------------------------------------------------------------
     // Step 3 — Star-level inlier refit.
     // ------------------------------------------------------------------
-    // Fixed inlier tolerance: 4 px. Sufficient for typical dithered subs
-    // where the quad-based bootstrap brings the error below a few pixels.
-    // Phase 2 may parameterise this via SolveConfig if needed.
-    const INLIER_TOL_PX: f64 = 4.0;
-    let inlier_tol_sq = INLIER_TOL_PX * INLIER_TOL_PX;
+    // Inlier tolerance in pixels: legacy fixed value for `register`, or
+    // derived from the reference WCS pixel scale for `register_with_config`
+    // (see `inlier_tol_px_for`).
+    let inlier_tol_sq = inlier_tol_px * inlier_tol_px;
 
     // For each sub detection, project through affine0, find the nearest
     // reference detection, and keep the pair if within tolerance.
@@ -240,7 +325,7 @@ pub fn register(
             "register: star-level refit has only {} inliers within {} px — \
              registration failed (frames may be too different or detections too sparse)",
             inlier_pairs.len(),
-            INLIER_TOL_PX
+            inlier_tol_px
         );
     }
 
@@ -703,5 +788,110 @@ mod tests {
             register(&ref_wcs, &ref_pts, &sub_pts, &cfg).is_err(),
             "should error when frames have no geometric overlap"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 5 — Config-driven inlier tolerance (arcsec → px)
+    // ------------------------------------------------------------------
+
+    /// Build a WCS with a known, rotation-free pixel scale (deg/px along
+    /// both axes), matching the `pixel_scale_deg = sqrt(|det(CD)|)` formula
+    /// used by `inlier_tol_px_for`.
+    fn wcs_with_scale(scale_arcsec_per_px: f64) -> WcsSolution {
+        let s = scale_arcsec_per_px / 3600.0;
+        WcsSolution {
+            crpix: (2000.0, 1500.0),
+            crval: (83.0, -5.0),
+            cd: [[-s, 0.0], [0.0, s]],
+            sip_forward: None,
+            sip_reverse: None,
+        }
+    }
+
+    #[test]
+    fn config_tol_derived_from_cd_scale() {
+        let wcs = wcs_with_scale(2.0); // 2.0"/px
+
+        // 8.0" / 2.0"/px = 4.0 px.
+        let cfg = SolveConfig {
+            register_inlier_tol_arcsec: Some(8.0),
+            ..SolveConfig::default()
+        };
+        let tol = inlier_tol_px_for(&wcs, &cfg);
+        assert!((tol - 4.0).abs() < 1e-9, "expected 4.0 px, got {tol}");
+
+        // Clamp high edge: 100.0" / 2.0"/px = 50 px → clamped to 12.0.
+        let cfg_hi = SolveConfig {
+            register_inlier_tol_arcsec: Some(100.0),
+            ..SolveConfig::default()
+        };
+        let tol_hi = inlier_tol_px_for(&wcs, &cfg_hi);
+        assert!(
+            (tol_hi - 12.0).abs() < 1e-9,
+            "expected clamp to 12.0 px, got {tol_hi}"
+        );
+
+        // Clamp low edge: 0.5" / 2.0"/px = 0.25 px → clamped to 1.0.
+        let cfg_lo = SolveConfig {
+            register_inlier_tol_arcsec: Some(0.5),
+            ..SolveConfig::default()
+        };
+        let tol_lo = inlier_tol_px_for(&wcs, &cfg_lo);
+        assert!(
+            (tol_lo - 1.0).abs() < 1e-9,
+            "expected clamp to 1.0 px, got {tol_lo}"
+        );
+    }
+
+    #[test]
+    fn inlier_tol_px_for_none_is_legacy_constant() {
+        let wcs = wcs_with_scale(2.0);
+        let cfg = SolveConfig::default();
+        assert_eq!(inlier_tol_px_for(&wcs, &cfg), INLIER_TOL_PX);
+    }
+
+    #[test]
+    fn inlier_tol_px_for_degenerate_cd_falls_back_to_legacy() {
+        // Singular CD (det == 0) — must not divide by zero; falls back to
+        // the legacy fixed tolerance.
+        let mut wcs = wcs_with_scale(2.0);
+        wcs.cd = [[0.0, 0.0], [0.0, 0.0]];
+        let cfg = SolveConfig {
+            register_inlier_tol_arcsec: Some(8.0),
+            ..SolveConfig::default()
+        };
+        assert_eq!(inlier_tol_px_for(&wcs, &cfg), INLIER_TOL_PX);
+    }
+
+    /// `register_with_config(..., &SolveConfig::default())` must be
+    /// byte-identical to `register(...)` — same matched count, same rms_px
+    /// bit pattern — since `register_inlier_tol_arcsec` defaults to `None`.
+    #[test]
+    fn register_with_config_none_matches_register() {
+        let ref_wcs = test_wcs(83.0, -5.0);
+        let ref_pts = irregular_stars(40, 0x1234_5678_9ABC_DEF0, 4096.0, 3072.0);
+
+        let theta = 2.0_f64.to_radians();
+        let s = 1.003_f64;
+        let (sin_t, cos_t) = (theta.sin(), theta.cos());
+        let known = Affine {
+            a1: s * cos_t,
+            b1: -s * sin_t,
+            c1: 5.0,
+            a2: s * sin_t,
+            b2: s * cos_t,
+            c2: -3.0,
+        };
+        let sub_pts = invert_affine(&known, &ref_pts);
+
+        let cfg = SolveConfig::default();
+        let reg_legacy = register(&ref_wcs, &ref_pts, &sub_pts, &cfg)
+            .expect("register should succeed on synthetic irregular field");
+        let reg_config = register_with_config(&ref_wcs, &ref_pts, &sub_pts, &cfg)
+            .expect("register_with_config should succeed on synthetic irregular field");
+
+        assert_eq!(reg_legacy.matched, reg_config.matched);
+        assert_eq!(reg_legacy.rms_px.to_bits(), reg_config.rms_px.to_bits());
+        assert_eq!(reg_legacy.flipped, reg_config.flipped);
     }
 }

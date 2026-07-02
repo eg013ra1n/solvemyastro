@@ -30,7 +30,7 @@ pub mod wcs_fit;
 
 pub use cache::{LayeredCones, PixelCache, StarCache, StarRecord};
 pub use diag::{BestAttempt, FailureClass, SolveFailure};
-pub use register::{register, Registration};
+pub use register::{register, register_with_config, Registration};
 pub use wcs::{SipCoefficients, WcsSolution};
 
 /// Star caches passed to [`solve`]. Two modes:
@@ -214,6 +214,10 @@ pub struct SolveConfig {
     ///
     /// Default `0x5F3759DF_5F3759DF` (an arbitrary non-zero constant).
     pub ransac_seed: u64,
+    /// Registration inlier tolerance in arcseconds. `None` keeps the legacy
+    /// fixed 4 px tolerance. When set, the pixel tolerance is derived from the
+    /// reference WCS pixel scale and clamped to [1.0, 12.0] px.
+    pub register_inlier_tol_arcsec: Option<f64>,
 }
 
 impl Default for SolveConfig {
@@ -234,6 +238,7 @@ impl Default for SolveConfig {
             b2_scale_hi_factor: 2.0,
             centroid_refinement: CentroidRefinement::Off,
             ransac_seed: 0x5F3759DF_5F3759DF,
+            register_inlier_tol_arcsec: None,
         }
     }
 }
