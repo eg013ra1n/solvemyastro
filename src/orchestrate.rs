@@ -1370,7 +1370,10 @@ fn run_search(
                         Ok(s) => s,
                         Err(_) => {
                             ct.stop = CellStop::ConeTooSparse;
-                            cells_mutex.lock().unwrap().push(ct);
+                            // Guarded data is diagnostics-only (CellTrace pushes for
+                            // reporting); recovering a poisoned lock here is strictly
+                            // better than cascading panics across the rayon pool.
+                            cells_mutex.lock().unwrap_or_else(|e| e.into_inner()).push(ct);
                             return None;
                         }
                     };
@@ -1379,7 +1382,7 @@ fn run_search(
                     ct.cat_raw = stars.len();
                     if stars.len() < 4 {
                         ct.stop = CellStop::ConeTooSparse;
-                        cells_mutex.lock().unwrap().push(ct);
+                        cells_mutex.lock().unwrap_or_else(|e| e.into_inner()).push(ct);
                         return None;
                     }
                     let pool_cap = if balance {
@@ -1417,7 +1420,7 @@ fn run_search(
                         &mut ct,
                         cell_seed,
                     );
-                    cells_mutex.lock().unwrap().push(ct);
+                    cells_mutex.lock().unwrap_or_else(|e| e.into_inner()).push(ct);
                     trial
                 })
                 .collect();
