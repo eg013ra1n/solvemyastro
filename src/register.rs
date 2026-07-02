@@ -69,6 +69,11 @@ pub struct Registration {
 
     /// RMS residual `|transform(sub) − ref|` over inliers, in pixels.
     pub rms_px: f64,
+
+    /// True when the fitted transform includes a reflection (det(M) < 0) — a
+    /// meridian-flipped frame. Registration is still valid; consumers decide
+    /// how to handle the mirror (e.g. flip at resample time).
+    pub flipped: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +331,10 @@ pub fn register(
              registration failed (degenerate star configuration)"
         );
     }
+    // A negative determinant means the fitted transform includes a reflection
+    // (mirror), which happens for meridian-flipped subs. The transform is
+    // still a valid affine — flag it for consumers rather than rejecting.
+    let flipped = det_m < 0.0;
     let inv_det = 1.0 / det_m;
     // M⁻¹ = (1/det) · [[b2, -b1], [-a2, a1]]
     let rhs_x = reference_wcs.crpix.0 - t.0;
@@ -341,7 +350,7 @@ pub fn register(
         sip_reverse: None,
     };
 
-    Ok(Registration { transform, refined_wcs, residual_pairs, matched, rms_px })
+    Ok(Registration { transform, refined_wcs, residual_pairs, matched, rms_px, flipped })
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +570,88 @@ mod tests {
             "RMS {:.4} px — too large, likely matched to spurious stars",
             reg.rms_px
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 3b — Meridian flip: reflection detection
+    // ------------------------------------------------------------------
+
+    /// Mirroring the TARGET (sub) frame's detections about the frame width
+    /// simulates a meridian-flipped sub. The composed sub→ref transform then
+    /// includes a reflection (`det(M) < 0`), which `register` must flag via
+    /// `Registration::flipped` — while still succeeding, since mirroring is
+    /// an exact affine map and inliers should match just as well as the
+    /// non-flipped case.
+    #[test]
+    fn mirrored_frame_sets_flipped_flag() {
+        let ref_wcs = test_wcs(83.0, -5.0);
+
+        let width = 4096.0;
+        let height = 3072.0;
+        let ref_pts = irregular_stars(40, 0x1234_5678_9ABC_DEF0, width, height);
+
+        // Same known sub→ref transform as `recovers_known_affine`: 2°
+        // rotation + 0.3% scale + small translation.
+        let theta = 2.0_f64.to_radians();
+        let s = 1.003_f64;
+        let (sin_t, cos_t) = (theta.sin(), theta.cos());
+        let known = Affine {
+            a1: s * cos_t,
+            b1: -s * sin_t,
+            c1: 5.0,
+            a2: s * sin_t,
+            b2: s * cos_t,
+            c2: -3.0,
+        };
+        let sub_pts = invert_affine(&known, &ref_pts);
+
+        // Mirror the TARGET frame's detections about the frame width —
+        // `x -> (W-1) - x` — to simulate a meridian flip.
+        let mirrored_sub_pts: Vec<(f64, f64)> =
+            sub_pts.iter().map(|&(x, y)| (width - 1.0 - x, y)).collect();
+
+        let cfg = SolveConfig::default();
+        let reg = register(&ref_wcs, &ref_pts, &mirrored_sub_pts, &cfg)
+            .expect("register should succeed on a mirrored (meridian-flipped) synthetic field");
+
+        assert!(reg.flipped, "expected flipped == true for a mirrored sub frame");
+        assert!(
+            reg.matched >= ref_pts.len() / 2,
+            "expected at least half the stars as inliers, got {} of {}",
+            reg.matched,
+            ref_pts.len()
+        );
+        assert!(
+            reg.rms_px < 0.05,
+            "RMS {:.4} px exceeds 0.05 px threshold for an exact mirrored affine",
+            reg.rms_px
+        );
+    }
+
+    /// The unmodified fixture (no mirroring) must report `flipped == false`.
+    #[test]
+    fn non_mirrored_frame_flipped_false() {
+        let ref_wcs = test_wcs(83.0, -5.0);
+        let ref_pts = irregular_stars(40, 0x1234_5678_9ABC_DEF0, 4096.0, 3072.0);
+
+        let theta = 2.0_f64.to_radians();
+        let s = 1.003_f64;
+        let (sin_t, cos_t) = (theta.sin(), theta.cos());
+        let known = Affine {
+            a1: s * cos_t,
+            b1: -s * sin_t,
+            c1: 5.0,
+            a2: s * sin_t,
+            b2: s * cos_t,
+            c2: -3.0,
+        };
+        let sub_pts = invert_affine(&known, &ref_pts);
+
+        let cfg = SolveConfig::default();
+        let reg = register(&ref_wcs, &ref_pts, &sub_pts, &cfg)
+            .expect("register should succeed on synthetic irregular field");
+
+        assert!(!reg.flipped, "expected flipped == false for a non-mirrored sub frame");
     }
 
     // ------------------------------------------------------------------
