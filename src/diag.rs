@@ -58,14 +58,15 @@ pub fn dump_residual_field(frame: &str, pairs: &[((f64, f64), (f64, f64))]) {
         out.push_str(&format!("{dx:.4},{dy:.4},{rx:.5},{ry:.5},{mag:.5}\n"));
     }
     match std::fs::File::create(&path).and_then(|mut f| f.write_all(out.as_bytes())) {
-        Ok(()) => eprintln!(
-            "[solvemyastro] residual field ({} stars) → {}",
-            pairs.len(),
-            path.display()
+        Ok(()) => tracing::debug!(
+            count = pairs.len(),
+            path = %path.display(),
+            "residual field written"
         ),
-        Err(e) => eprintln!(
-            "[solvemyastro] failed to write residual field to {}: {e}",
-            path.display()
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to write residual field"
         ),
     }
 }

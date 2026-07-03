@@ -1041,10 +1041,11 @@ fn cone_search_pixels(ra_deg: f64, dec_deg: f64, radius_deg: f64) -> Vec<u64> {
         .or_else(|| try_cover(radius_deg * 0.99));
 
     let Some(mut pixels) = pixels else {
-        eprintln!(
-            "cache::cone_search_pixels: cdshealpix panicked at every nudge for \
-             ra={ra_deg:.6} dec={dec_deg:.6} radius_deg={radius_deg:.6}; \
-             falling back to brute-force pixel scan"
+        tracing::warn!(
+            ra_deg,
+            dec_deg,
+            radius_deg,
+            "cdshealpix panicked at every radius nudge — falling back to brute-force pixel scan"
         );
         return cone_search_pixels_bruteforce(ra_deg, dec_deg, radius_deg);
     };

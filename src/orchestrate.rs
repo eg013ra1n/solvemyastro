@@ -18,17 +18,21 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 /// Per-stage timing accumulator for the solve pipeline. All fields are
-/// nanoseconds. Updated with `Relaxed` ordering from rayon workers; printed
-/// once at solve end when `SolveConfig::print_timing` is true.
+/// nanoseconds. Updated with `Relaxed` ordering from rayon workers; emitted
+/// as structured `debug!` events once at solve end when
+/// `SolveConfig::print_timing` is true.
 ///
 /// Phase 1 instrumentation — the data drives the speed-fix targeting in
-/// Phase 3 (kd-tree on `match_quads` vs `count_inliers`).
+/// Phase 3 (kd-tree on `match_quads` vs `count_inliers`). Also the math-
+/// instrumentation backbone for the pipeline's `select` / `quad_build` /
+/// `match` / `refine` / `verify` stages (see `log_stage_timings`).
 #[derive(Default, Debug)]
 pub(crate) struct TimingProfile {
     pub cone_ns: AtomicU64,
     pub cone_calls: AtomicU64,
     pub project_ns: AtomicU64,
     pub build_quads_cat_ns: AtomicU64,
+    pub build_quads_cat_calls: AtomicU64,
     pub match_quads_ns: AtomicU64,
     pub match_quads_calls: AtomicU64,
     pub fit_affine_ns: AtomicU64,
@@ -43,30 +47,25 @@ impl TimingProfile {
     fn add(target: &AtomicU64, dur: std::time::Duration) {
         target.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
     }
-    fn print_summary(&self, total: std::time::Duration, frame: &str) {
+
+    /// Emit one `debug!` stage-timing event per pipeline stage tracked here
+    /// (`cone`, `project`, `quad_build` (catalog side), `match`, `fit_affine`,
+    /// `verify`, `refine` (affine + SIP)), plus one summary event with the
+    /// total wall time. Coarse — one event per stage per solve, not per call
+    /// — so the cost at any tracing level is a handful of atomic loads.
+    fn log_stage_timings(&self, total: std::time::Duration, frame: &str) {
         let total_ms = total.as_millis() as u64;
         let ms = |ns: u64| ns / 1_000_000;
-        let pct = |ns: u64| if total_ms > 0 { ms(ns) * 100 / total_ms } else { 0 };
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        eprintln!(
-            "[solvemyastro timing] {frame}: total {total_ms} ms — \
-             cone {cone}ms/{ccalls} ({cone_pct}%), \
-             project {proj}ms, \
-             build_quads_cat {bqc}ms, \
-             match_quads {mq}ms/{mqcalls} ({mq_pct}%), \
-             fit_affine {fa}ms/{facalls}, \
-             count_inliers {ci}ms/{cicalls} ({ci_pct}%), \
-             refit_affine {ra}ms, \
-             fit_sip {sip}ms",
-            cone = ms(g(&self.cone_ns)), ccalls = g(&self.cone_calls), cone_pct = pct(g(&self.cone_ns)),
-            proj = ms(g(&self.project_ns)),
-            bqc = ms(g(&self.build_quads_cat_ns)),
-            mq = ms(g(&self.match_quads_ns)), mqcalls = g(&self.match_quads_calls), mq_pct = pct(g(&self.match_quads_ns)),
-            fa = ms(g(&self.fit_affine_ns)), facalls = g(&self.fit_affine_calls),
-            ci = ms(g(&self.count_inliers_ns)), cicalls = g(&self.count_inliers_calls), ci_pct = pct(g(&self.count_inliers_ns)),
-            ra = ms(g(&self.refit_affine_ns)),
-            sip = ms(g(&self.fit_sip_ns)),
-        );
+        tracing::debug!(stage = "cone", frame, duration_ms = ms(g(&self.cone_ns)), count = g(&self.cone_calls), "solve stage timing");
+        tracing::debug!(stage = "project", frame, duration_ms = ms(g(&self.project_ns)), "solve stage timing");
+        tracing::debug!(stage = "quad_build", pool = "catalog", frame, duration_ms = ms(g(&self.build_quads_cat_ns)), count = g(&self.build_quads_cat_calls), "solve stage timing");
+        tracing::debug!(stage = "match", frame, duration_ms = ms(g(&self.match_quads_ns)), count = g(&self.match_quads_calls), "solve stage timing");
+        tracing::debug!(stage = "fit_affine", frame, duration_ms = ms(g(&self.fit_affine_ns)), count = g(&self.fit_affine_calls), "solve stage timing");
+        tracing::debug!(stage = "verify", frame, duration_ms = ms(g(&self.count_inliers_ns)), count = g(&self.count_inliers_calls), "solve stage timing");
+        tracing::debug!(stage = "refine", step = "affine", frame, duration_ms = ms(g(&self.refit_affine_ns)), "solve stage timing");
+        tracing::debug!(stage = "refine", step = "sip", frame, duration_ms = ms(g(&self.fit_sip_ns)), "solve stage timing");
+        tracing::debug!(frame, total_ms, "solve stage timing summary");
     }
 }
 
@@ -368,6 +367,7 @@ fn run_trial(
     let t_bq = Instant::now();
     let cat_quads = build_quads(&projected, projected.len(), gs);
     TimingProfile::add(&timing.build_quads_cat_ns, t_bq.elapsed());
+    timing.build_quads_cat_calls.fetch_add(1, Ordering::Relaxed);
     ct.cat_quads = cat_quads.len();
     if cat_quads.is_empty() {
         ct.stop = CellStop::CatQuadsEmpty;
@@ -874,6 +874,10 @@ pub(crate) fn solve_inner(
     };
     let t0 = Instant::now();
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
+    let frame_name = image
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
     // 1. Detect stars.
     //
@@ -903,17 +907,11 @@ pub(crate) fn solve_inner(
         let (decision, median_fwhm) = crate::refine::evaluate_refinement(&r.stars);
         match decision {
             crate::refine::RefineDecision::Accept => {
-                eprintln!(
-                    "[solvemyastro] PSF refinement accepted: median FWHM={:.2}px",
-                    median_fwhm
-                );
+                tracing::debug!(frame = %frame_name, median_fwhm_px = median_fwhm, "PSF refinement accepted");
                 (r, Some(median_fwhm), true)
             }
             crate::refine::RefineDecision::Revert { reason } => {
-                eprintln!(
-                    "[solvemyastro] PSF refinement reverted ({:?}): re-detecting without refine",
-                    reason
-                );
+                tracing::warn!(frame = %frame_name, reason = ?reason, "PSF refinement reverted — re-detecting without refine");
                 // Re-run without refinement to get clean pass-1 positions.
                 let r2 = astroimage::ImageAnalyzer::new()
                     .with_detection_sigma(5.0)
@@ -950,8 +948,17 @@ pub(crate) fn solve_inner(
     // Precise path (refinement_accepted): also build the σ slice from
     // `select_fast_stars_with_sigma`.  The two functions apply the SAME SNR gate
     // and ranking so the returned slices are always the same length / order.
+    let t_select = Instant::now();
     let image_pts = select_fast_stars(&result.stars, 600);
     let n = image_pts.len();
+    tracing::debug!(
+        stage = "select",
+        frame = %frame_name,
+        duration_ms = t_select.elapsed().as_millis() as u64,
+        count = n,
+        total_detected,
+        "solve stage timing"
+    );
     if n < 4 {
         anyhow::bail!("too few stars after selection ({n}, need ≥4)");
     }
@@ -982,7 +989,17 @@ pub(crate) fn solve_inner(
 
     // 3. Build image quads once.
     let group_size = group_size_for(n);
+    let t_quad_build = Instant::now();
     let image_quads = build_quads(&image_pts, n, group_size);
+    tracing::debug!(
+        stage = "quad_build",
+        pool = "image",
+        frame = %frame_name,
+        duration_ms = t_quad_build.elapsed().as_millis() as u64,
+        count = image_quads.len(),
+        group_size,
+        "solve stage timing"
+    );
     if image_quads.len() < 3 {
         anyhow::bail!("too few image quads ({}, need ≥3)", image_quads.len());
     }
@@ -1008,12 +1025,15 @@ pub(crate) fn solve_inner(
     };
     let search_radius = hints.search_radius_deg.unwrap_or(DEFAULT_HINTED_RADIUS_DEG);
 
-    eprintln!(
-        "[solvemyastro] {}: {} stars ({}→{} after selection), {} quads (g{}), {} rungs, {}",
-        image.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        total_detected, total_detected, n, image_quads.len(), group_size,
-        rungs.len(),
-        if center.is_some() { "hinted" } else { "blind" }
+    tracing::info!(
+        frame = %frame_name,
+        total_detected,
+        n_selected = n,
+        n_image_quads = image_quads.len(),
+        group_size,
+        n_rungs = rungs.len(),
+        mode = if center.is_some() { "hinted" } else { "blind" },
+        "solve started"
     );
 
     // 5. Search. Primary pass uses the full detection pool (unchanged
@@ -1043,10 +1063,6 @@ pub(crate) fn solve_inner(
             ConeSource::Layered(layered.as_ref().expect("layered is Some in the Layered arm"))
         }
     };
-    let frame_name = image
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let mut trace = SolveTrace {
         frame: frame_name.clone(),
         n_detected: total_detected,
@@ -1092,7 +1108,7 @@ pub(crate) fn solve_inner(
         Err(e) => {
             trace.outcome = TraceOutcome::Failed(e.to_string());
             trace.total_ms = t0.elapsed().as_millis() as u64;
-            eprintln!("{trace}");
+            tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %e, funnel = %trace, "solve failed");
             return Err(e);
         }
         Ok(Some(mut sol)) => {
@@ -1103,9 +1119,17 @@ pub(crate) fn solve_inner(
             };
             trace.total_ms = t0.elapsed().as_millis() as u64;
             if cfg.print_timing {
-                timing.print_summary(t0.elapsed(), &frame_name);
+                timing.log_stage_timings(t0.elapsed(), &frame_name);
             }
-            eprintln!("{trace}");
+            tracing::info!(
+                frame = %frame_name,
+                total_ms = trace.total_ms,
+                inliers = sol.matched_stars,
+                rms_px = sol.rms_residual_px,
+                scale_arcsec_px = sol.pixel_scale_arcsec,
+                funnel = %trace,
+                "solve succeeded"
+            );
             return Ok(sol);
         }
         Ok(None) => {}
@@ -1113,9 +1137,9 @@ pub(crate) fn solve_inner(
     if is_cancelled() {
         anyhow::bail!("cancelled");
     }
-    eprintln!(
-        "[solvemyastro] primary search found nothing — \
-         retrying with density-balanced quad pools"
+    tracing::warn!(
+        frame = %frame_name,
+        "primary search found nothing — retrying with density-balanced quad pools"
     );
     let mut fallback_pass = PassTrace::new(true);
     let fallback_result = run_search(&ctx, true, &mut fallback_pass);
@@ -1124,7 +1148,7 @@ pub(crate) fn solve_inner(
         Err(e) => {
             trace.outcome = TraceOutcome::Failed(e.to_string());
             trace.total_ms = t0.elapsed().as_millis() as u64;
-            eprintln!("{trace}");
+            tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %e, funnel = %trace, "solve failed");
             return Err(e);
         }
         Ok(Some(mut sol)) => {
@@ -1135,15 +1159,23 @@ pub(crate) fn solve_inner(
             };
             trace.total_ms = t0.elapsed().as_millis() as u64;
             if cfg.print_timing {
-                timing.print_summary(t0.elapsed(), &frame_name);
+                timing.log_stage_timings(t0.elapsed(), &frame_name);
             }
-            eprintln!("{trace}");
+            tracing::info!(
+                frame = %frame_name,
+                total_ms = trace.total_ms,
+                inliers = sol.matched_stars,
+                rms_px = sol.rms_residual_px,
+                scale_arcsec_px = sol.pixel_scale_arcsec,
+                funnel = %trace,
+                "solve succeeded"
+            );
             return Ok(sol);
         }
         Ok(None) => {}
     }
     if cfg.print_timing {
-        timing.print_summary(t0.elapsed(), &frame_name);
+        timing.log_stage_timings(t0.elapsed(), &frame_name);
     }
     let msg = format!(
         "no trial passed verification across {} FOV rung(s) (incl. density-balanced retry)",
@@ -1151,9 +1183,9 @@ pub(crate) fn solve_inner(
     );
     trace.outcome = TraceOutcome::Failed(msg.clone());
     trace.total_ms = t0.elapsed().as_millis() as u64;
-    eprintln!("{trace}");
+    tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %msg, funnel = %trace, "solve failed");
     // Return the structured failure so callers can render a precise reason
-    // (the trace is otherwise only printed to stderr and dropped here).
+    // (the full funnel trace is carried in the `funnel` field of the error! event above).
     Err(anyhow::Error::new(crate::diag::SolveFailure {
         class: trace.classify(),
         best_attempt: trace.best_attempt(),
@@ -1593,10 +1625,15 @@ fn run_search(
                 crate::verify::AcceptanceDecision::Accepted
             };
             if let crate::verify::AcceptanceDecision::Rejected(reason) = gate_decision {
-                eprintln!(
-                    "[solvemyastro] trial rejected: {reason} \
-                     (inliers={seed_inliers}/{required} log_odds={:.1} seed_rms={:.2}px cat_in_fov={})",
-                    v.log_odds, v.seed_rms_px, verify_stars.len(),
+                tracing::debug!(
+                    frame = %frame_name,
+                    reason = %reason,
+                    inliers = seed_inliers,
+                    required,
+                    log_odds = v.log_odds,
+                    seed_rms_px = v.seed_rms_px,
+                    cat_in_fov = verify_stars.len(),
+                    "trial rejected"
                 );
                 v.reject_reason = Some(reason);
                 rt.verifies.push(v);
@@ -1703,10 +1740,15 @@ fn run_search(
             rt.verifies.push(v);
 
             let (cra, cdec) = final_wcs.pixel_to_sky(image_center.0, image_center.1);
-            eprintln!(
-                "[solvemyastro] SOLVED  RA={cra:.4} Dec={cdec:.4} \
-                 scale={final_scale:.3}\"/px rot={:.1}° inliers={final_inliers} rms={rms_px:.2}px",
-                final_wcs.field_rotation_deg()
+            tracing::info!(
+                frame = %frame_name,
+                ra = cra,
+                dec = cdec,
+                scale_arcsec_px = final_scale,
+                rot_deg = final_wcs.field_rotation_deg(),
+                inliers = final_inliers,
+                rms_px,
+                "trial solved"
             );
 
             // 8. SIP fit (optional).
@@ -1803,17 +1845,25 @@ fn run_search(
                                             f64::MAX
                                         };
                                         if srms_raw < srms_ref {
-                                            eprintln!(
-                                                "[solvemyastro] Phase4 guard: pass-1 wins \
-                                                 rms={srms_raw:.3}px vs refined {srms_ref:.3}px \
-                                                 (inliers: raw={si_raw} ref={si_ref})"
+                                            tracing::debug!(
+                                                frame = %frame_name,
+                                                winner = "raw",
+                                                rms_raw_px = srms_raw,
+                                                rms_ref_px = srms_ref,
+                                                inliers_raw = si_raw,
+                                                inliers_ref = si_ref,
+                                                "Phase4 guard: pass-1 wins"
                                             );
                                             (w_raw, srms_raw, sip_pairs_ref)
                                         } else {
-                                            eprintln!(
-                                                "[solvemyastro] Phase4 guard: refined wins \
-                                                 rms={srms_ref:.3}px vs pass-1 {srms_raw:.3}px \
-                                                 (inliers: ref={si_ref} raw={si_raw})"
+                                            tracing::debug!(
+                                                frame = %frame_name,
+                                                winner = "refined",
+                                                rms_raw_px = srms_raw,
+                                                rms_ref_px = srms_ref,
+                                                inliers_raw = si_raw,
+                                                inliers_ref = si_ref,
+                                                "Phase4 guard: refined wins"
                                             );
                                             (w_ref, srms_ref, sip_pairs_ref)
                                         }
@@ -1847,13 +1897,26 @@ fn run_search(
                         // correct pixel-space math it should strictly improve;
                         // this guards against a pathological field).
                         if srms <= rms_px {
-                            eprintln!(
-                                "[solvemyastro] SIP({profile}) applied: linear rms={rms_px:.2}px → sip rms={srms:.2}px ({si_ref} pairs) | med={med:.2} p90={p90:.2} max={mx:.2} >2px={gt2}"
+                            tracing::debug!(
+                                frame = %frame_name,
+                                profile,
+                                rms_linear_px = rms_px,
+                                rms_sip_px = srms,
+                                pairs = si_ref,
+                                median_resid_px = med,
+                                p90_resid_px = p90,
+                                max_resid_px = mx,
+                                over_2px = gt2,
+                                "SIP fit applied"
                             );
                             (w, srms, srms * final_scale)
                         } else {
-                            eprintln!(
-                                "[solvemyastro] SIP({profile}) rejected: rms {srms:.2}px > linear {rms_px:.2}px"
+                            tracing::debug!(
+                                frame = %frame_name,
+                                profile,
+                                rms_linear_px = rms_px,
+                                rms_sip_px = srms,
+                                "SIP fit rejected — worse than linear"
                             );
                             (final_wcs.clone(), rms_px, rms_arcsec)
                         }

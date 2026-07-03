@@ -36,6 +36,12 @@ byteorder = "1"
 # so the corpus gate produces identical results across repeated runs.
 rand = "0.8"
 rand_xoshiro = "0.6"
+# Structured-logging facade only (no subscriber here). solvemyastro is a
+# library — events flow through whatever subscriber the embedding process
+# installs (the athenaeum host subscriber when used as a workspace dep;
+# emitted nowhere when run standalone with no subscriber installed, e.g.
+# the `solvemyastro` CLI binary, which keeps its own println/eprintln).
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -370,9 +370,9 @@ pub fn solve(
             .and_then(|e| e.downcast_ref::<SolveFailure>())
             .and_then(|f| harvest_scale(f, cfg.b1_min_inliers, hints.pixel_scale_arcsec));
         if let Some(scale) = harvested {
-            eprintln!(
-                "[solvemyastro] hinted solve failed — retrying at recovered scale \
-                 {scale:.3}\"/px (position kept)"
+            tracing::warn!(
+                scale_arcsec_px = scale,
+                "hinted solve failed — retrying at recovered scale (position kept)"
             );
             let b1_hints = SolveHints {
                 pixel_scale_arcsec: Some(scale),
@@ -387,9 +387,10 @@ pub fn solve(
         // B2 — bounded scale sweep at the known position.
         if !cancelled() {
             if let Some((lo, hi)) = b2_bounds(hints, cfg) {
-                eprintln!(
-                    "[solvemyastro] retrying with bounded scale sweep \
-                     [{lo:.3}..{hi:.3}]\"/px (position kept)"
+                tracing::warn!(
+                    scale_lo_arcsec_px = lo,
+                    scale_hi_arcsec_px = hi,
+                    "hinted solve failed — retrying with bounded scale sweep (position kept)"
                 );
                 let sweep_hints = SolveHints {
                     pixel_scale_arcsec: None,
@@ -407,9 +408,8 @@ pub fn solve(
 
     // Step C — existing degrade-to-blind: clear the position prior, keep scale.
     if has_position && !cancelled() {
-        eprintln!(
-            "[solvemyastro] hinted solve failed — retrying with the position prior cleared \
-             (blind position, scale kept)"
+        tracing::warn!(
+            "hinted solve failed — retrying with the position prior cleared (blind position, scale kept)"
         );
         let blind_hints = SolveHints { ra: None, dec: None, ..*hints };
         if let Ok(sol) = orchestrate::solve(image, &blind_hints, caches, cfg, cancel) {

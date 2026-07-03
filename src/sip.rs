@@ -242,9 +242,11 @@ pub fn fit_sip(
     let ord1 = match order_for(pairs1.len()) {
         Some(o) => o,
         None => {
-            eprintln!(
-                "[solvemyastro] SIP skipped: only {} pairs at generous tol (need ≥12)",
-                pairs1.len()
+            tracing::warn!(
+                variant = "two_stage",
+                pairs = pairs1.len(),
+                min_required = 12,
+                "SIP fit skipped — too few pairs at generous tolerance"
             );
             return None;
         }
@@ -538,9 +540,11 @@ pub fn fit_sip_annealed(
     let ord1 = match order_for(pairs1.len()) {
         Some(o) => o,
         None => {
-            eprintln!(
-                "[solvemyastro] fit_sip_annealed: only {} pairs at generous tol (need ≥12)",
-                pairs1.len()
+            tracing::warn!(
+                variant = "annealed",
+                pairs = pairs1.len(),
+                min_required = 12,
+                "SIP fit skipped — too few pairs at generous tolerance"
             );
             return None;
         }
