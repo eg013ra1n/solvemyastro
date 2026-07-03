@@ -1108,7 +1108,7 @@ pub(crate) fn solve_inner(
         Err(e) => {
             trace.outcome = TraceOutcome::Failed(e.to_string());
             trace.total_ms = t0.elapsed().as_millis() as u64;
-            tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %e, funnel = %trace, "solve failed");
+            tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %e, outcome = "failed", funnel = %trace, "solve failed");
             return Err(e);
         }
         Ok(Some(mut sol)) => {
@@ -1127,6 +1127,7 @@ pub(crate) fn solve_inner(
                 inliers = sol.matched_stars,
                 rms_px = sol.rms_residual_px,
                 scale_arcsec_px = sol.pixel_scale_arcsec,
+                outcome = "solved",
                 funnel = %trace,
                 "solve succeeded"
             );
@@ -1148,7 +1149,7 @@ pub(crate) fn solve_inner(
         Err(e) => {
             trace.outcome = TraceOutcome::Failed(e.to_string());
             trace.total_ms = t0.elapsed().as_millis() as u64;
-            tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %e, funnel = %trace, "solve failed");
+            tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %e, outcome = "failed", funnel = %trace, "solve failed");
             return Err(e);
         }
         Ok(Some(mut sol)) => {
@@ -1167,6 +1168,7 @@ pub(crate) fn solve_inner(
                 inliers = sol.matched_stars,
                 rms_px = sol.rms_residual_px,
                 scale_arcsec_px = sol.pixel_scale_arcsec,
+                outcome = "solved",
                 funnel = %trace,
                 "solve succeeded"
             );
@@ -1183,7 +1185,7 @@ pub(crate) fn solve_inner(
     );
     trace.outcome = TraceOutcome::Failed(msg.clone());
     trace.total_ms = t0.elapsed().as_millis() as u64;
-    tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %msg, funnel = %trace, "solve failed");
+    tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %msg, outcome = "failed", funnel = %trace, "solve failed");
     // Return the structured failure so callers can render a precise reason
     // (the full funnel trace is carried in the `funnel` field of the error! event above).
     Err(anyhow::Error::new(crate::diag::SolveFailure {
