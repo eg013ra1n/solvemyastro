@@ -700,6 +700,14 @@ fn refit_affine_iter(
 /// `SolveConfig::ransac_seed` XOR'd with the cell coordinates (bit-cast to u64).
 /// The corpus gate uses the same seed on every run.
 ///
+/// Determinism is per-build, NOT across `rand` majors: the raw Xoshiro256**
+/// stream is version-stable, but `random_range`'s stream→index mapping is not
+/// (rand 0.8 used Lemire zone-rejection, 0.9+ uses Canon's method), so a `rand`
+/// bump reshuffles which triples get sampled. That is safe here because the
+/// sample only ever seeds a candidate affine that must out-inlier the full-set
+/// least-squares fit to be adopted — but it does mean a `rand` bump can move
+/// the corpus baseline, and the baseline must be re-frozen if it does.
+///
 /// Returns the best `Affine` found, or the original `fit_affine` result when
 /// the PROSAC result is not an improvement.
 #[allow(clippy::too_many_arguments)]
@@ -710,7 +718,9 @@ fn prosac_seed_affine(
     rng_seed: u64,
     n_trials: usize,
 ) -> Option<Affine> {
-    use rand::Rng;
+    // `RngExt` is rand 0.10's extension trait (0.8 called it `Rng`; `rand::Rng`
+    // is now a re-export of the core trait and carries no `random_range`).
+    use rand::RngExt;
 
     if matches.len() < 3 {
         return None;
@@ -738,17 +748,17 @@ fn prosac_seed_affine(
         // Sample 3 pairs.
         let sample: [(usize, usize); 3] = if trial_idx < 10 && top_quartile >= 3 {
             // Top-quartile preferential sampling.
-            let i0 = rng.gen_range(0..top_quartile);
-            let mut i1 = rng.gen_range(0..top_quartile);
+            let i0 = rng.random_range(0..top_quartile);
+            let mut i1 = rng.random_range(0..top_quartile);
             if i1 == i0 { i1 = (i1 + 1) % top_quartile; }
-            let mut i2 = rng.gen_range(0..top_quartile);
+            let mut i2 = rng.random_range(0..top_quartile);
             if i2 == i0 || i2 == i1 { i2 = (i2 + 2) % top_quartile; }
             [sorted_matches[i0], sorted_matches[i1], sorted_matches[i2]]
         } else {
-            let i0 = rng.gen_range(0..nm);
-            let mut i1 = rng.gen_range(0..nm);
+            let i0 = rng.random_range(0..nm);
+            let mut i1 = rng.random_range(0..nm);
             if i1 == i0 { i1 = (i1 + 1) % nm; }
-            let mut i2 = rng.gen_range(0..nm);
+            let mut i2 = rng.random_range(0..nm);
             if i2 == i0 || i2 == i1 { i2 = (i2 + 2) % nm; }
             [sorted_matches[i0], sorted_matches[i1], sorted_matches[i2]]
         };

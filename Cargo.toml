@@ -26,7 +26,7 @@ path = "src/main.rs"
 # Versions pinned to the workspace lock to avoid duplicate crate versions
 # (project rule). CLI uses std::env::args (project convention — no clap).
 rustafits = { path = "../rustafits" }
-nalgebra = "0.33"
+nalgebra = "0.35"
 rayon = "1.10"
 anyhow = "1"
 memmap2 = "0.9"
@@ -34,8 +34,8 @@ cdshealpix = "0.9"
 byteorder = "1"
 # PROSAC RANSAC deterministic RNG (Phase 3). Seeded from SolveConfig::ransac_seed
 # so the corpus gate produces identical results across repeated runs.
-rand = "0.8"
-rand_xoshiro = "0.6"
+rand = "0.10"
+rand_xoshiro = "0.8"
 # Structured-logging facade only (no subscriber here). solvemyastro is a
 # library — events flow through whatever subscriber the embedding process
 # installs (the athenaeum host subscriber when used as a workspace dep;
