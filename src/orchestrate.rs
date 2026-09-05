@@ -106,6 +106,24 @@ const MAX_CAT_STARS: usize = 6000;
 const BASE_MATCH_ARCSEC: f64 = 3.0;
 /// Minimum inlier floor (absolute) regardless of density calculation.
 const MIN_ABSOLUTE_INLIERS: usize = 6;
+/// Below this many detections a frame is simply sparse, and the share of
+/// streaks says nothing — the trailed verdict needs a population to judge.
+const MIN_DETECTIONS_FOR_TRAIL_VERDICT: usize = 100;
+/// Share of detections the shape cut must remove before a frame is called
+/// trailed rather than merely imperfect.
+const TRAILED_POOL_PERCENT: usize = 90;
+
+/// Did the shape cut just empty this frame?
+///
+/// `total_detected` is what the detector found; `pool` what survived the
+/// elongation cut and the SNR gate. A frame of streaks loses nearly all of
+/// it, a healthy one almost none — so the share separates "nothing to match"
+/// from "a hard field", and only the former is worth refusing outright.
+fn looks_trailed(total_detected: usize, pool: usize) -> bool {
+    total_detected >= MIN_DETECTIONS_FOR_TRAIL_VERDICT
+        && total_detected.saturating_sub(pool) * 100 >= total_detected * TRAILED_POOL_PERCENT
+}
+
 /// Adaptive tolerance maximum (px) so we don't accept garbage on tiny scales.
 const MAX_MATCH_PX: f64 = 20.0;
 /// Magnitude limit for the verification cone (bright stars only — mirrors
@@ -971,6 +989,20 @@ pub(crate) fn solve_inner(
     );
     if n < 4 {
         anyhow::bail!("too few stars after selection ({n}, need ≥4)");
+    }
+    // A frame the shape cut nearly emptied has no stars to offer, only
+    // streaks — and the handful that survive are the least-bad fragments,
+    // not catalogue positions. Refuse now rather than walk the FOV ladder
+    // (twice, counting the density-balanced retry) to arrive at the same
+    // answer minutes later. Measured: frames whose stars are trails lose
+    // 98-99 % of their detections here, healthy ones 0-13 %, and even a
+    // hard DSLR frame only 60 %.
+    if looks_trailed(total_detected, n) {
+        let dropped = total_detected - n;
+        anyhow::bail!(
+            "stars are trailed: {dropped} of {total_detected} detections are streaks, \
+             leaving {n} usable"
+        );
     }
     // σ slice + pass-1 raw positions: built only when refinement was accepted
     // so the sx/sy/raw_x/raw_y values are meaningful (PSF-fitted).
@@ -2031,6 +2063,24 @@ mod bounded_ladder_tests {
 mod orchestrate_unit_tests {
     use super::*;
     use crate::SolveHints;
+
+    /// Measured shares, from real frames (2026-09-05): a wind-shaken frame
+    /// leaves 14 of 600 detections after the shape cut, a healthy one 572,
+    /// and even a hard DSLR frame keeps 40 %. Only the first has nothing to
+    /// match, and only it is worth refusing before the FOV ladder runs —
+    /// twice, counting the density-balanced retry.
+    #[test]
+    fn a_frame_of_streaks_is_told_apart_from_a_hard_one() {
+        assert!(looks_trailed(600, 14), "586 of 600 are streaks");
+        assert!(looks_trailed(600, 60), "exactly 90 % dropped");
+        assert!(!looks_trailed(600, 61), "just under the line is not a verdict");
+        assert!(!looks_trailed(600, 243), "a hard DSLR frame keeps 40 %");
+        assert!(!looks_trailed(600, 572), "a healthy frame");
+        // A sparse field has no population to judge — a narrow FOV can
+        // legitimately detect only a handful of stars.
+        assert!(!looks_trailed(50, 2), "too few detections to call it");
+        assert!(!looks_trailed(0, 0));
+    }
 
     // -----------------------------------------------------------------------
     // fov_rungs
