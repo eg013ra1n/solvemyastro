@@ -2,9 +2,11 @@
 //!
 //! # Algorithm
 //!
-//! 1. Discard detections whose `snr ≤ SNR_THRESHOLD` (= 10.0).
-//! 2. Rank survivors by SNR descending (brightest first).
-//! 3. Cap at the pool-size ceiling (default 600).
+//! 1. Discard detections that are not shaped like stars — axis ratio over
+//!    [`MAX_AXIS_RATIO`], measured from the PSF refinement's per-axis σ.
+//! 2. Discard detections whose `snr ≤ SNR_THRESHOLD` (= 10.0).
+//! 3. Rank survivors by SNR descending (brightest first).
+//! 4. Cap at the pool-size ceiling (default 600).
 //!
 //! `FastStar.snr` (rustafits `detect_fast`) is the aperture-photometry
 //! signal-to-noise ratio with background noise already folded in, so the
@@ -13,6 +15,28 @@
 
 /// SNR floor below which a detection is treated as noise.
 const SNR_THRESHOLD: f32 = 10.0;
+
+/// Largest eccentricity a detection may have and still be quad material.
+///
+/// A star is round; a trailed one is a streak whose centroid marks the middle
+/// of a line rather than a catalogue position, so quads built on such points
+/// match nothing real — and the solver, unable to match them at the true
+/// scale, walks its autoFOV ladder until something "fits" at a wildly wrong
+/// one. Measured on wind-shaken frames (2026-09-05): 98–99 % of their
+/// detections exceed 0.8, against 8–10 % on healthy frames and on trailed
+/// frames that still solve correctly, so the cut empties the pool exactly on
+/// the frames that have nothing to offer and barely touches the rest.
+///
+/// Read from `FastStar::eccentricity`, which the detector measures from
+/// second moments for EVERY detection. The per-axis σ of the PSF fit cannot
+/// serve here: on those same frames the fit declines almost every star,
+/// leaving σ at zero precisely when the shape matters most.
+pub const MAX_ECCENTRICITY: f32 = 0.8;
+
+/// Is this detection shaped like a star rather than a streak?
+fn is_pointlike(eccentricity: f32) -> bool {
+    eccentricity <= MAX_ECCENTRICITY
+}
 
 /// Select the quad-building star pool from raw `detect_fast` detections.
 ///
@@ -90,7 +114,9 @@ pub fn select_fast_stars(
     stars: &[astroimage::FastStar],
     max: usize,
 ) -> Vec<(f64, f64)> {
-    select_stars_for_quads(stars, max, |s| (s.x, s.y, s.snr))
+    let round: Vec<&astroimage::FastStar> =
+        stars.iter().filter(|s| is_pointlike(s.eccentricity)).collect();
+    select_stars_for_quads(&round, max, |s: &&astroimage::FastStar| (s.x, s.y, s.snr))
 }
 
 /// Select the quad-building star pool from `detect_fast` detections, returning
@@ -117,6 +143,7 @@ pub fn select_fast_stars_with_sigma(
     // Gate: keep only SNR > threshold, same predicate as select_fast_stars.
     let mut passing: Vec<(f32, f32, f32, f32, f32)> = stars
         .iter()
+        .filter(|s| is_pointlike(s.eccentricity))
         .map(|s| (s.x, s.y, s.snr, s.sx, s.sy))
         .filter(|&(_, _, snr, _, _)| snr > SNR_THRESHOLD)
         .collect();
@@ -155,6 +182,7 @@ pub fn select_fast_stars_with_raw(
     // Carry: (x, y, snr, raw_x, raw_y, sx, sy).
     let mut passing: Vec<(f32, f32, f32, f32, f32, f32, f32)> = stars
         .iter()
+        .filter(|s| is_pointlike(s.eccentricity))
         .map(|s| (s.x, s.y, s.snr, s.raw_x, s.raw_y, s.sx, s.sy))
         .filter(|&(_, _, snr, _, _, _, _)| snr > SNR_THRESHOLD)
         .collect();
@@ -183,6 +211,30 @@ mod tests {
 
     fn acc(s: &S) -> (f32, f32, f32) {
         (s.x, s.y, s.snr)
+    }
+
+    /// A detection whose two axes disagree is a streak, not a star: its
+    /// centroid does not mark a catalogue position, so quads built on it match
+    /// nothing real. Measured on wind-shaken frames (2026-09-05): 49–76 % of
+    /// their detections have an axis ratio over 2, against 0–1 % on healthy
+    /// frames — and the solver "solved" them at 16–193× the header's pixel
+    /// scale, writing astrometry that is pure fiction.
+    #[test]
+    fn elongated_detections_are_not_quad_material() {
+        assert!(is_pointlike(0.0), "a perfectly round star stays");
+        assert!(is_pointlike(0.5), "ordinary seeing stays — healthy frames sit near 0.5");
+        assert!(is_pointlike(0.7), "a trailed frame that still solves sits here");
+        assert!(is_pointlike(0.8), "exactly at the limit stays");
+        assert!(!is_pointlike(0.81), "past the limit is a streak");
+        assert!(!is_pointlike(0.98), "where a wind-shaken frame's detections live");
+    }
+
+    /// The moments are measured for every detection, so there is no "unknown"
+    /// case to reason about — but a detector that reports nothing must not
+    /// wipe the pool either.
+    #[test]
+    fn an_unmeasured_shape_reads_as_round() {
+        assert!(is_pointlike(0.0), "a zero from a detector that skipped the moments");
     }
 
     #[test]

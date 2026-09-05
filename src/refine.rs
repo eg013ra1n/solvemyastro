@@ -133,6 +133,7 @@ mod tests {
             peak: 0.0,
             flux: 0.0,
             snr,
+            eccentricity: 0.0,
             sx: 0.0,
             sy: 0.0,
             fwhm,
