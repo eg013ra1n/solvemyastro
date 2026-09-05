@@ -15,7 +15,12 @@ solvemyastro cache-info <cache-dir>
 
 ## Status
 
-Phased build (see the implementation plan). Phases 0–2 complete: catalog
-cache, blind plate solver, and pixel-space SIP distortion fit are
-functional and corpus-gated (sub-pixel SIP on 13/14 bench frames).
-Next: Athenaeum integration (Phase 3).
+In use: solvemyastro is the only solver Athenaeum ships. The catalog cache,
+blind and hinted solving, the pixel-space SIP distortion fit (sub-pixel on
+13/14 bench frames), the opt-in precise profile and frame-to-frame
+registration are all functional and held by a corpus gate against a frozen
+baseline.
+
+Released by tag from this repository; `rustafits` is a path dependency, so the
+crate builds inside the Athenaeum workspace layout and is not published to
+crates.io. See `CHANGELOG.md`.
