@@ -1496,23 +1496,15 @@ fn run_search(
         group_size,
         min_quads,
         image_center,
-        width,
-        height,
-        long_px,
-        total_detected,
         rungs,
         center,
         search_radius,
         cones,
         cfg,
         obs_epoch,
-        t0,
         cancel,
         timing,
-        truth,
-        frame_name,
-        star_sigmas,
-        image_pts_raw,
+        ..
     } = ctx;
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
 
@@ -1673,7 +1665,62 @@ fn run_search(
                 })
                 .collect();
             results.extend(alts);
-        'candidates: for trial in results {
+            if let Some(sol) = verify_trials(ctx, results, &mut rt)? {
+                // Mark verified so remaining parallel trials in this rung stop early,
+                // and snapshot this rung into pass_trace so the funnel includes the
+                // rung that ultimately solved.
+                any_verified.store(true, Ordering::Relaxed);
+                pass_trace.rungs.push(rt);
+                return Ok(Some(sol));
+            }
+            // This chunk's candidates didn't verify — fall through to the
+            // next chunk in the same rung.
+        } // end 'chunks loop
+
+        // Either every chunk failed to verify or we broke out due to
+        // any_verified being set externally. Snapshot trace counts and
+        // push the rung before moving on.
+        rt.cells = cells_mutex.into_inner().unwrap();
+        rt.candidates_emitted = total_candidates_in_rung;
+        pass_trace.rungs.push(rt);
+    } // end rung loop
+
+    if is_cancelled() {
+        anyhow::bail!("cancelled");
+    }
+    Ok(None)
+}
+
+/// Verify `trials` in order: seed inliers and log-odds, the full-field refit,
+/// SIP, and the bright-star completeness gate. The first trial that passes
+/// all of them is returned as the solution; every rejection is recorded in
+/// `rt`. Shared by the spiral search and the quad-index search.
+fn verify_trials(
+    ctx: &SearchCtx,
+    trials: Vec<TrialResult>,
+    rt: &mut RungTrace,
+) -> Result<Option<SolveSolution>> {
+    let &SearchCtx {
+        image_pts,
+        image_center,
+        width,
+        height,
+        long_px,
+        total_detected,
+        cones,
+        cfg,
+        obs_epoch,
+        t0,
+        cancel,
+        timing,
+        truth,
+        frame_name,
+        star_sigmas,
+        image_pts_raw,
+        ..
+    } = ctx;
+    let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
+        'candidates: for trial in trials {
             if is_cancelled() {
                 anyhow::bail!("cancelled");
             }
@@ -2161,8 +2208,6 @@ fn run_search(
             }
             let solve_time_ms = t0.elapsed().as_millis() as u64;
 
-            // Mark verified so remaining parallel trials in this rung stop early.
-            any_verified.store(true, Ordering::Relaxed);
 
             // Phase-0 diagnostic (SOLVEMYASTRO_DUMP_RESIDUALS=1): dump the
             // per-star residual vector field at the final (SIP-or-linear) WCS
@@ -2175,9 +2220,6 @@ fn run_search(
                 crate::diag::dump_residual_field(frame_name, &resid_pairs);
             }
 
-            // Successful return: snapshot this rung into pass_trace before
-            // exiting so the funnel includes the rung that ultimately solved.
-            pass_trace.rungs.push(rt);
 
             return Ok(Some(SolveSolution {
                 pixel_scale_arcsec: sip_wcs.pixel_scale_arcsec(),
@@ -2196,21 +2238,6 @@ fn run_search(
                 psf_fwhm_px: None,
             }));
         } // end 'candidates loop
-            // This chunk's candidates didn't verify — fall through to the
-            // next chunk in the same rung.
-        } // end 'chunks loop
-
-        // Either every chunk failed to verify or we broke out due to
-        // any_verified being set externally. Snapshot trace counts and
-        // push the rung before moving on.
-        rt.cells = cells_mutex.into_inner().unwrap();
-        rt.candidates_emitted = total_candidates_in_rung;
-        pass_trace.rungs.push(rt);
-    } // end rung loop
-
-    if is_cancelled() {
-        anyhow::bail!("cancelled");
-    }
     Ok(None)
 }
 
