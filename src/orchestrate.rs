@@ -349,6 +349,9 @@ struct TrialResult {
     /// Threaded to the verify section so the PROSAC gate (`< 10 pairs`) can
     /// be applied to the full-field iterative refit decision.
     quad_match_pairs: usize,
+    /// The same seed re-fitted about its own frame centre (see
+    /// [`refit_seed_at`]). Verified only when `wcs` is rejected.
+    recentered: Option<WcsSolution>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -467,6 +470,24 @@ fn run_trial(
     timing.fit_affine_calls.fetch_add(1, Ordering::Relaxed);
     let wcs = affine_to_wcs(&affine, image_center, (ra0, dec0));
 
+    // The affine was fitted in the tangent plane of the *cell* centre, but the
+    // WCS puts its tangent point at the frame centre it implies. When those
+    // differ, the CD is the wrong plane's: on a wide field a 0.6° hint error
+    // leaves the seed several pixels off at the edges, verification sees a
+    // handful of inliers and the correct seed is thrown away. Re-fit once
+    // with the catalog projected about the seed's own centre, kept as a
+    // fallback candidate so seeds that already verify are untouched.
+    let seed = wcs.pixel_to_sky(image_center.0, image_center.1);
+    let recentered = if great_circle_deg(seed.0, seed.1, ra0, dec0) > RECENTER_MIN_DEG {
+        refit_seed_at(seed, iquads, cat_stars, image_center, gs, mq, cfg, ransac_seed, timing)
+            .filter(|w| {
+                let s = w.pixel_scale_arcsec();
+                s.is_finite() && (0.05..=120.0).contains(&s)
+            })
+    } else {
+        None
+    };
+
     // Sanity: pixel scale must be in physical range (0.05"–120"/px).
     let scale = wcs.pixel_scale_arcsec();
     if !scale.is_finite() || scale < 0.05 || scale > 120.0 {
@@ -483,7 +504,47 @@ fn run_trial(
         dist_from_hint_deg,
     });
     ct.stop = CellStop::SeedEmitted;
-    Some(TrialResult { wcs, tangent: (ra0, dec0), scale_arcsec: scale, quad_match_pairs })
+    Some(TrialResult { wcs, tangent: (ra0, dec0), scale_arcsec: scale, quad_match_pairs, recentered })
+}
+
+/// Seed-to-cell offset above which [`run_trial`] re-fits the seed about its
+/// own centre.
+const RECENTER_MIN_DEG: f64 = 0.01;
+
+/// Re-run the quad match and affine fit with the catalog projected about
+/// `tangent` (the seed's frame centre). Same match floor and PROSAC rule as
+/// the first fit; `None` when the re-fit falls short, so the caller keeps its
+/// original seed.
+#[allow(clippy::too_many_arguments)]
+fn refit_seed_at(
+    tangent: (f64, f64),
+    iquads: &[Quad],
+    cat_stars: &[CatalogStar],
+    image_center: (f64, f64),
+    gs: usize,
+    mq: usize,
+    cfg: &SolveConfig,
+    ransac_seed: u64,
+    timing: &TimingProfile,
+) -> Option<WcsSolution> {
+    let t = Instant::now();
+    let projected = project_catalog(cat_stars, tangent.0, tangent.1);
+    TimingProfile::add(&timing.project_ns, t.elapsed());
+    let t = Instant::now();
+    let cat_quads = build_quads(&projected, projected.len(), gs);
+    TimingProfile::add(&timing.build_quads_cat_ns, t.elapsed());
+    let t = Instant::now();
+    let (matches, _) = match_quads_stats(iquads, &cat_quads, cfg.quad_tolerance);
+    TimingProfile::add(&timing.match_quads_ns, t.elapsed());
+    if matches.len() < mq {
+        return None;
+    }
+    let affine = if matches.len() < 10 {
+        prosac_seed_affine(&matches, iquads, &cat_quads, ransac_seed, 100)?
+    } else {
+        fit_affine(&matches, iquads, &cat_quads)?
+    };
+    Some(affine_to_wcs(&affine, image_center, tangent))
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,7 +1602,23 @@ fn run_search(
             // is the spiral-pruning early-exit. Sequential within-chunk
             // verify is fine: candidates per chunk are rare (false quad
             // matches survive the median-ratio filter only occasionally).
-            let results = chunk_results;
+            // Recentered re-fits are verified after every original seed of
+            // the chunk, so they only decide chunks no original seed passes.
+            let mut results = chunk_results;
+            let alts: Vec<TrialResult> = results
+                .iter_mut()
+                .filter_map(|t| {
+                    let w = t.recentered.take()?;
+                    Some(TrialResult {
+                        scale_arcsec: w.pixel_scale_arcsec(),
+                        wcs: w,
+                        tangent: t.tangent,
+                        quad_match_pairs: t.quad_match_pairs,
+                        recentered: None,
+                    })
+                })
+                .collect();
+            results.extend(alts);
         'candidates: for trial in results {
             if is_cancelled() {
                 anyhow::bail!("cancelled");
