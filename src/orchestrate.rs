@@ -1731,6 +1731,9 @@ fn run_search(
     Ok(None)
 }
 
+/// Index hypotheses verified as they come before agreement is required.
+const INDEX_FREE_VERIFIES: usize = 16;
+
 /// Blind / scale-free search through the quad index. Every hypothesis is
 /// verified as it arrives (same pipeline as the spiral, via
 /// [`verify_trials`]); repeats of an already rejected solution are skipped.
@@ -1760,6 +1763,9 @@ fn run_index_search(
     let is_cancelled = || ctx.cancel.is_some_and(|f| f.load(Ordering::Relaxed));
     let mut rt = RungTrace::new(0, 0, 0.0, 0);
     let mut rejected: Vec<((f64, f64), f64)> = Vec::new();
+    // Unverified hypotheses waiting for a second, agreeing match:
+    // (crval, scale, rotation, mirrored).
+    let mut pending: Vec<((f64, f64), f64, f64, bool)> = Vec::new();
     let mut outcome: Result<Option<SolveSolution>> = Ok(None);
     let mut n_hypotheses = 0usize;
     let mut last_queries = 0usize;
@@ -1775,10 +1781,31 @@ fn run_index_search(
                 return false;
             }
         }
-        if rejected.iter().any(|&((ra, dec), s)| {
+        let same = |(ra, dec): (f64, f64), s: f64| {
             (scale / s - 1.0).abs() < 0.02 && great_circle_deg(ra, dec, c.0, c.1) < 0.02 * fov_deg
-        }) {
+        };
+        if rejected.iter().any(|&(p, s)| same(p, s)) {
             return false;
+        }
+        // Past the first few, a hypothesis is verified only once a second,
+        // independent match agrees with it: chance code matches scatter over
+        // the sky, a true field yields many matches with one WCS, and each
+        // verification reads catalog cones.
+        if n_hypotheses >= INDEX_FREE_VERIFIES {
+            let rot = h.wcs.field_rotation_deg();
+            let flip = h.wcs.cd[0][0] * h.wcs.cd[1][1] - h.wcs.cd[0][1] * h.wcs.cd[1][0] < 0.0;
+            let agrees = |&(p, s, r, f): &((f64, f64), f64, f64, bool)| {
+                f == flip && same(p, s) && ((rot - r + 540.0) % 360.0 - 180.0).abs() < 1.0
+            };
+            match pending.iter().position(agrees) {
+                Some(i) => {
+                    pending.swap_remove(i);
+                }
+                None => {
+                    pending.push((c, scale, rot, flip));
+                    return false;
+                }
+            }
         }
         n_hypotheses += 1;
         let trial = TrialResult {
