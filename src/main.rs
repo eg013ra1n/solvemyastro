@@ -10,6 +10,8 @@
 //!                [--bright-floor 14.0] [--target-density 100]
 //!                [--mode hybrid|floor-only|cap-only]
 //!   solvemyastro cache-info <cache-dir>
+//!   solvemyastro build-index --tiers <dir with tier_*> --out <index-dir>
+//!                [--min-depth 2] [--max-depth 6] [--stars-per-cell 10] [--quads-per-cell 8]
 
 use std::path::PathBuf;
 
@@ -211,13 +213,57 @@ fn main() -> Result<()> {
             println!("  catalog epoch: J{}", cache.catalog_epoch());
             Ok(())
         }
+        "build-index" => {
+            let tiers = opt(rest, "--tiers")
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("--tiers <dir with tier_*> is required"))?;
+            let out = opt(rest, "--out")
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("--out <index-dir> is required"))?;
+            let d = solvemyastro::index::BuildParams::default();
+            let num = |flag: &str, default: usize| -> Result<usize> {
+                opt(rest, flag).map_or(Ok(default), |v| {
+                    v.parse().map_err(|_| anyhow::anyhow!("{flag}: not a number: {v}"))
+                })
+            };
+            let params = solvemyastro::index::BuildParams {
+                min_depth: num("--min-depth", d.min_depth as usize)? as u8,
+                max_depth: num("--max-depth", d.max_depth as usize)? as u8,
+                stars_per_cell: num("--stars-per-cell", d.stars_per_cell)?,
+                quads_per_cell: num("--quads-per-cell", d.quads_per_cell)?,
+            };
+            // Tiers bright → faint; the index only needs the bright ones.
+            let mut layers = Vec::new();
+            for t in ["tier_500", "tier_2000"] {
+                let dir = tiers.join(t);
+                if dir.is_dir() {
+                    layers.push(StarCache::open(&dir)?);
+                }
+            }
+            if layers.is_empty() {
+                bail!("no tier_500 / tier_2000 under {}", tiers.display());
+            }
+            let refs: Vec<&StarCache> = layers.iter().collect();
+            let t = std::time::Instant::now();
+            let (n_stars, n_quads) =
+                solvemyastro::index::build_index(&refs, &out, &params, |m| eprintln!("  {m}"))?;
+            println!(
+                "build-index: {} stars, {} quads -> {} ({:.1} s)",
+                n_stars,
+                n_quads,
+                out.join(solvemyastro::index::INDEX_FILE).display(),
+                t.elapsed().as_secs_f64()
+            );
+            Ok(())
+        }
         "" | "-h" | "--help" => {
             println!(
                 "solvemyastro — standalone plate solver (precise WCS + SIP)\n\n\
                  USAGE:\n  \
                  solvemyastro solve <image> --catalog <dir> [--ra --dec --fov|--scale --radius] [--json]\n  \
                  solvemyastro build-cache --from <src-dir> --out <cache-dir>\n  \
-                 solvemyastro cache-info <cache-dir>"
+                 solvemyastro cache-info <cache-dir>\n  \
+                 solvemyastro build-index --tiers <dir> --out <index-dir> [--min-depth --max-depth]"
             );
             Ok(())
         }

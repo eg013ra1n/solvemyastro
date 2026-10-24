@@ -16,6 +16,7 @@ use anyhow::Result;
 
 pub mod cache;
 pub mod diag;
+pub mod index;
 pub(crate) mod math;
 pub(crate) mod nn;
 pub mod orchestrate;
@@ -31,6 +32,7 @@ pub mod wcs_fit;
 
 pub use cache::{LayeredCones, PixelCache, StarCache, StarRecord};
 pub use diag::{BestAttempt, FailureClass, SolveFailure};
+pub use index::QuadIndex;
 pub use register::{register, register_with_config, Registration};
 pub use wcs::{SipCoefficients, WcsSolution};
 
@@ -349,8 +351,23 @@ pub fn solve(
     cfg: &SolveConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SolveSolution> {
+    solve_with_index(image, hints, caches, None, cfg, cancel)
+}
+
+/// [`solve`] with a [`QuadIndex`]. When the hints leave the position or the
+/// scale open (blind, position-only, scale-only), the index is searched
+/// before the spiral: its cost does not grow with the sky area or scale
+/// range left to cover. Fully hinted frames solve exactly as with [`solve`].
+pub fn solve_with_index(
+    image: &Path,
+    hints: &SolveHints,
+    caches: &Caches<'_>,
+    index: Option<&QuadIndex>,
+    cfg: &SolveConfig,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<SolveSolution> {
     // Step A — hinted (or blind) solve.
-    let result = orchestrate::solve(image, hints, caches, cfg, cancel);
+    let result = orchestrate::solve(image, hints, caches, index, cfg, cancel);
     if result.is_ok() {
         return result;
     }
@@ -380,7 +397,7 @@ pub fn solve(
                 fov_deg: None,
                 ..*hints
             };
-            if let Ok(sol) = orchestrate::solve(image, &b1_hints, caches, cfg, cancel) {
+            if let Ok(sol) = orchestrate::solve(image, &b1_hints, caches, index, cfg, cancel) {
                 return Ok(sol);
             }
         }
@@ -399,7 +416,7 @@ pub fn solve(
                     ..*hints
                 };
                 if let Ok(sol) =
-                    orchestrate::solve_inner(image, &sweep_hints, caches, cfg, cancel, Some((lo, hi)))
+                    orchestrate::solve_inner(image, &sweep_hints, caches, index, cfg, cancel, Some((lo, hi)))
                 {
                     return Ok(sol);
                 }
@@ -413,7 +430,7 @@ pub fn solve(
             "hinted solve failed — retrying with the position prior cleared (blind position, scale kept)"
         );
         let blind_hints = SolveHints { ra: None, dec: None, ..*hints };
-        if let Ok(sol) = orchestrate::solve(image, &blind_hints, caches, cfg, cancel) {
+        if let Ok(sol) = orchestrate::solve(image, &blind_hints, caches, index, cfg, cancel) {
             return Ok(sol);
         }
     }

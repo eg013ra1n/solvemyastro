@@ -73,6 +73,7 @@ use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256StarStar;
 
 use crate::{
+    index::QuadIndex,
     diag::{CellStop, CellTrace, KnownTruth, PassTrace, RungTrace, SeedInfo, SolveTrace, TraceOutcome, VerifyTrace, known_truth_for},
     math::great_circle_deg,
     nn::PointGrid,
@@ -1010,10 +1011,11 @@ pub fn solve(
     image: &Path,
     hints: &SolveHints,
     caches: &crate::Caches<'_>,
+    index: Option<&QuadIndex>,
     cfg: &SolveConfig,
     cancel: Option<&AtomicBool>,
 ) -> Result<SolveSolution> {
-    solve_inner(image, hints, caches, cfg, cancel, None)
+    solve_inner(image, hints, caches, index, cfg, cancel, None)
 }
 
 /// Internal entry: `scale_bounds = Some((lo_arcsec, hi_arcsec))` drives a
@@ -1022,6 +1024,7 @@ pub(crate) fn solve_inner(
     image: &Path,
     hints: &SolveHints,
     caches: &crate::Caches<'_>,
+    index: Option<&QuadIndex>,
     cfg: &SolveConfig,
     cancel: Option<&AtomicBool>,
     scale_bounds: Option<(f64, f64)>,
@@ -1278,6 +1281,43 @@ pub(crate) fn solve_inner(
         star_sigmas: star_sigmas_storage.as_deref(),
         image_pts_raw: image_pts_raw_storage.as_deref(),
     };
+    // Quad-index search first when the hints leave position or scale open:
+    // it costs the same anywhere on the sky, where the spiral's cost grows
+    // with the area and scale range it has to cover. A fully hinted frame
+    // keeps the spiral, which is near-instant around a good hint.
+    let has_position = center.is_some();
+    let has_scale = scale_bounds.is_none()
+        && (hints.pixel_scale_arcsec.is_some() || hints.fov_deg.is_some());
+    if let Some(ix) = index.filter(|_| !(has_position && has_scale)) {
+        let mut index_pass = PassTrace::new(false);
+        let found = run_index_search(&ctx, ix, hints, scale_bounds, &mut index_pass);
+        trace.passes.push(index_pass);
+        match found {
+            Err(e) => return Err(e),
+            Ok(Some(mut sol)) => {
+                sol.psf_fwhm_px = psf_fwhm_px;
+                trace.outcome = TraceOutcome::Solved {
+                    ra: sol.wcs.crval.0, dec: sol.wcs.crval.1,
+                    inliers: sol.matched_stars, rms_px: sol.rms_residual_px,
+                };
+                trace.total_ms = t0.elapsed().as_millis() as u64;
+                tracing::info!(
+                    frame = %frame_name,
+                    total_ms = trace.total_ms,
+                    inliers = sol.matched_stars,
+                    scale_arcsec_px = sol.pixel_scale_arcsec,
+                    outcome = "solved",
+                    path = "index",
+                    "solve succeeded"
+                );
+                return Ok(sol);
+            }
+            Ok(None) => {
+                tracing::warn!(frame = %frame_name, "quad-index search found nothing — falling back to the spiral search");
+            }
+        }
+    }
+
     let mut primary_pass = PassTrace::new(false);
     let primary_result = run_search(&ctx, false, &mut primary_pass);
     trace.passes.push(primary_pass);
@@ -1689,6 +1729,106 @@ fn run_search(
         anyhow::bail!("cancelled");
     }
     Ok(None)
+}
+
+/// Blind / scale-free search through the quad index. Every hypothesis is
+/// verified as it arrives (same pipeline as the spiral, via
+/// [`verify_trials`]); repeats of an already rejected solution are skipped.
+fn run_index_search(
+    ctx: &SearchCtx,
+    index: &QuadIndex,
+    hints: &SolveHints,
+    scale_bounds: Option<(f64, f64)>,
+    pass_trace: &mut PassTrace,
+) -> Result<Option<SolveSolution>> {
+    // Plausible scale: the B2 band, else the hint ±5× (the FOV ladder's
+    // reach), else anything physical.
+    let hint_scale = hints
+        .pixel_scale_arcsec
+        .or_else(|| hints.fov_deg.map(|f| f * 3600.0 / ctx.long_px.max(1) as f64))
+        .filter(|s| s.is_finite() && *s > 0.0);
+    let (scale_lo, scale_hi) = match (scale_bounds, hint_scale) {
+        (Some(b), _) => b,
+        (None, Some(s)) => (s / 5.0, s * 5.0),
+        (None, None) => (0.1, 120.0),
+    };
+    let params = crate::index::SearchParams {
+        scale_lo: scale_lo.max(0.05),
+        scale_hi: scale_hi.min(120.0),
+        ..Default::default()
+    };
+    let is_cancelled = || ctx.cancel.is_some_and(|f| f.load(Ordering::Relaxed));
+    let mut rt = RungTrace::new(0, 0, 0.0, 0);
+    let mut rejected: Vec<((f64, f64), f64)> = Vec::new();
+    let mut outcome: Result<Option<SolveSolution>> = Ok(None);
+    let mut n_hypotheses = 0usize;
+    let mut last_queries = 0usize;
+    let mut verify_time = std::time::Duration::ZERO;
+    let t_search = Instant::now();
+    crate::index::search(index, ctx.image_pts, ctx.image_center, &params, is_cancelled, |h| {
+        last_queries = h.queries;
+        let scale = h.wcs.pixel_scale_arcsec();
+        let fov_deg = scale * ctx.long_px as f64 / 3600.0;
+        let c = h.wcs.crval;
+        if let Some((hra, hdec)) = ctx.center {
+            if great_circle_deg(hra, hdec, c.0, c.1) > ctx.search_radius + fov_deg {
+                return false;
+            }
+        }
+        if rejected.iter().any(|&((ra, dec), s)| {
+            (scale / s - 1.0).abs() < 0.02 && great_circle_deg(ra, dec, c.0, c.1) < 0.02 * fov_deg
+        }) {
+            return false;
+        }
+        n_hypotheses += 1;
+        let trial = TrialResult {
+            scale_arcsec: scale,
+            tangent: c,
+            wcs: h.wcs,
+            quad_match_pairs: 4,
+            recentered: None,
+        };
+        let t_v = Instant::now();
+        let verified = verify_trials(ctx, vec![trial], &mut rt);
+        verify_time += t_v.elapsed();
+        match verified {
+            Ok(Some(sol)) => {
+                tracing::debug!(
+                    frame = %ctx.frame_name,
+                    star_n = h.star_n,
+                    queries = h.queries,
+                    hypotheses = n_hypotheses,
+                    "quad-index hypothesis verified"
+                );
+                outcome = Ok(Some(sol));
+                true
+            }
+            Ok(None) => {
+                rejected.push((c, scale));
+                false
+            }
+            Err(e) => {
+                outcome = Err(e);
+                true
+            }
+        }
+    });
+    rt.candidates_emitted = n_hypotheses;
+    pass_trace.rungs.push(rt);
+    tracing::debug!(
+        frame = %ctx.frame_name,
+        hypotheses = n_hypotheses,
+        rejected = rejected.len(),
+        queries_at_last_hypothesis = last_queries,
+        search_ms = (t_search.elapsed() - verify_time).as_millis() as u64,
+        verify_ms = verify_time.as_millis() as u64,
+        solved = matches!(outcome, Ok(Some(_))),
+        "quad-index search"
+    );
+    if outcome.is_ok() && is_cancelled() {
+        anyhow::bail!("cancelled");
+    }
+    outcome
 }
 
 /// Verify `trials` in order: seed inliers and log-odds, the full-field refit,

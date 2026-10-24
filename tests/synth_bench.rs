@@ -12,6 +12,7 @@
 //! found the right field (centre within 5 % of the FOV, scale within 2 %) but
 //! missed that; wrong otherwise.
 //!
+//! `SOLVEMYASTRO_INDEX_DIR` adds a quad index (`solvemyastro build-index`).
 //! `SYNTH_MODE` picks which hints are passed (hinted / position / scale /
 //! blind); `SYNTH_FRAMES` keeps only files whose name contains it.
 //!
@@ -24,7 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use solvemyastro::{solve, Caches, SolveConfig, SolveHints, StarCache};
+use solvemyastro::{solve_with_index, Caches, QuadIndex, SolveConfig, SolveHints, StarCache};
 
 /// Primary-header keyword → value (quotes stripped).
 fn read_header(path: &Path) -> HashMap<String, String> {
@@ -106,6 +107,11 @@ fn synth_bench() {
     let refs: Vec<&StarCache> = caches.iter().collect();
     let caches = Caches::layered(&refs);
     let cfg = SolveConfig::default();
+    // Optional quad index (`solvemyastro build-index`), used for the
+    // position- or scale-free modes.
+    let index = std::env::var_os("SOLVEMYASTRO_INDEX_DIR")
+        .map(|d| QuadIndex::open(Path::new(&d)).expect("open quad index"));
+    println!("quad index: {}", if index.is_some() { "yes" } else { "no" });
     let mode = std::env::var("SYNTH_MODE").unwrap_or_else(|_| "hinted".into());
     assert!(
         matches!(mode.as_str(), "hinted" | "position" | "scale" | "blind"),
@@ -134,7 +140,7 @@ fn synth_bench() {
 
         let t0 = Instant::now();
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            solve(path, &hints, &caches, &cfg, None)
+            solve_with_index(path, &hints, &caches, index.as_ref(), &cfg, None)
         }));
         let ms = t0.elapsed().as_millis();
         let row = by_focal.entry(focal as u32).or_default();
