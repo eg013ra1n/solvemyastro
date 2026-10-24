@@ -3,7 +3,7 @@
 //! Implements the full solve pipeline:
 //! 1. Star detection via `astroimage::ImageAnalyzer::detect_fast`.
 //! 2. SNR-gated star selection (`select_fast_stars`).
-//! 3. autoFOV ladder (hinted ≤ 3 rungs, blind 9.5→0.38° ÷1.5).
+//! 3. autoFOV ladder (hinted ≤ 9 rungs, blind 14.25→0.57° ÷1.5).
 //! 4. Square-spiral sky-cell search.
 //! 5. Per-cell: cone → gnomonic project → build quads → match → fit affine.
 //! 6. Seed WCS → inlier count → second-solve (full-field affine refit).
@@ -87,19 +87,25 @@ use crate::{
 // Blind-search constants
 // ---------------------------------------------------------------------------
 
-/// Blind autoFOV top rung.
-const FOV_MAX_DEG: f64 = 9.5;
-/// Blind autoFOV bottom rung floor.
-const FOV_MIN_DEG: f64 = 0.38;
+/// Blind autoFOV top rung. With [`CONE_OVERSIZE`] its cone radius is 9.5°.
+const FOV_MAX_DEG: f64 = 14.25;
+/// Blind autoFOV bottom rung floor. With [`CONE_OVERSIZE`] its cone radius is
+/// 0.38°.
+const FOV_MIN_DEG: f64 = 0.57;
 /// Per-rung divisor.
 const FOV_DIV: f64 = 1.5;
 /// Full-sky search radius when blind.
 const FULL_SKY_RADIUS_DEG: f64 = 180.0;
 /// Default hinted search radius (degrees) when none specified.
 const DEFAULT_HINTED_RADIUS_DEG: f64 = 10.0;
-/// Oversize factor for catalog cone relative to the rung FOV.
-/// Read a slightly larger cone so edge stars are included.
-const CONE_OVERSIZE: f64 = 1.0;
+/// Catalog-cone radius (and spiral step) as a fraction of the rung FOV.
+///
+/// Quads are built from nearest neighbours of the brightest stars on each
+/// side, so they only correspond when the catalog pool covers about the same
+/// sky as the frame. At radius = FOV the cone holds ~4.5× the frame's area
+/// and the correct rung matched nothing; every bench frame solved one rung
+/// finer instead, i.e. at radius ≈ FOV/1.5 — so that is the radius used.
+const CONE_OVERSIZE: f64 = 2.0 / 3.0;
 /// Maximum catalog stars per trial (deep, no magnitude-budget starvation).
 const MAX_CAT_STARS: usize = 6000;
 /// Inlier match radius in arcsec (adaptive: this is the base; see adaptive_tol).
@@ -1409,7 +1415,7 @@ fn run_search(
         if is_cancelled() {
             anyhow::bail!("cancelled");
         }
-        let cells = spiral_cells(center, search_radius, rung.fov_deg);
+        let cells = spiral_cells(center, search_radius, rung.fov_deg * CONE_OVERSIZE);
         let cone_radius = (rung.fov_deg * CONE_OVERSIZE).min(89.0);
         let mut rt = RungTrace::new(rung_idx + 1, total_rungs, rung.fov_deg, cells.len());
 
