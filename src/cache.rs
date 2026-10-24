@@ -297,6 +297,11 @@ impl StarCache {
         // pre-filter has zero false rejects.
         let dec_min = dec - radius_deg;
         let dec_max = dec + radius_deg;
+        // Inside the cone ⟺ centre·star ≥ cos(radius). Away from that boundary
+        // the dot product decides; within `CONE_DOT_MARGIN` of it the exact
+        // great-circle test does, so membership is the same as before.
+        let centre = unit_vector(ra, dec);
+        let cos_r = radius_deg.to_radians().cos();
 
         for px in pixels {
             // Get or insert the pixel's PM-propagated records.
@@ -310,21 +315,33 @@ impl StarCache {
             // double-check makes the cold path idempotent under
             // contention without holding the write lock during the slow
             // decode.
+            //
+            // An entry holds the pixel's records only down to the magnitude
+            // it was decoded for (records are mag-sorted, so that is a
+            // prefix). A request for fainter stars re-decodes a longer
+            // prefix; the filter below never reads past `mag_limit`, so a
+            // prefix covering it gives the same stars as the whole pixel.
             let recs: Arc<Vec<PropagatedRecord>> = {
                 let map = cache.map.read().expect("PixelCache RwLock poisoned");
-                if let Some(arc) = map.get(&px) {
-                    Arc::clone(arc)
-                } else {
-                    drop(map);
-                    // Cache miss: decode first WITHOUT holding any lock, so
-                    // concurrent readers of OTHER pixels are not blocked
-                    // during the (~6 ms) decode+propagate.
-                    let propagated = self.read_pixel_propagated(px, epoch)?;
-                    let arc = Arc::new(propagated);
-                    let mut map = cache.map.write().expect("PixelCache RwLock poisoned");
-                    // Another worker may have inserted while we decoded;
-                    // prefer theirs to keep the cache canonical.
-                    Arc::clone(map.entry(px).or_insert_with(|| Arc::clone(&arc)))
+                match map.get(&px) {
+                    Some(e) if e.covered >= mag_limit => Arc::clone(&e.recs),
+                    _ => {
+                        drop(map);
+                        // Cache miss: decode first WITHOUT holding any lock, so
+                        // concurrent readers of OTHER pixels are not blocked
+                        // during the decode+propagate.
+                        let (propagated, covered) =
+                            self.read_pixel_propagated(px, epoch, mag_limit)?;
+                        let fresh = PixelEntry { recs: Arc::new(propagated), covered };
+                        let mut map = cache.map.write().expect("PixelCache RwLock poisoned");
+                        // Another worker may have inserted while we decoded;
+                        // keep whichever entry covers more.
+                        let e = map.entry(px).or_insert_with(|| fresh.clone());
+                        if fresh.covered > e.covered {
+                            *e = fresh;
+                        }
+                        Arc::clone(&e.recs)
+                    }
                 }
             };
 
@@ -339,9 +356,15 @@ impl StarCache {
                 if star.dec < dec_min || star.dec > dec_max {
                     continue;
                 }
-                // Precise filter only for the small subset that survives
-                // the dec window.
-                if great_circle_deg(star.ra, star.dec, ra, dec) <= radius_deg {
+                let dot = centre[0] * star.xyz[0] + centre[1] * star.xyz[1] + centre[2] * star.xyz[2];
+                let inside = if dot > cos_r + CONE_DOT_MARGIN {
+                    true
+                } else if dot < cos_r - CONE_DOT_MARGIN {
+                    false
+                } else {
+                    great_circle_deg(star.ra, star.dec, ra, dec) <= radius_deg
+                };
+                if inside {
                     results.push(CatalogStar { ra: star.ra, dec: star.dec, mag: star.mag });
                 }
             }
@@ -396,12 +419,19 @@ impl StarCache {
         Ok(out)
     }
 
-    /// Decode + PM-propagate every record in pixel `px` to `epoch`.
-    /// Internal helper used by [`Self::cone_cached`] on cache miss.
-    fn read_pixel_propagated(&self, px: u64, epoch: f64) -> Result<Vec<PropagatedRecord>> {
+    /// Decode + PM-propagate the records of pixel `px` to `epoch`, from the
+    /// brightest down to `mag_limit`. Returns them with the magnitude they
+    /// are complete to: `mag_limit`, or `INFINITY` when the whole pixel was
+    /// read. Internal helper used by [`Self::cone_cached`] on cache miss.
+    fn read_pixel_propagated(
+        &self,
+        px: u64,
+        epoch: f64,
+        mag_limit: f32,
+    ) -> Result<(Vec<PropagatedRecord>, f32)> {
         let (offset, count) = self.directory[px as usize];
         if count == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), f32::INFINITY));
         }
         let byte_start = offset as usize;
         let byte_end = byte_start + count as usize * RECORD_SIZE;
@@ -412,18 +442,26 @@ impl StarCache {
         );
         let slice = &self.mmap[byte_start..byte_end];
         let mut cur = std::io::Cursor::new(slice);
-        let mut out = Vec::with_capacity(count as usize);
+        let mut out = Vec::new();
         for _ in 0..count {
             let rec_ra = cur.read_f64::<LittleEndian>().context("read rec ra")?;
             let rec_dec = cur.read_f64::<LittleEndian>().context("read rec dec")?;
             let rec_mag = cur.read_f32::<LittleEndian>().context("read rec mag")?;
             let rec_pmra = cur.read_f32::<LittleEndian>().context("read rec pmra")? as f64;
             let rec_pmdec = cur.read_f32::<LittleEndian>().context("read rec pmdec")? as f64;
+            if rec_mag > mag_limit {
+                return Ok((out, mag_limit));
+            }
             let (pm_ra, pm_dec) =
                 propagate(rec_ra, rec_dec, rec_pmra, rec_pmdec, self.catalog_epoch, epoch);
-            out.push(PropagatedRecord { ra: pm_ra, dec: pm_dec, mag: rec_mag });
+            out.push(PropagatedRecord {
+                ra: pm_ra,
+                dec: pm_dec,
+                xyz: unit_vector(pm_ra, pm_dec),
+                mag: rec_mag,
+            });
         }
-        Ok(out)
+        Ok((out, f32::INFINITY))
     }
 }
 
@@ -437,6 +475,8 @@ impl StarCache {
 struct PropagatedRecord {
     ra: f64,
     dec: f64,
+    /// Unit vector of `(ra, dec)`, for the trig-free cone test.
+    xyz: [f64; 3],
     mag: f32,
 }
 
@@ -447,10 +487,17 @@ struct PropagatedRecord {
 pub struct PixelCache {
     /// All cone calls in this solve use this epoch. Asserted on each call.
     epoch: f64,
-    /// pixel_id → Arc-shared decoded + PM-propagated records (mag-sorted
-    /// ascending — same order as the on-disk records, since PM doesn't
-    /// affect magnitudes).
-    map: RwLock<HashMap<u64, Arc<Vec<PropagatedRecord>>>>,
+    /// pixel_id → Arc-shared decoded + PM-propagated records, mag-sorted
+    /// ascending (PM does not change magnitudes) and complete down to the
+    /// entry's `covered` magnitude.
+    map: RwLock<HashMap<u64, PixelEntry>>,
+}
+
+/// A pixel's decoded records, complete down to magnitude `covered`.
+#[derive(Clone)]
+struct PixelEntry {
+    recs: Arc<Vec<PropagatedRecord>>,
+    covered: f32,
 }
 
 impl PixelCache {
@@ -1000,6 +1047,17 @@ fn legacy_bin_paths(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Compute the HEALPix pixel for a sky position (depth 6, nested scheme).
 ///
 /// Mirrors `athenaeum_core::catalog::healpix::sky_to_pixel` exactly.
+/// Band around `cos(radius)` in which [`StarCache::cone_cached`] defers to the
+/// exact great-circle test — far wider than the dot product's rounding error.
+const CONE_DOT_MARGIN: f64 = 1e-9;
+
+/// Unit vector of a sky position given in degrees.
+fn unit_vector(ra_deg: f64, dec_deg: f64) -> [f64; 3] {
+    let (sr, cr) = ra_deg.to_radians().sin_cos();
+    let (sd, cd) = dec_deg.to_radians().sin_cos();
+    [cd * cr, cd * sr, sd]
+}
+
 fn sky_to_pixel(ra_deg: f64, dec_deg: f64) -> u64 {
     nested::hash(HEALPIX_DEPTH, ra_deg.to_radians(), dec_deg.to_radians())
 }
@@ -1448,6 +1506,39 @@ mod tests {
     /// as `cone` for every query, both on a cold cache and on a warm cache
     /// (the second call hits the in-memory pixel map). Otherwise the
     /// solver's behaviour changes silently.
+    /// Pixels decoded for a bright limit and later asked for fainter stars
+    /// (the verify cone's 12 → 14 → 19 escalation) give the same cones as
+    /// the uncached path, in either order.
+    #[test]
+    fn cone_cached_prefix_then_deeper_matches_cone() {
+        let mut stars = Vec::new();
+        for i in 0..400 {
+            let f = i as f64;
+            stars.push(StarRecord {
+                ra: 30.0 + (f * 0.37) % 2.0,
+                dec: 20.0 + (f * 0.53) % 2.0,
+                mag: 5.0 + (i % 140) as f32 * 0.1,
+                pmra_mas_yr: (i % 9) as f64,
+                pmdec_mas_yr: -((i % 4) as f64),
+            });
+        }
+        let epoch = 2025.0;
+        let (cache, _tmp) = build_and_open(stars, epoch);
+        let pc = PixelCache::new(epoch);
+        let key = |s: &CatalogStar| (s.ra.to_bits(), s.dec.to_bits(), s.mag.to_bits());
+        for &mag in &[8.0_f32, 12.0, 19.0, 10.0, 6.5, 19.0] {
+            let mut a = cache.cone(31.0, 21.0, 1.2, mag, epoch).expect("cone");
+            let mut b = cache.cone_cached(&pc, 31.0, 21.0, 1.2, mag, epoch).expect("cached");
+            a.sort_by_key(key);
+            b.sort_by_key(key);
+            assert!(!a.is_empty());
+            assert_eq!(a.len(), b.len(), "count mismatch at mag < {mag}");
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(key(x), key(y), "star mismatch at mag < {mag}");
+            }
+        }
+    }
+
     #[test]
     fn cone_cached_matches_cone() {
         // Spread stars across multiple HEALPix pixels so the cache exercises
