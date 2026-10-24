@@ -1933,18 +1933,6 @@ fn run_search(
                 continue 'candidates;
             }
 
-            let (bright_k, bright_m) =
-                bright_star_evidence(&final_wcs, &verify_stars, image_pts, width, height, tol_px);
-            let p_random = image_pts.len() as f64 * std::f64::consts::PI * tol_px * tol_px
-                / (width * height);
-            let bright_lo = crate::verify::bright_star_log_odds(bright_k, bright_m, p_random);
-            if std::env::var_os("SOLVEMYASTRO_BRIGHT_TRACE").is_some() {
-                eprintln!(
-                    "BRIGHT frame={frame_name} k={bright_k} m={bright_m} p_rand={p_random:.2e} llr={bright_lo:.1} inliers={final_inliers} scale={:.3}",
-                    final_wcs.pixel_scale_arcsec()
-                );
-            }
-
             let final_scale = final_wcs.pixel_scale_arcsec();
             let rms_px = if final_inliers > 0 { (final_rss / final_inliers as f64).sqrt() } else { 0.0 };
             let rms_arcsec = rms_px * final_scale;
@@ -2143,6 +2131,34 @@ fn run_search(
                 (final_wcs.clone(), rms_px, rms_arcsec)
             };
 
+            // Bright-star completeness on the final (SIP) WCS: the brightest
+            // catalog stars in the frame must mostly have detections. A dense
+            // field's chance alignment collects its inliers among the faint
+            // stars and finds almost none of the bright ones; evaluated after
+            // SIP so a wide lens's edge distortion does not count as a miss.
+            let (bright_k, bright_m) =
+                bright_star_evidence(&sip_wcs, &verify_stars, image_pts, width, height, tol_px);
+            let p_random = image_pts.len() as f64 * std::f64::consts::PI * tol_px * tol_px
+                / (width * height);
+            let bright_lo = crate::verify::bright_star_log_odds(bright_k, bright_m, p_random);
+            tracing::debug!(
+                frame = %frame_name,
+                bright_k,
+                bright_m,
+                p_random,
+                bright_log_odds = bright_lo,
+                "bright-star completeness"
+            );
+            if bright_lo < cfg.log_odds_threshold {
+                if let Some(last) = rt.verifies.last_mut() {
+                    last.accepted = false;
+                    last.reject_reason = Some(format!(
+                        "bright stars: {bright_m}/{bright_k} found, log-odds {bright_lo:.1} < {:.1}",
+                        cfg.log_odds_threshold
+                    ));
+                }
+                continue 'candidates;
+            }
             let solve_time_ms = t0.elapsed().as_millis() as u64;
 
             // Mark verified so remaining parallel trials in this rung stop early.
