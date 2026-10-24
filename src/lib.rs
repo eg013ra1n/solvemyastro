@@ -17,6 +17,7 @@ use anyhow::Result;
 pub mod cache;
 pub mod diag;
 pub(crate) mod math;
+pub(crate) mod nn;
 pub mod orchestrate;
 pub mod project;
 pub mod quad;

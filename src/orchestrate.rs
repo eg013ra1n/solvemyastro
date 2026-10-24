@@ -75,6 +75,7 @@ use rand_xoshiro::Xoshiro256StarStar;
 use crate::{
     diag::{CellStop, CellTrace, KnownTruth, PassTrace, RungTrace, SeedInfo, SolveTrace, TraceOutcome, VerifyTrace, known_truth_for},
     math::great_circle_deg,
+    nn::PointGrid,
     project::project_catalog,
     quad::{build_quads, fit_affine, group_size_for, match_quads_stats, Affine, Quad},
     select::{select_fast_stars, select_fast_stars_with_raw},
@@ -569,6 +570,7 @@ fn count_inliers(
     let mut rss = 0.0_f64;
     let mut pairs: Vec<((f64, f64), (f64, f64))> = Vec::new();
 
+    let grid = PointGrid::new(image_pts, tol_px);
     for cat in cat_stars {
         let (px, py) = wcs.sky_to_pixel(cat.ra, cat.dec);
         if !px.is_finite() || !py.is_finite() {
@@ -577,22 +579,15 @@ fn count_inliers(
         if px < 0.0 || px >= width || py < 0.0 || py >= height {
             continue;
         }
-        // Find the nearest detected star. Compare squared distances — no sqrt
-        // in the hot loop; only the ordering matters, and `rss` wants the
+        // Nearest detected star by squared distance — `rss` wants the
         // squared residual anyway.
-        let mut best_d2 = f64::MAX;
-        let mut best_img = (0.0_f64, 0.0_f64);
-        for &(ix, iy) in image_pts {
-            let d2 = (ix - px).powi(2) + (iy - py).powi(2);
-            if d2 < best_d2 {
-                best_d2 = d2;
-                best_img = (ix, iy);
+        let nearest = grid.nearest_by(px, py, |(ix, iy)| (ix - px).powi(2) + (iy - py).powi(2));
+        if let Some((i, best_d2)) = nearest {
+            if best_d2 <= tol_px * tol_px {
+                count += 1;
+                rss += best_d2;
+                pairs.push(((px, py), image_pts[i]));
             }
-        }
-        if best_d2 <= tol_px * tol_px {
-            count += 1;
-            rss += best_d2;
-            pairs.push(((px, py), best_img));
         }
     }
     (count, rss, pairs)

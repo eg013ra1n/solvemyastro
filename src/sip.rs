@@ -42,6 +42,7 @@
 use nalgebra::{DMatrix, DVector};
 
 use crate::{
+    nn::PointGrid,
     wcs::{tan, SipCoefficients, WcsSolution},
     CatalogStar,
 };
@@ -135,6 +136,8 @@ pub fn fit_sip(
 
     // Match each catalog star to the nearest detection within `mtol`,
     // projecting through `proj` (linear WCS in stage 1, SIP-corrected in 2).
+    let gen_tol = (tol_px * 4.0).max(6.0);
+    let grid = PointGrid::new(image_pts, gen_tol);
     let collect = |proj: &WcsSolution, mtol: f64| -> Vec<Pair> {
         let mut pairs = Vec::new();
         for cat in cat_stars {
@@ -145,18 +148,14 @@ pub fn fit_sip(
             if px < 0.0 || px >= width || py < 0.0 || py >= height {
                 continue;
             }
-            let mut best = f64::MAX;
-            let mut best_img = (0.0_f64, 0.0_f64);
-            for &(ix, iy) in image_pts {
-                let d = (ix - px).hypot(iy - py);
-                if d < best {
-                    best = d;
-                    best_img = (ix, iy);
-                }
-            }
+            let Some((i, best)) = grid.nearest_by(px, py, |(ix, iy)| (ix - px).hypot(iy - py))
+            else {
+                continue;
+            };
             if best > mtol {
                 continue;
             }
+            let best_img = image_pts[i];
             // Ideal pixel offset (degrees in via tan, pixels out via CD⁻¹) —
             // the same units `pixel_to_sky` adds A/B in.
             let (xi, eta) = tan::sky_to_tangent(cat.ra, cat.dec, crval_ra, crval_dec);
@@ -237,7 +236,6 @@ pub fn fit_sip(
 
     // Stage 1: generous tolerance vs. the linear projection — captures the
     // distorted corner stars a tight linear tol would reject.
-    let gen_tol = (tol_px * 4.0).max(6.0);
     let pairs1 = collect(wcs, gen_tol);
     let ord1 = match order_for(pairs1.len()) {
         Some(o) => o,
@@ -385,20 +383,21 @@ pub fn fit_sip_annealed(
 
     // Match catalog → detections within mtol, projecting through `proj`.
     // Byte-identical to fit_sip's `collect`, extended with per-star weight.
+    let gen_tol = (base_tol_px * 4.0).max(6.0);
+    let grid = PointGrid::new(image_pts, gen_tol);
     let collect = |proj: &WcsSolution, mtol: f64| -> Vec<Pair> {
         let mut pairs = Vec::new();
         for cat in cat_stars {
             let (px, py) = proj.sky_to_pixel(cat.ra, cat.dec);
             if !px.is_finite() || !py.is_finite() { continue; }
             if px < 0.0 || px >= width || py < 0.0 || py >= height { continue; }
-            let mut best = f64::MAX;
-            let mut best_img = (0.0_f64, 0.0_f64);
-            let mut best_idx = 0usize;
-            for (idx, &(ix, iy)) in image_pts.iter().enumerate() {
-                let d = (ix - px).hypot(iy - py);
-                if d < best { best = d; best_img = (ix, iy); best_idx = idx; }
-            }
+            let Some((best_idx, best)) =
+                grid.nearest_by(px, py, |(ix, iy)| (ix - px).hypot(iy - py))
+            else {
+                continue;
+            };
             if best > mtol { continue; }
+            let best_img = image_pts[best_idx];
             let (xi, eta) = crate::wcs::tan::sky_to_tangent(cat.ra, cat.dec, crval_ra, crval_dec);
             let rx = inv * (linear_wcs.cd[1][1] * xi - linear_wcs.cd[0][1] * eta);
             let ry = inv * (-linear_wcs.cd[1][0] * xi + linear_wcs.cd[0][0] * eta);
@@ -535,7 +534,6 @@ pub fn fit_sip_annealed(
     // Stage 1: generous tolerance vs. the linear projection.
     // Byte-identical matching to fit_sip; weighted SVD.
     // -----------------------------------------------------------------------
-    let gen_tol = (base_tol_px * 4.0).max(6.0);
     let pairs1 = collect(linear_wcs, gen_tol);
     let ord1 = match order_for(pairs1.len()) {
         Some(o) => o,
