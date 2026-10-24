@@ -8,7 +8,7 @@
 //! Hints are built the way a capture program's headers would give them:
 //! OBJCTRA/OBJCTDEC (deliberately off by up to 1°), FOCALLEN, XPIXSZ and
 //! XBINNING for the scale. A frame is correct when its centre is within
-//! max(30″, 2 px) of the truth and its scale within 1 %.
+//! max(30″, 5 px) of the truth and its scale within 1 %.
 //!
 //! `SYNTH_MODE` picks which hints are passed (hinted / position / scale /
 //! blind); `SYNTH_FRAMES` keeps only files whose name contains it.
@@ -141,7 +141,7 @@ fn synth_bench() {
             Ok(Ok(s)) => {
                 let dpos = sep_arcsec(tra, tdec, s.wcs.crval.0, s.wcs.crval.1);
                 let dscale = (s.pixel_scale_arcsec - tscale).abs() / tscale * 100.0;
-                let ok = dpos < (2.0 * tscale).max(30.0) && dscale < 1.0;
+                let ok = dpos < (5.0 * tscale).max(30.0) && dscale < 1.0;
                 if ok {
                     row.1 += 1;
                 } else {

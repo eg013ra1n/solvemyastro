@@ -92,6 +92,11 @@ const FOV_MAX_DEG: f64 = 14.25;
 /// Blind autoFOV bottom rung floor. With [`CONE_OVERSIZE`] its cone radius is
 /// 0.38°.
 const FOV_MIN_DEG: f64 = 0.57;
+/// Floor of a hinted ladder. Lower than [`FOV_MIN_DEG`] because a hint pins
+/// the search to a small sky region: long-focus frames (0.3° at 4000 mm)
+/// need a cone near their own size, and only a blind ladder would pay for
+/// fine rungs over the whole sky.
+const HINTED_FOV_MIN_DEG: f64 = 0.15;
 /// Per-rung divisor.
 const FOV_DIV: f64 = 1.5;
 /// Full-sky search radius when blind.
@@ -164,7 +169,7 @@ fn fov_rungs(long_px: usize, hints: &SolveHints) -> Vec<FovRung> {
             let fov = s * long_px.max(1) as f64 / 3600.0;
             // Ladder centred on the hint, expanding outward in FOV_DIV steps.
             // Try up to 4 steps in each direction (covers 1.5^4 ≈ 5× scale range),
-            // clamped to [FOV_MIN_DEG, FOV_MAX_DEG].
+            // clamped to [HINTED_FOV_MIN_DEG, FOV_MAX_DEG].
             // This handles stacked/drizzled images where the stored FOCALLEN or CDELT1
             // may differ from the actual per-pixel scale by 2–4×.
             // Centre-first, expanding outward (centre, ÷1.5, ×1.5, ÷1.5², …).
@@ -172,13 +177,13 @@ fn fov_rungs(long_px: usize, hints: &SolveHints) -> Vec<FovRung> {
             // early-exit fires on it immediately instead of after several
             // dense wrong-scale spirals (the finest rungs have the most cells).
             let mut rungs = Vec::new();
-            rungs.push(mk(fov.clamp(FOV_MIN_DEG, FOV_MAX_DEG)));
+            rungs.push(mk(fov.clamp(HINTED_FOV_MIN_DEG, FOV_MAX_DEG)));
             let mut up = fov;
             let mut down = fov;
             for _ in 0..4 {
                 down /= FOV_DIV;
                 up *= FOV_DIV;
-                if down >= FOV_MIN_DEG {
+                if down >= HINTED_FOV_MIN_DEG {
                     rungs.push(mk(down));
                 }
                 if up <= FOV_MAX_DEG {
@@ -203,13 +208,13 @@ fn fov_rungs(long_px: usize, hints: &SolveHints) -> Vec<FovRung> {
 
 /// FOV ladder over an explicit `[lo_arcsec, hi_arcsec]` scale band (B2 of the
 /// scale-recovery fallback). Rungs descend from the coarse (hi) bound by
-/// `FOV_DIV`, clamped to `[FOV_MIN_DEG, FOV_MAX_DEG]`. Always includes a rung at
+/// `FOV_DIV`, clamped to `[HINTED_FOV_MIN_DEG, FOV_MAX_DEG]`. Always includes a rung at
 /// (or just below) the fine bound so a finer-than-hint true scale is reached.
 fn fov_rungs_bounded(long_px: usize, lo_arcsec: f64, hi_arcsec: f64) -> Vec<FovRung> {
     let lp = long_px.max(1) as f64;
     let mk = |fov: f64| FovRung { fov_deg: fov, scale_arcsec: fov * 3600.0 / lp };
-    let lo_fov = (lo_arcsec * lp / 3600.0).clamp(FOV_MIN_DEG, FOV_MAX_DEG);
-    let hi_fov = (hi_arcsec * lp / 3600.0).clamp(FOV_MIN_DEG, FOV_MAX_DEG);
+    let lo_fov = (lo_arcsec * lp / 3600.0).clamp(HINTED_FOV_MIN_DEG, FOV_MAX_DEG);
+    let hi_fov = (hi_arcsec * lp / 3600.0).clamp(HINTED_FOV_MIN_DEG, FOV_MAX_DEG);
     let (lo_fov, hi_fov) = if lo_fov <= hi_fov { (lo_fov, hi_fov) } else { (hi_fov, lo_fov) };
 
     let mut rungs = Vec::new();
@@ -2056,7 +2061,7 @@ fn run_search(
 
 #[cfg(test)]
 mod bounded_ladder_tests {
-    use super::{fov_rungs_bounded, FOV_MIN_DEG, FOV_MAX_DEG};
+    use super::{fov_rungs_bounded, HINTED_FOV_MIN_DEG, FOV_MAX_DEG};
 
     #[test]
     fn bounded_span_is_clamped_and_descending() {
@@ -2071,7 +2076,7 @@ mod bounded_ladder_tests {
         }
         // Every rung inside the global clamp.
         for r in &rungs {
-            assert!(r.fov_deg >= FOV_MIN_DEG - 1e-9 && r.fov_deg <= FOV_MAX_DEG + 1e-9);
+            assert!(r.fov_deg >= HINTED_FOV_MIN_DEG - 1e-9 && r.fov_deg <= FOV_MAX_DEG + 1e-9);
         }
         // Reaches near the finer (lo) end: smallest scale ≤ ~1.5× lo.
         let smallest = rungs.last().unwrap().scale_arcsec;
