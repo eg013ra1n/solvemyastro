@@ -354,6 +354,16 @@ struct TrialResult {
     recentered: Option<WcsSolution>,
 }
 
+/// Catalog stars expected inside the frame, from a cone of `n_cone` stars:
+/// the cone covers the frame rectangle scaled by `aspect / (π·OVERSIZE²)`.
+fn catalog_in_frame(n_cone: usize, image_center: (f64, f64)) -> usize {
+    let dim_a = 2.0 * image_center.0 + 1.0;
+    let dim_b = 2.0 * image_center.1 + 1.0;
+    let aspect = dim_a.min(dim_b) / dim_a.max(dim_b);
+    (n_cone as f64 * aspect / (std::f64::consts::PI * CONE_OVERSIZE * CONE_OVERSIZE)).round()
+        as usize
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_trial(
     image_quads: &[Quad],
@@ -385,13 +395,7 @@ fn run_trial(
     // is not the deeper pool the cap is ≥ n_img and this is a no-op, so the
     // fallback pass can only ever help, never regress.
     let balanced: Option<(Vec<crate::quad::Quad>, usize, usize)> = if balance {
-        let dim_a = 2.0 * image_center.0 + 1.0;
-        let dim_b = 2.0 * image_center.1 + 1.0;
-        let aspect = dim_a.min(dim_b) / dim_a.max(dim_b);
-        let est = (cat_stars.len() as f64 * aspect
-            / (std::f64::consts::PI * CONE_OVERSIZE * CONE_OVERSIZE))
-            .round() as usize;
-        let img_keep = est.clamp(4, image_pts.len());
+        let img_keep = catalog_in_frame(cat_stars.len(), image_center).clamp(4, image_pts.len());
         if img_keep >= image_pts.len() {
             None // image not the deeper pool — nothing to cap
         } else {
@@ -1551,6 +1555,12 @@ fn run_search(
                         cells_mutex.lock().unwrap_or_else(|e| e.into_inner()).push(ct);
                         return None;
                     }
+                    // A cell whose catalog is sparser than the detections is
+                    // density-balanced right away, as the fallback pass would:
+                    // an unbalanced pool there cannot match, and waiting for
+                    // the fallback means first walking every other rung.
+                    let balance =
+                        balance || catalog_in_frame(stars.len(), image_center) < image_pts.len();
                     let pool_cap = if balance {
                         MAX_CAT_STARS
                     } else {

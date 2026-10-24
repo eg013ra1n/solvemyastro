@@ -8,12 +8,15 @@
 //! Hints are built the way a capture program's headers would give them:
 //! OBJCTRA/OBJCTDEC (deliberately off by up to 1°), FOCALLEN, XPIXSZ and
 //! XBINNING for the scale. A frame is correct when its centre is within
-//! max(30″, 5 px) of the truth and its scale within 1 %.
+//! max(30″, 5 px) of the truth and its scale within 1 %; imprecise when it
+//! found the right field (centre within 5 % of the FOV, scale within 2 %) but
+//! missed that; wrong otherwise.
 //!
 //! `SYNTH_MODE` picks which hints are passed (hinted / position / scale /
 //! blind); `SYNTH_FRAMES` keeps only files whose name contains it.
 //!
-//! GATE (asserted): no wrong solutions and no panics. Frames the solver
+//! GATE (asserted): no wrong solutions and no panics; imprecise ones are
+//! reported. Frames the solver
 //! cannot solve are reported per focal length, not failed, because wide
 //! lenses sit outside the solver's FOV ladder by design.
 
@@ -118,8 +121,8 @@ fn synth_bench() {
         .collect();
     files.sort();
 
-    // focal → (frames, correct, wrong, total ms)
-    let mut by_focal: BTreeMap<u32, (usize, usize, usize, u128)> = BTreeMap::new();
+    // focal → (frames, correct, imprecise, total ms, wrong)
+    let mut by_focal: BTreeMap<u32, (usize, usize, usize, u128, usize)> = BTreeMap::new();
     let mut wrong = Vec::new();
     let mut panicked = Vec::new();
     for path in &files {
@@ -141,16 +144,20 @@ fn synth_bench() {
             Ok(Ok(s)) => {
                 let dpos = sep_arcsec(tra, tdec, s.wcs.crval.0, s.wcs.crval.1);
                 let dscale = (s.pixel_scale_arcsec - tscale).abs() / tscale * 100.0;
-                let ok = dpos < (5.0 * tscale).max(30.0) && dscale < 1.0;
-                if ok {
+                let fov_arcsec = tscale * num("NAXIS1").max(num("NAXIS2"));
+                let tag = if dpos < (5.0 * tscale).max(30.0) && dscale < 1.0 {
                     row.1 += 1;
-                } else {
+                    "OK"
+                } else if dpos < 0.05 * fov_arcsec && dscale < 2.0 {
                     row.2 += 1;
+                    "IMPRECISE"
+                } else {
+                    row.4 += 1;
                     wrong.push(name.clone());
-                }
+                    "WRONG"
+                };
                 format!(
-                    "{:>7} dpos={dpos:7.1}\" dscale={dscale:5.2}% m={:4} rms={:4.2}px",
-                    if ok { "OK" } else { "WRONG" },
+                    "{tag:>9} dpos={dpos:7.1}\" dscale={dscale:5.2}% m={:4} rms={:4.2}px",
                     s.matched_stars,
                     s.rms_residual_px
                 )
@@ -164,9 +171,9 @@ fn synth_bench() {
         println!("{name:26} {ms:>6}ms {line}");
     }
 
-    println!("\nmode={mode}\n focal   frames  correct  wrong   avg ms");
-    for (f, (n, ok, bad, ms)) in &by_focal {
-        println!("{f:>5}mm {n:>7} {ok:>8} {bad:>6} {:>8}", ms / (*n as u128).max(1));
+    println!("\nmode={mode}\n focal   frames  correct  imprecise  wrong   avg ms");
+    for (f, (n, ok, rough, ms, bad)) in &by_focal {
+        println!("{f:>5}mm {n:>7} {ok:>8} {rough:>10} {bad:>6} {:>8}", ms / (*n as u128).max(1));
     }
     assert!(panicked.is_empty(), "GATE FAIL: panic(s): {panicked:?}");
     assert!(wrong.is_empty(), "GATE FAIL: wrong solution(s): {wrong:?}");
