@@ -28,6 +28,17 @@ SOLVEMYASTRO_BENCH_DIR=<dest>/bench SOLVEMYASTRO_TIER_DIR=<dest>/catalogs \
   cargo test --release --test corpus_bench -- --ignored corpus_layered_tiers --nocapture
 ```
 
+Quad index for blind and scale-free solves (`solve_with_index`): a base pack
+for fields from ~1.1° (depth 2–7, ~220 MB) and an optional narrow-field pack
+from ~0.55° (depth 8, ~370 MB with `--quads-per-cell 4`), both built from the
+tiers:
+
+```
+solvemyastro build-index --tiers <dest>/catalogs --out <dest>/index/base
+solvemyastro build-index --tiers <dest>/catalogs --out <dest>/index/narrow \
+  --min-depth 8 --max-depth 8 --quads-per-cell 4
+```
+
 Synthetic fields from 35 mm to 4000 mm, rendered from the same catalog with
 the true solution in their headers:
 
@@ -35,6 +46,7 @@ the true solution in their headers:
 cargo run --release --example synth_fields -- --tiers <dest>/catalogs --out <synth>
 SOLVEMYASTRO_SYNTH_DIR=<synth> SOLVEMYASTRO_TIER_DIR=<dest>/catalogs \
   cargo test --release --test synth_bench -- --ignored --nocapture   # SYNTH_MODE=hinted|position|scale|blind
+# with SOLVEMYASTRO_INDEX_DIR=<dest>/index/base:<dest>/index/narrow for the index path
 ```
 
 ## Status
