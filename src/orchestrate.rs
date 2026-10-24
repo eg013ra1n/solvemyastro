@@ -1562,9 +1562,16 @@ fn run_search(
                         image_pts.len().min(MAX_CAT_STARS).max(50)
                     };
                     let stars = if stars.len() > pool_cap {
+                        // The `pool_cap` brightest, in magnitude order. Selecting
+                        // first keeps the sort to the survivors — a wide cone
+                        // holds tens of thousands of stars for a few hundred kept.
                         let mut s = stars;
-                        s.sort_unstable_by(|a, b| a.mag.partial_cmp(&b.mag).unwrap_or(std::cmp::Ordering::Equal));
+                        let by_mag = |a: &CatalogStar, b: &CatalogStar| {
+                            a.mag.partial_cmp(&b.mag).unwrap_or(std::cmp::Ordering::Equal)
+                        };
+                        s.select_nth_unstable_by(pool_cap - 1, by_mag);
                         s.truncate(pool_cap);
+                        s.sort_unstable_by(by_mag);
                         s
                     } else {
                         stars
