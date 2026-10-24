@@ -3,6 +3,10 @@
 //! Run with:
 //!   cargo test -p solvemyastro --release --test corpus_bench -- --ignored --nocapture
 //!
+//! Data paths default to the bench machine's layout; override with
+//! `SOLVEMYASTRO_BENCH_DIR`, `SOLVEMYASTRO_SMAC_GAIA` and
+//! `SOLVEMYASTRO_SMAC_GAIA_BRIGHT`.
+//!
 //! GATE (asserted):
 //!   - Every non-skipped frame with a reference-truth entry is solved here.
 //!   - M78 (`2024-01-13_20-27-32_L_-10.00_120.00s_0081.fits`) solves within tolerance.
@@ -31,6 +35,25 @@ const SMAC_GAIA: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application S
 /// `Caches::tiered(&deep, &bright)`; if absent, it falls back to
 /// `Caches::deep_only(&deep)` (byte-identical to the pre-bright bench).
 const SMAC_GAIA_BRIGHT: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia_bright";
+
+/// Corpus directory: `$SOLVEMYASTRO_BENCH_DIR`, else [`BENCH_DIR`].
+fn bench_dir() -> PathBuf {
+    env_path_or("SOLVEMYASTRO_BENCH_DIR", BENCH_DIR)
+}
+
+/// Deep catalog: `$SOLVEMYASTRO_SMAC_GAIA`, else [`SMAC_GAIA`].
+fn smac_gaia_dir() -> PathBuf {
+    env_path_or("SOLVEMYASTRO_SMAC_GAIA", SMAC_GAIA)
+}
+
+/// Bright sub-catalog: `$SOLVEMYASTRO_SMAC_GAIA_BRIGHT`, else [`SMAC_GAIA_BRIGHT`].
+fn smac_gaia_bright_dir() -> PathBuf {
+    env_path_or("SOLVEMYASTRO_SMAC_GAIA_BRIGHT", SMAC_GAIA_BRIGHT)
+}
+
+fn env_path_or(var: &str, default: &str) -> PathBuf {
+    std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(default))
+}
 
 /// Key: distinctive filename substring; value: (ra_deg, dec_deg, scale_arcsec_per_px)
 fn cached_truth() -> &'static [(&'static str, f64, f64, f64)] {
@@ -335,8 +358,10 @@ fn sep_arcsec(r1: f64, d1: f64, r2: f64, d2: f64) -> f64 {
 #[test]
 #[ignore = "needs smac_gaia cache + corpus; run with --release --nocapture"]
 fn corpus_bench() {
-    let bench_dir = Path::new(BENCH_DIR);
-    let smac_path = Path::new(SMAC_GAIA);
+    let bench_dir = bench_dir();
+    let bench_dir = bench_dir.as_path();
+    let smac_path = smac_gaia_dir();
+    let smac_path = smac_path.as_path();
 
     if !bench_dir.is_dir() {
         println!("SKIP corpus_bench: bench dir not found at {}", bench_dir.display());
@@ -352,7 +377,8 @@ fn corpus_bench() {
     // Optional bright sub-catalog. Present → use tiered caches (bright
     // for quad matching, deep for verify, auto-fallback). Absent → byte-
     // identical to the pre-bright path. Either way the gate is the same.
-    let bright_path = Path::new(SMAC_GAIA_BRIGHT);
+    let bright_path = smac_gaia_bright_dir();
+    let bright_path = bright_path.as_path();
     let bright_cache: Option<StarCache> = if bright_path.is_dir() {
         match StarCache::open(bright_path) {
             Ok(c) => {
@@ -938,7 +964,8 @@ fn layered_single_layer_solve_equals_legacy() {
             return;
         }
     };
-    let bench_dir = Path::new(BENCH_DIR);
+    let bench_dir = bench_dir();
+    let bench_dir = bench_dir.as_path();
     if !bench_dir.is_dir() {
         println!("SKIP: bench dir absent at {}", bench_dir.display());
         return;
@@ -1023,7 +1050,8 @@ fn corpus_layered_tiers() {
             return;
         }
     };
-    let bench_dir = Path::new(BENCH_DIR);
+    let bench_dir = bench_dir();
+    let bench_dir = bench_dir.as_path();
     if !bench_dir.is_dir() {
         println!("SKIP: bench dir absent at {}", bench_dir.display());
         return;
