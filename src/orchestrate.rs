@@ -593,6 +593,48 @@ fn count_inliers(
     (count, rss, pairs)
 }
 
+/// Of the catalog stars that land in the frame, take the `image_pts.len()`
+/// brightest and count how many have a detection within `tol_px`.
+/// Returns `(k, matched)`.
+fn bright_star_evidence(
+    wcs: &WcsSolution,
+    cat_stars: &[CatalogStar],
+    image_pts: &[(f64, f64)],
+    width: f64,
+    height: f64,
+    tol_px: f64,
+) -> (usize, usize) {
+    let mut in_frame: Vec<(f32, f64, f64)> = cat_stars
+        .iter()
+        .filter_map(|c| {
+            let (px, py) = wcs.sky_to_pixel(c.ra, c.dec);
+            (px.is_finite() && py.is_finite() && px >= 0.0 && px < width && py >= 0.0 && py < height)
+                .then_some((c.mag, px, py))
+        })
+        .collect();
+    let k = in_frame.len().min(image_pts.len());
+    if k == 0 {
+        return (0, 0);
+    }
+    let by_mag = |a: &(f32, f64, f64), b: &(f32, f64, f64)| {
+        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+    };
+    if in_frame.len() > k {
+        in_frame.select_nth_unstable_by(k - 1, by_mag);
+        in_frame.truncate(k);
+    }
+    let grid = PointGrid::new(image_pts, tol_px);
+    let tol2 = tol_px * tol_px;
+    let matched = in_frame
+        .iter()
+        .filter(|&&(_, px, py)| {
+            grid.nearest_by(px, py, |(ix, iy)| (ix - px).powi(2) + (iy - py).powi(2))
+                .is_some_and(|(_, d2)| d2 <= tol2)
+        })
+        .count();
+    (k, matched)
+}
+
 /// Full-field affine refit over inlier pairs (catalog-predicted pixel → detected pixel).
 /// Returns None if too few pairs.
 fn refit_affine(
@@ -1889,6 +1931,18 @@ fn run_search(
                 v.reject_reason = Some(format!("final_inliers {final_inliers} < MIN_ABSOLUTE_INLIERS {MIN_ABSOLUTE_INLIERS}"));
                 rt.verifies.push(v);
                 continue 'candidates;
+            }
+
+            let (bright_k, bright_m) =
+                bright_star_evidence(&final_wcs, &verify_stars, image_pts, width, height, tol_px);
+            let p_random = image_pts.len() as f64 * std::f64::consts::PI * tol_px * tol_px
+                / (width * height);
+            let bright_lo = crate::verify::bright_star_log_odds(bright_k, bright_m, p_random);
+            if std::env::var_os("SOLVEMYASTRO_BRIGHT_TRACE").is_some() {
+                eprintln!(
+                    "BRIGHT frame={frame_name} k={bright_k} m={bright_m} p_rand={p_random:.2e} llr={bright_lo:.1} inliers={final_inliers} scale={:.3}",
+                    final_wcs.pixel_scale_arcsec()
+                );
             }
 
             let final_scale = final_wcs.pixel_scale_arcsec();
