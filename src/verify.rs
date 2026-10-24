@@ -99,6 +99,12 @@ pub fn log_odds(
 /// others, so a correct solve is not expected to find most of them.
 pub const BRIGHT_MATCH_PROB: f64 = 0.25;
 
+/// Acceptance threshold for [`bright_star_log_odds`]: `log(1e9)`, the
+/// blind-solve level. A blind search tests thousands of hypotheses, so a
+/// chance alignment clearing `log(1e6)` once is to be expected (one did, at
+/// 16.0: 7 of 58 bright stars at 0.25"/px); correct solves measured ≥ 33.
+pub const BRIGHT_LOG_ODDS_MIN: f64 = 20.723_265_836_946_41; // log(1e9)
+
 /// Log-likelihood ratio of "correct WCS" vs "chance alignment" from the `k`
 /// brightest catalog stars in the frame, `matched` of which have a detection
 /// within tolerance. Under a correct WCS each is found with probability

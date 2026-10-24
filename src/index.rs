@@ -699,11 +699,12 @@ fn hypothesis_wcs(
 }
 
 /// Enumerate image quads brightest-first ("quads whose faintest member is
-/// star n"), look each up in the index (plain and mirrored), and pass every
+/// star n"), look each up in every band of `indexes` (plain and mirrored —
+/// e.g. a base pack and a narrow-field pack), and pass every
 /// plausible hypothesis to `emit`. Stops when `emit` returns `true`, when the
 /// query budget is spent, or when `cancelled()` turns true.
 pub fn search(
-    index: &QuadIndex,
+    indexes: &[&QuadIndex],
     pts: &[(f64, f64)],
     image_center: (f64, f64),
     params: &SearchParams,
@@ -727,7 +728,7 @@ pub fn search(
         for mirror in [false, true] {
             let q = if mirror { p.map(|(x, y)| (x, -y)) } else { p };
             let Some((code, order)) = quad_code(q) else { continue };
-            for band in index.bands() {
+            for (index, band) in indexes.iter().flat_map(|ix| ix.bands().iter().map(move |b| (*ix, b))) {
                 // AB in pixels × plausible scale must reach the band.
                 if ab_px * params.scale_hi < arcsec(band.ab_lo)
                     || ab_px * params.scale_lo >= arcsec(band.ab_hi)

@@ -1011,11 +1011,11 @@ pub fn solve(
     image: &Path,
     hints: &SolveHints,
     caches: &crate::Caches<'_>,
-    index: Option<&QuadIndex>,
+    indexes: &[&QuadIndex],
     cfg: &SolveConfig,
     cancel: Option<&AtomicBool>,
 ) -> Result<SolveSolution> {
-    solve_inner(image, hints, caches, index, cfg, cancel, None)
+    solve_inner(image, hints, caches, indexes, cfg, cancel, None)
 }
 
 /// Internal entry: `scale_bounds = Some((lo_arcsec, hi_arcsec))` drives a
@@ -1024,7 +1024,7 @@ pub(crate) fn solve_inner(
     image: &Path,
     hints: &SolveHints,
     caches: &crate::Caches<'_>,
-    index: Option<&QuadIndex>,
+    indexes: &[&QuadIndex],
     cfg: &SolveConfig,
     cancel: Option<&AtomicBool>,
     scale_bounds: Option<(f64, f64)>,
@@ -1288,9 +1288,9 @@ pub(crate) fn solve_inner(
     let has_position = center.is_some();
     let has_scale = scale_bounds.is_none()
         && (hints.pixel_scale_arcsec.is_some() || hints.fov_deg.is_some());
-    if let Some(ix) = index.filter(|_| !(has_position && has_scale)) {
+    if !indexes.is_empty() && !(has_position && has_scale) {
         let mut index_pass = PassTrace::new(false);
-        let found = run_index_search(&ctx, ix, hints, scale_bounds, &mut index_pass);
+        let found = run_index_search(&ctx, indexes, hints, scale_bounds, &mut index_pass);
         trace.passes.push(index_pass);
         match found {
             Err(e) => return Err(e),
@@ -1739,7 +1739,7 @@ const INDEX_FREE_VERIFIES: usize = 16;
 /// [`verify_trials`]); repeats of an already rejected solution are skipped.
 fn run_index_search(
     ctx: &SearchCtx,
-    index: &QuadIndex,
+    indexes: &[&QuadIndex],
     hints: &SolveHints,
     scale_bounds: Option<(f64, f64)>,
     pass_trace: &mut PassTrace,
@@ -1771,7 +1771,7 @@ fn run_index_search(
     let mut last_queries = 0usize;
     let mut verify_time = std::time::Duration::ZERO;
     let t_search = Instant::now();
-    crate::index::search(index, ctx.image_pts, ctx.image_center, &params, is_cancelled, |h| {
+    crate::index::search(indexes, ctx.image_pts, ctx.image_center, &params, is_cancelled, |h| {
         last_queries = h.queries;
         let scale = h.wcs.pixel_scale_arcsec();
         let fov_deg = scale * ctx.long_px as f64 / 3600.0;
@@ -2363,12 +2363,12 @@ fn verify_trials(
                 bright_log_odds = bright_lo,
                 "bright-star completeness"
             );
-            if bright_lo < cfg.log_odds_threshold {
+            let bright_min = crate::verify::BRIGHT_LOG_ODDS_MIN.max(cfg.log_odds_threshold);
+            if bright_lo < bright_min {
                 if let Some(last) = rt.verifies.last_mut() {
                     last.accepted = false;
                     last.reject_reason = Some(format!(
-                        "bright stars: {bright_m}/{bright_k} found, log-odds {bright_lo:.1} < {:.1}",
-                        cfg.log_odds_threshold
+                        "bright stars: {bright_m}/{bright_k} found, log-odds {bright_lo:.1} < {bright_min:.1}"
                     ));
                 }
                 continue 'candidates;
