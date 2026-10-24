@@ -260,6 +260,28 @@ fn spiral_cells(center: Option<(f64, f64)>, radius_deg: f64, step_deg: f64) -> V
     out
 }
 
+/// Smallest spiral chunk: enough cells to keep every rayon worker busy.
+const SPIRAL_CHUNK_MIN: usize = 16;
+/// Largest spiral chunk — bounds per-chunk barrier overhead on frames that
+/// scan a whole rung.
+const SPIRAL_CHUNK_MAX: usize = 1024;
+
+/// Split the spiral into consecutive chunks that double in size from
+/// [`SPIRAL_CHUNK_MIN`] up to [`SPIRAL_CHUNK_MAX`]. Order is preserved.
+fn spiral_chunks<T>(cells: &[T]) -> impl Iterator<Item = &[T]> {
+    let mut rest = cells;
+    let mut size = SPIRAL_CHUNK_MIN;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (head, tail) = rest.split_at(size.min(rest.len()));
+        rest = tail;
+        size = (size * 2).min(SPIRAL_CHUNK_MAX);
+        Some(head)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Density-aware minimum-quads floor
 // ---------------------------------------------------------------------------
@@ -1391,21 +1413,17 @@ fn run_search(
         let cone_radius = (rung.fov_deg * CONE_OVERSIZE).min(89.0);
         let mut rt = RungTrace::new(rung_idx + 1, total_rungs, rung.fov_deg, cells.len());
 
-        // Spiral-pruning chunk size. The spiral visits cells in order of
-        // increasing distance from the hint, so the correct cell is
-        // usually near the start. We process the spiral in chunks of
-        // `SPIRAL_CHUNK`: each chunk runs all its cells in parallel via
-        // rayon, then sequentially verifies any candidates. On the first
-        // verified solve we return immediately — skipping every remaining
-        // chunk in this rung.
-        //
-        // Tuning trade-off: smaller chunks give finer early-exit
-        // granularity (faster on hinted frames) but introduce more
-        // per-chunk barrier overhead (slower on sparse-field frames that
-        // must scan all chunks of the right-scale rung). 1024 was picked
-        // by corpus_bench A/B: it keeps the big hinted-frame wins
-        // (~30-70% reduction) while limiting sparse-field overhead.
-        const SPIRAL_CHUNK: usize = 1024;
+        // Spiral pruning. The spiral visits cells in order of increasing
+        // distance from the hint, so the correct cell is usually near the
+        // start. We process the spiral in chunks (see `spiral_chunks`):
+        // each chunk runs all its cells in parallel via rayon, then
+        // sequentially verifies any candidates. On the first verified
+        // solve we return immediately — skipping every remaining chunk in
+        // this rung. Chunks grow geometrically, so a hinted frame whose
+        // cell is near the centre pays for a few dozen cells instead of a
+        // full chunk, while a frame that must scan the whole rung still
+        // runs in large chunks. Candidates are verified in spiral order
+        // either way, so the chunking never changes which one is accepted.
 
         // Early-exit flag: set once ANY trial passes verification.
         // Workers in subsequent chunks check it at cell start.
@@ -1416,7 +1434,7 @@ fn run_search(
         // verify pair; on the first verified solve we return immediately.
         // Empty / no-candidate chunks fall through to the next chunk.
         let mut total_candidates_in_rung = 0usize;
-        'chunks: for chunk in cells.chunks(SPIRAL_CHUNK) {
+        'chunks: for chunk in spiral_chunks(&cells) {
             if is_cancelled() {
                 anyhow::bail!("cancelled");
             }
@@ -2137,6 +2155,17 @@ mod orchestrate_unit_tests {
     // -----------------------------------------------------------------------
     // spiral_cells
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn spiral_chunks_grow_and_cover_in_order() {
+        let cells: Vec<usize> = (0..5000).collect();
+        let sizes: Vec<usize> = spiral_chunks(&cells).map(|c| c.len()).collect();
+        assert_eq!(&sizes[..7], &[16, 32, 64, 128, 256, 512, 1024]);
+        assert!(sizes.iter().all(|&n| n <= SPIRAL_CHUNK_MAX));
+        let flat: Vec<usize> = spiral_chunks(&cells).flatten().copied().collect();
+        assert_eq!(flat, cells);
+        assert_eq!(spiral_chunks::<usize>(&[]).count(), 0);
+    }
 
     #[test]
     fn spiral_cells_centre_first() {
