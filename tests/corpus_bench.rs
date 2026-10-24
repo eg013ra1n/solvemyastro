@@ -18,9 +18,7 @@
 //!   - 0 false positives (wrong-position "solve").
 //!   - 0 panics.
 //!   - Skipped entirely (not solved, not counted, not gated) — see
-//!     `SKIP_FRAMES`: `_VSH8902` (no known truth, unsolvable on the bench
-//!     catalog), `_DSC5767` and `_DSC2522` (DSLR wide-field, out of
-//!     target corpus scope).
+//!     `SKIP_FRAMES`: `_VSH8902` (24 mm, ~85° FOV, outside the FOV ladder).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -76,15 +74,20 @@ fn cached_truth() -> &'static [(&'static str, f64, f64, f64)] {
         ("Light_Pane 4_300.0s_Bin1_O_gain111_20211011-024956", 36.702,  60.880, 0.88),
         ("Light_Pane 7_300.0s_Bin1_O_gain111_20211014-045033", 36.113,  61.488, 0.88),
         ("Light_veil_300.0s_Bin1_0015",               312.045, 30.958, 1.89),
+        // M31 frames solved blind (no usable hints: _DSC2522's FOCALLEN says
+        // 50 mm, the solution is ~1000 mm; _DSC5767 carries no header at
+        // all). Confirmed independently: projecting M31, M32 and M110
+        // through each solution lands on the galaxies in the image.
+        ("_DSC2522",                                   10.763, 41.257, 1.004),
+        ("_DSC5767",                                   10.727, 41.706, 2.770),
     ]
 }
 
 /// Frames excluded from the corpus gate entirely — not solved, not counted,
-/// not gated. User-curated scope decision:
-///   - `_VSH8902`: no known truth on the bench catalog (unsolvable here).
-///   - `_DSC5767`: documented allowed-fail.
-///   - `_DSC2522`: DSLR wide-field, out of target corpus scope.
-const SKIP_FRAMES: &[&str] = &["_VSH8902", "_DSC5767", "_DSC2522"];
+/// not gated:
+///   - `_VSH8902`: 24 mm on a full-frame body, ~85° FOV — far outside the
+///     FOV ladder (14°); no known truth.
+const SKIP_FRAMES: &[&str] = &["_VSH8902"];
 
 // ---------------------------------------------------------------------------
 // Minimal FITS header reader (no external dep — hand-rolled 2880-byte blocks)
