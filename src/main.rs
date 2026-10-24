@@ -11,7 +11,7 @@
 //!                [--mode hybrid|floor-only|cap-only]
 //!   solvemyastro cache-info <cache-dir>
 //!   solvemyastro build-index --tiers <dir with tier_*> --out <index-dir>
-//!                [--min-depth 2] [--max-depth 6] [--stars-per-cell 10] [--quads-per-cell 8]
+//!                [--min-depth 2] [--max-depth 7] [--stars-per-cell 10] [--quads-per-cell 8]
 
 use std::path::PathBuf;
 

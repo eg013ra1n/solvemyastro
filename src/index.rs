@@ -30,8 +30,8 @@
 //! |------|--------|
 //! | header (64 B) | magic `SMAQIDX1`, `u32` version, `u32` n_bands, `u64` n_stars, `f64` catalog epoch |
 //! | band table | per band 48 B: `u32` depth, `u32` 0, `f64` ab_lo, `f64` ab_hi (rad), `u64` n_quads, `u64` codes offset, `u64` ids offset |
-//! | stars | `n_stars` × (`f32` x, y, z unit vector, `f32` mag) |
-//! | per band | codes `n_quads` × 4 `f32`, tree order; ids `n_quads` × 4 `u32` (A, B, C, D) |
+//! | stars | `n_stars` × `f32` x, y, z unit vector — only stars some quad uses |
+//! | per band | codes `n_quads` × 4 `u16` ([`CODE_MIN`] + q·[`CODE_STEP`]), tree order; ids `n_quads` × 4 `u32` (A, B, C, D) |
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -46,14 +46,24 @@ use crate::cache::StarCache;
 use crate::wcs::{tan, WcsSolution};
 
 const MAGIC: &[u8; 8] = b"SMAQIDX1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_SIZE: usize = 64;
 const BAND_ENTRY_SIZE: usize = 48;
-const STAR_SIZE: usize = 16;
-const CODE_SIZE: usize = 16;
+const STAR_SIZE: usize = 12;
+const CODE_SIZE: usize = 8;
 const IDS_SIZE: usize = 16;
 /// File name inside an index directory.
 pub const INDEX_FILE: &str = "quads.smaq";
+/// Codes lie in the circle on AB — x, y ∈ [0.5 − √½, 0.5 + √½] ⊂ [−0.25, 1.25] —
+/// and are stored as `u16` steps of [`CODE_STEP`] (2.3e-5, far below any
+/// lookup tolerance).
+const CODE_MIN: f64 = -0.25;
+const CODE_STEP: f64 = 1.5 / 65535.0;
+
+fn quantize(c: f64) -> u16 {
+    ((c - CODE_MIN) / CODE_STEP).round().clamp(0.0, 65535.0) as u16
+}
+
 /// kd-tree leaf size: ranges this small are scanned linearly.
 const LEAF: usize = 16;
 /// Depth of the `.smac` star caches the index is built from.
@@ -162,7 +172,8 @@ fn cell_of(depth: u8, v: [f64; 3]) -> u64 {
 pub struct BuildParams {
     /// Coarsest band depth (largest quads). Depth 2 ≈ 10–21° AB.
     pub min_depth: u8,
-    /// Finest band depth (smallest quads). Depth 6 ≈ 0.65–1.3° AB.
+    /// Finest band depth (smallest quads). Depth 7 ≈ 0.32–0.65° AB, which
+    /// serves fields down to ~1.1°.
     pub max_depth: u8,
     /// Brightest stars kept per depth `d+1` cell.
     pub stars_per_cell: usize,
@@ -172,7 +183,7 @@ pub struct BuildParams {
 
 impl Default for BuildParams {
     fn default() -> Self {
-        Self { min_depth: 2, max_depth: 6, stars_per_cell: 10, quads_per_cell: 8 }
+        Self { min_depth: 2, max_depth: 7, stars_per_cell: 10, quads_per_cell: 8 }
     }
 }
 
@@ -198,7 +209,7 @@ struct BuiltBand {
     depth: u8,
     ab_lo: f64,
     ab_hi: f64,
-    codes: Vec<[f32; 4]>,
+    codes: Vec<[u16; 4]>,
     ids: Vec<[u32; 4]>,
 }
 
@@ -230,8 +241,8 @@ pub fn build_index(
     }
     std::fs::create_dir_all(out_dir)?;
     let n_quads = bands.iter().map(|b| b.codes.len()).sum();
-    write_index(&out_dir.join(INDEX_FILE), epoch, &stars, &bands)?;
-    Ok((stars.xyz.len(), n_quads))
+    let n_stars = write_index(&out_dir.join(INDEX_FILE), epoch, &stars, &bands)?;
+    Ok((n_stars, n_quads))
 }
 
 /// The `k` brightest stars of every depth-`u` cell (global star ids, mag
@@ -320,7 +331,7 @@ fn build_band(cells: &[Vec<u32>], stars: &StarTable, d: u8, u: u8, qcap: usize) 
                     tan::sky_to_tangent(ra, dec, mra, mdec)
                 });
                 let Some((code, order)) = quad_code(pts) else { continue };
-                codes.push(code.map(|x| x as f32));
+                codes.push(code.map(quantize));
                 ids.push(order.map(|o| nb[quad[o]]));
                 made += 1;
                 if made >= qcap {
@@ -334,40 +345,51 @@ fn build_band(cells: &[Vec<u32>], stars: &StarTable, d: u8, u: u8, qcap: usize) 
 
 /// Reorder `codes` (and `ids` with them) into implicit kd-tree order: the
 /// median of `[lo, hi)` on axis `level % 4` sits at `(lo + hi) / 2`.
-fn tree_order(codes: &mut [[f32; 4]], ids: &mut [[u32; 4]]) {
+fn tree_order(codes: &mut [[u16; 4]], ids: &mut [[u32; 4]]) {
     let mut perm: Vec<usize> = (0..codes.len()).collect();
-    fn rec(perm: &mut [usize], codes: &[[f32; 4]], level: usize) {
+    fn rec(perm: &mut [usize], codes: &[[u16; 4]], level: usize) {
         if perm.len() <= LEAF {
             return;
         }
         let axis = level % 4;
         let mid = perm.len() / 2;
-        perm.select_nth_unstable_by(mid, |&a, &b| {
-            codes[a][axis].partial_cmp(&codes[b][axis]).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        perm.select_nth_unstable_by_key(mid, |&a| codes[a][axis]);
         let (left, right) = perm.split_at_mut(mid);
         rec(left, codes, level + 1);
         rec(&mut right[1..], codes, level + 1);
     }
     rec(&mut perm, codes, 0);
-    let c: Vec<[f32; 4]> = perm.iter().map(|&p| codes[p]).collect();
+    let c: Vec<[u16; 4]> = perm.iter().map(|&p| codes[p]).collect();
     let i: Vec<[u32; 4]> = perm.iter().map(|&p| ids[p]).collect();
     codes.copy_from_slice(&c);
     ids.copy_from_slice(&i);
 }
 
-fn write_index(path: &Path, epoch: f64, stars: &StarTable, bands: &[BuiltBand]) -> Result<()> {
+fn write_index(path: &Path, epoch: f64, stars: &StarTable, bands: &[BuiltBand]) -> Result<usize> {
+    // Keep only the stars some quad uses, renumbered in first-use order.
+    let mut remap = vec![u32::MAX; stars.xyz.len()];
+    let mut kept: Vec<[f64; 3]> = Vec::new();
+    for b in bands {
+        for q in &b.ids {
+            for &i in q {
+                if remap[i as usize] == u32::MAX {
+                    remap[i as usize] = kept.len() as u32;
+                    kept.push(stars.xyz[i as usize]);
+                }
+            }
+        }
+    }
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("create {}", path.display()))?);
     let mut header = [0u8; HEADER_SIZE];
     header[..8].copy_from_slice(MAGIC);
     header[8..12].copy_from_slice(&VERSION.to_le_bytes());
     header[12..16].copy_from_slice(&(bands.len() as u32).to_le_bytes());
-    header[16..24].copy_from_slice(&(stars.xyz.len() as u64).to_le_bytes());
+    header[16..24].copy_from_slice(&(kept.len() as u64).to_le_bytes());
     header[24..32].copy_from_slice(&epoch.to_le_bytes());
     w.write_all(&header)?;
 
     let stars_off = HEADER_SIZE + bands.len() * BAND_ENTRY_SIZE;
-    let mut off = stars_off + stars.xyz.len() * STAR_SIZE;
+    let mut off = stars_off + kept.len() * STAR_SIZE;
     for b in bands {
         let n = b.codes.len();
         let (codes_off, ids_off) = (off, off + n * CODE_SIZE);
@@ -380,8 +402,8 @@ fn write_index(path: &Path, epoch: f64, stars: &StarTable, bands: &[BuiltBand]) 
         w.write_all(&(codes_off as u64).to_le_bytes())?;
         w.write_all(&(ids_off as u64).to_le_bytes())?;
     }
-    for (v, m) in stars.xyz.iter().zip(&stars.mag) {
-        for x in [v[0] as f32, v[1] as f32, v[2] as f32, *m] {
+    for v in &kept {
+        for x in [v[0] as f32, v[1] as f32, v[2] as f32] {
             w.write_all(&x.to_le_bytes())?;
         }
     }
@@ -392,13 +414,13 @@ fn write_index(path: &Path, epoch: f64, stars: &StarTable, bands: &[BuiltBand]) 
             }
         }
         for q in &b.ids {
-            for x in q {
-                w.write_all(&x.to_le_bytes())?;
+            for &x in q {
+                w.write_all(&remap[x as usize].to_le_bytes())?;
             }
         }
     }
     w.flush()?;
-    Ok(())
+    Ok(kept.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -502,10 +524,12 @@ impl QuadIndex {
         [f32_at(b, o) as f64, f32_at(b, o + 4) as f64, f32_at(b, o + 8) as f64]
     }
 
-    fn code(&self, band: &Band, q: usize) -> [f32; 4] {
+    fn code(&self, band: &Band, q: usize) -> [f64; 4] {
         let o = band.codes_off + q * CODE_SIZE;
         let b = &self.mmap[..];
-        [f32_at(b, o), f32_at(b, o + 4), f32_at(b, o + 8), f32_at(b, o + 12)]
+        std::array::from_fn(|k| {
+            CODE_MIN + u16::from_le_bytes([b[o + 2 * k], b[o + 2 * k + 1]]) as f64 * CODE_STEP
+        })
     }
 
     /// Star ids (A, B, C, D) of quad `q` in `band`.
@@ -523,7 +547,7 @@ impl QuadIndex {
             if hi - lo <= LEAF {
                 for q in lo..hi {
                     let c = self.code(band, q);
-                    if (0..4).all(|k| (c[k] as f64 - code[k]).abs() <= tol) {
+                    if (0..4).all(|k| (c[k] - code[k]).abs() <= tol) {
                         out.push(q);
                     }
                 }
@@ -532,8 +556,8 @@ impl QuadIndex {
             let axis = level % 4;
             let mid = lo + (hi - lo) / 2;
             let c = self.code(band, mid);
-            let pivot = c[axis] as f64;
-            if (0..4).all(|k| (c[k] as f64 - code[k]).abs() <= tol) {
+            let pivot = c[axis];
+            if (0..4).all(|k| (c[k] - code[k]).abs() <= tol) {
                 out.push(mid);
             }
             if code[axis] - tol <= pivot {
@@ -814,13 +838,13 @@ mod tests {
             (s >> 11) as f64 / (1u64 << 53) as f64
         };
         let n = 5000;
-        let mut codes: Vec<[f32; 4]> = (0..n).map(|_| [rnd() as f32, rnd() as f32, rnd() as f32, rnd() as f32]).collect();
+        let mut codes: Vec<[u16; 4]> = (0..n).map(|_| [rnd(), rnd(), rnd(), rnd()].map(quantize)).collect();
         let mut ids: Vec<[u32; 4]> = (0..n as u32).map(|i| [i, 0, 0, 0]).collect();
         let orig = codes.clone();
         tree_order(&mut codes, &mut ids);
         let dir = tempfile::tempdir().expect("tmp");
         let band = BuiltBand { depth: 5, ab_lo: 0.01, ab_hi: 0.02, codes, ids };
-        let stars = StarTable { key_to_id: HashMap::new(), xyz: vec![[1.0, 0.0, 0.0]], mag: vec![1.0] };
+        let stars = StarTable { key_to_id: HashMap::new(), xyz: vec![[1.0, 0.0, 0.0]; n], mag: vec![1.0; n] };
         write_index(&dir.path().join(INDEX_FILE), 2016.0, &stars, &[band]).expect("write");
         let idx = QuadIndex::open(dir.path()).expect("open");
         let b = idx.bands()[0];
@@ -829,14 +853,17 @@ mod tests {
             let q = [rnd(), rnd(), rnd(), rnd()];
             let tol = 0.05 + rnd() * 0.1;
             idx.range_query(&b, q, tol, &mut out);
-            let mut got: Vec<u32> = out.iter().map(|&h| idx.quad_stars(&b, h)[0]).collect();
+            // Compare the matched codes (star ids are renumbered on write).
+            let key = |c: [f64; 4]| c.map(|x| ((x - CODE_MIN) / CODE_STEP).round() as u16);
+            let mut got: Vec<[u16; 4]> = out.iter().map(|&h| key(idx.code(&b, h))).collect();
             got.sort_unstable();
-            let want: Vec<u32> = orig
+            let mut want: Vec<[u16; 4]> = orig
                 .iter()
-                .enumerate()
-                .filter(|(_, c)| (0..4).all(|k| (c[k] as f64 - q[k]).abs() <= tol))
-                .map(|(i, _)| i as u32)
+                .filter(|c| (0..4).all(|k| (CODE_MIN + c[k] as f64 * CODE_STEP - q[k]).abs() <= tol))
+                .copied()
                 .collect();
+            want.sort_unstable();
+            assert!(!want.is_empty() || got.is_empty());
             assert_eq!(got, want);
         }
     }
