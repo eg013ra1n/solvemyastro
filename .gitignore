@@ -20,3 +20,6 @@ Thumbs.db
 
 # Regeneratable corpus-bench run output (the frozen baseline is corpus_baseline.json)
 /tests/corpus_run.json
+
+# Bench frames are published separately (scripts/fetch_bench_data.sh), never committed
+/tests/files/

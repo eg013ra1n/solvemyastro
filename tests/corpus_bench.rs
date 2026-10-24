@@ -5,7 +5,11 @@
 //!
 //! Data paths default to the bench machine's layout; override with
 //! `SOLVEMYASTRO_BENCH_DIR`, `SOLVEMYASTRO_SMAC_GAIA` and
-//! `SOLVEMYASTRO_SMAC_GAIA_BRIGHT`.
+//! `SOLVEMYASTRO_SMAC_GAIA_BRIGHT` (and `SOLVEMYASTRO_TIER_DIR` for the
+//! tier-stack tests). The frames are published at
+//! <https://artfrom.space/builds/platesolve_bench/platesolve_bench.zip> and
+//! the tier catalog at <https://artfrom.space/catalogs/>;
+//! `scripts/fetch_bench_data.sh <dest>` downloads and unpacks both.
 //!
 //! GATE (asserted):
 //!   - Every non-skipped frame with a reference-truth entry is solved here.
