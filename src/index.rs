@@ -572,9 +572,12 @@ impl Default for SearchParams {
             scale_lo: 0.1,
             scale_hi: 120.0,
             max_stars: 150,
-            cd_cap: 8,
+            // 5 rather than 8: the first true hit on a dense nebular field
+            // came after 86 k lookups instead of 145 k.
+            cd_cap: 5,
             min_ab_px: 30.0,
-            max_queries: 200_000,
+            // ~1 µs per lookup: about a second of search at worst.
+            max_queries: 1_000_000,
         }
     }
 }
