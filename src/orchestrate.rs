@@ -1321,14 +1321,17 @@ pub(crate) fn solve_inner(
                 // Where the indexes cover the field size, the spiral would
                 // re-search what they just found empty, at a cost growing as
                 // 1/FOV² (minutes for a frame nothing can solve). It keeps
-                // the rungs finer than the indexes reach, and the widest
-                // rungs, which are cheap and where lens distortion can defeat
-                // the index's 4-star hypotheses.
+                // the widest rungs, which are cheap and where lens distortion
+                // can defeat the index's 4-star hypotheses, and — around a
+                // position hint only — the rungs finer than the indexes
+                // reach: over the whole sky those take minutes each.
                 let covered = indexes.iter().map(|ix| ix.min_fov_deg()).fold(f64::INFINITY, f64::min);
                 spiral_rungs = rungs
                     .iter()
                     .copied()
-                    .filter(|r| r.fov_deg < covered || r.fov_deg >= SPIRAL_WIDE_RUNG_DEG)
+                    .filter(|r| {
+                        r.fov_deg >= SPIRAL_WIDE_RUNG_DEG || (has_position && r.fov_deg < covered)
+                    })
                     .collect();
                 ctx.rungs = &spiral_rungs;
                 tracing::warn!(
