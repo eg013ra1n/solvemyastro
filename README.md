@@ -29,8 +29,8 @@ SOLVEMYASTRO_BENCH_DIR=<dest>/bench SOLVEMYASTRO_TIER_DIR=<dest>/catalogs \
 ```
 
 Quad index for blind and scale-free solves (`solve_with_index`): a base pack
-for fields from ~1.1° (depth 2–7, ~220 MB) and an optional narrow-field pack
-from ~0.55° (depth 8, ~370 MB with `--quads-per-cell 4`), both built from the
+for fields from ~1.1° (depth 2–7, ~150 MB) and an optional narrow-field pack
+from ~0.55° (depth 8, ~240 MB with `--quads-per-cell 4`), both built from the
 tiers:
 
 ```
