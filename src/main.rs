@@ -3,8 +3,9 @@
 //! Plain `std::env::args` parsing (project convention — no clap).
 //!
 //! Usage:
-//!   solvemyastro solve <image> --catalog <dir> [--ra <d> --dec <d>]
-//!                [--fov <d> | --scale <as/px>] [--radius <d>] [--json]
+//!   solvemyastro solve <image> (--catalog <dir> | --tiers <dir with tier_*>)
+//!                [--index <index-dir>]... [--ra <d> --dec <d>]
+//!                [--fov <d> | --scale <as/px>] [--radius <d>] [--epoch <year>] [--json]
 //!   solvemyastro build-cache --from <legacy-dir> --out <cache-dir> [--epoch <year>]
 //!   solvemyastro build-bright-cache --from <deep-cache-dir> --out <bright-cache-dir>
 //!                [--bright-floor 14.0] [--target-density 100]
@@ -18,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 
 use solvemyastro::cache::{build_cache, build_cache_from_legacy_dir, BuildProgress, StarRecord};
-use solvemyastro::{solve, SolveConfig, SolveHints, StarCache};
+use solvemyastro::{solve_with_index, QuadIndex, SolveConfig, SolveHints, StarCache};
 
 fn opt(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
@@ -42,10 +43,38 @@ fn main() -> Result<()> {
                 .filter(|a| !a.starts_with("--"))
                 .map(PathBuf::from)
                 .ok_or_else(|| anyhow::anyhow!("usage: solvemyastro solve <image> --catalog <dir> [...]"))?;
-            let catalog = opt(rest, "--catalog")
-                .map(PathBuf::from)
-                .ok_or_else(|| anyhow::anyhow!("--catalog <cache-dir> is required"))?;
-            let cache = StarCache::open(&catalog)?;
+            // Catalog: one cache (--catalog) or a density-tier stack (--tiers).
+            let mut layers: Vec<StarCache> = Vec::new();
+            if let Some(dir) = opt(rest, "--tiers").map(PathBuf::from) {
+                for t in ["tier_500", "tier_2000", "tier_5000", "tier_8000"] {
+                    if dir.join(t).is_dir() {
+                        layers.push(StarCache::open(&dir.join(t))?);
+                    }
+                }
+                if layers.is_empty() {
+                    bail!("no tier_* caches under {}", dir.display());
+                }
+            } else {
+                let catalog = opt(rest, "--catalog")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("--catalog <cache-dir> or --tiers <dir> is required"))?;
+                layers.push(StarCache::open(&catalog)?);
+            }
+            let layer_refs: Vec<&StarCache> = layers.iter().collect();
+            let caches = if layer_refs.len() == 1 {
+                solvemyastro::Caches::deep_only(layer_refs[0])
+            } else {
+                solvemyastro::Caches::layered(&layer_refs)
+            };
+            // Quad index packs: --index may be given several times.
+            let indexes = rest
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| *a == "--index")
+                .filter_map(|(i, _)| rest.get(i + 1))
+                .map(|d| QuadIndex::open(&PathBuf::from(d)))
+                .collect::<Result<Vec<_>>>()?;
+            let index_refs: Vec<&QuadIndex> = indexes.iter().collect();
             let hints = SolveHints {
                 ra: opt_f64(rest, "--ra"),
                 dec: opt_f64(rest, "--dec"),
@@ -54,7 +83,14 @@ fn main() -> Result<()> {
                 search_radius_deg: opt_f64(rest, "--radius"),
                 epoch: opt_f64(rest, "--epoch"),
             };
-            let sol = solve(&image, &hints, &solvemyastro::Caches::deep_only(&cache), &SolveConfig::default(), None)?;
+            let sol = solve_with_index(
+                &image,
+                &hints,
+                &caches,
+                &index_refs,
+                &SolveConfig::default(),
+                None,
+            )?;
             if has(rest, "--json") {
                 println!(
                     "{{\"ra\":{},\"dec\":{},\"scale\":{},\"rot\":{},\"matched\":{}}}",
@@ -260,7 +296,7 @@ fn main() -> Result<()> {
             println!(
                 "solvemyastro — standalone plate solver (precise WCS + SIP)\n\n\
                  USAGE:\n  \
-                 solvemyastro solve <image> --catalog <dir> [--ra --dec --fov|--scale --radius] [--json]\n  \
+                 solvemyastro solve <image> (--catalog <dir> | --tiers <dir>) [--index <dir>]... [--ra --dec --fov|--scale --radius] [--json]\n  \
                  solvemyastro build-cache --from <src-dir> --out <cache-dir>\n  \
                  solvemyastro cache-info <cache-dir>\n  \
                  solvemyastro build-index --tiers <dir> --out <index-dir> [--min-depth --max-depth]"

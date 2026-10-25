@@ -900,6 +900,13 @@ mod tests {
         assert!(c0[0] + c0[2] <= 1.0 + 1e-12 && c0[0] <= c0[2]);
     }
 
+    /// An open index is shared read-only between solves and threads.
+    #[test]
+    fn quad_index_is_send_and_sync() {
+        fn shared<T: Send + Sync>() {}
+        shared::<QuadIndex>();
+    }
+
     #[test]
     fn code_rejects_points_outside_the_circle() {
         assert!(quad_code([(0.0, 0.0), (10.0, 0.0), (5.0, 4.9), (5.0, 5.2)]).is_none());
