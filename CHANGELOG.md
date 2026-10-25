@@ -5,6 +5,62 @@ All notable changes to solvemyastro will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-10-25
+
+### Quad index
+
+- **Precomputed quad index** (`index` module, `QuadIndex`, `quads.smaq` format
+  v3) for blind and scale-free solves. An image quad is looked up directly in a
+  table of catalog quads, so the cost no longer grows with the sky area or the
+  scale range left to search: the 37 real bench frames solve blind in 0.2–4.7 s
+  each (43 s total, 330 s without the index), every solution matching the
+  hinted one.
+- `solve_with_index()` takes one or more index packs. A base pack (depth 2–7,
+  fields from ~1.1°, 147 MB) and an optional narrow pack (depth 8, fields from
+  ~0.55°, 236 MB) can be shipped and installed separately. Fully hinted frames
+  never use the index and solve exactly as with `solve()`.
+- `solvemyastro build-index --tiers <dir> --out <dir>` builds a pack from the
+  density-tier catalog; the output is deterministic, so a published pack is
+  verified by its SHA-256. `solvemyastro solve` takes `--tiers` and a
+  repeatable `--index`.
+- When the index finds nothing, the spiral runs only where the index did not
+  look, so a frame nothing can solve fails in ~20–30 s instead of minutes.
+- `index::FORMAT_VERSION` (3) is public, for a pack manifest's `format` field.
+- `QUAD_INDEX.md` documents building, shipping and wiring in the packs.
+
+### Verification
+
+- **Bright-star completeness gate.** After the SIP fit the brightest catalog
+  stars in the frame are scored, found for the WCS and missing against it; a
+  candidate below `log(1e9)` is rejected and the search continues. Two chance
+  alignments on a dense 51″/px Milky Way field that used to pass now fail.
+- A seed rejected by verification is re-fitted about its own centre before it
+  is given up.
+
+### Search
+
+- The hinted ladder reaches 0.15° FOV for long-focus frames; the catalog cone
+  radius is FOV/1.5 so the hinted rung matches.
+- A sparse-catalog cell is balanced in the primary pass.
+- Spiral chunks grow 16 → 1024 instead of a fixed 1024.
+
+### Performance
+
+- Grid nearest-neighbour lookup for catalog-to-detection matching.
+- `PixelCache` decodes pixels only to the requested magnitude; the cone test
+  is trig-free with an exact fallback at the boundary.
+- The brightest cone stars are selected with `select_nth_unstable` instead of
+  sorting all of them.
+
+### Testing
+
+- Bench frames moved out of the repository to
+  `https://artfrom.space/builds/platesolve_bench/platesolve_bench.zip`;
+  `scripts/fetch_bench_data.sh` downloads them with the tier catalog.
+- `synth_bench` and the `synth_fields` example: synthetic star fields from the
+  tier catalog, hinted, position-only, scale-only and blind.
+- `_DSC2522` and `_DSC5767` join the corpus gate with known truth.
+
 ## [0.1.0] — 2026-09-06
 
 First tagged release. The crate has been developed as a submodule of Athenaeum
