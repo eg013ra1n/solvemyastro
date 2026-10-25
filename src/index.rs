@@ -49,7 +49,9 @@ use crate::cache::StarCache;
 use crate::wcs::{tan, WcsSolution};
 
 const MAGIC: &[u8; 8] = b"SMAQIDX1";
-const VERSION: u32 = 3;
+/// `quads.smaq` format version; [`QuadIndex::open`] refuses any other. A
+/// published manifest names it so an app can skip packs it cannot open.
+pub const FORMAT_VERSION: u32 = 3;
 const HEADER_SIZE: usize = 64;
 const BAND_ENTRY_SIZE: usize = 64;
 const RECORD_SIZE: usize = 16;
@@ -434,7 +436,7 @@ fn write_index(path: &Path, epoch: f64, bands: &[BuiltBand]) -> Result<()> {
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("create {}", path.display()))?);
     let mut header = [0u8; HEADER_SIZE];
     header[..8].copy_from_slice(MAGIC);
-    header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     header[12..16].copy_from_slice(&(bands.len() as u32).to_le_bytes());
     header[24..32].copy_from_slice(&epoch.to_le_bytes());
     w.write_all(&header)?;
@@ -539,8 +541,8 @@ impl QuadIndex {
         let b = &mmap[..];
         ensure!(b.len() >= HEADER_SIZE && &b[..8] == MAGIC, "{} is not a quad index", path.display());
         let version = u32_at(b, 8);
-        if version != VERSION {
-            bail!("{}: index version {version}, expected {VERSION} — rebuild it", path.display());
+        if version != FORMAT_VERSION {
+            bail!("{}: index version {version}, expected {FORMAT_VERSION} — rebuild it", path.display());
         }
         let n_bands = u32_at(b, 12) as usize;
         ensure!(b.len() >= HEADER_SIZE + n_bands * BAND_ENTRY_SIZE, "{} is truncated", path.display());
