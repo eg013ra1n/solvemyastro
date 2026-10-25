@@ -94,6 +94,10 @@ const FOV_MAX_DEG: f64 = 14.25;
 /// Blind autoFOV bottom rung floor. With [`CONE_OVERSIZE`] its cone radius is
 /// 0.38°.
 const FOV_MIN_DEG: f64 = 0.57;
+/// After a quad-index search found nothing, spiral rungs this wide or wider
+/// still run even inside the indexes' range: a full-sky pass over them is a
+/// few thousand cells, and wide lenses are where index hypotheses fail.
+const SPIRAL_WIDE_RUNG_DEG: f64 = 6.0;
 /// Floor of a hinted ladder. Lower than [`FOV_MIN_DEG`] because a hint pins
 /// the search to a small sky region: long-focus frames (0.3° at 4000 mm)
 /// need a cone near their own size, and only a blind ladder would pay for
@@ -1257,7 +1261,7 @@ pub(crate) fn solve_inner(
         total_ms: 0,
     };
     let truth = known_truth_for(&frame_name);
-    let ctx = SearchCtx {
+    let mut ctx = SearchCtx {
         image_pts: &image_pts,
         image_quads: &image_quads,
         group_size,
@@ -1285,6 +1289,7 @@ pub(crate) fn solve_inner(
     // it costs the same anywhere on the sky, where the spiral's cost grows
     // with the area and scale range it has to cover. A fully hinted frame
     // keeps the spiral, which is near-instant around a good hint.
+    let spiral_rungs: Vec<FovRung>;
     let has_position = center.is_some();
     let has_scale = scale_bounds.is_none()
         && (hints.pixel_scale_arcsec.is_some() || hints.fov_deg.is_some());
@@ -1313,7 +1318,25 @@ pub(crate) fn solve_inner(
                 return Ok(sol);
             }
             Ok(None) => {
-                tracing::warn!(frame = %frame_name, "quad-index search found nothing — falling back to the spiral search");
+                // Where the indexes cover the field size, the spiral would
+                // re-search what they just found empty, at a cost growing as
+                // 1/FOV² (minutes for a frame nothing can solve). It keeps
+                // the rungs finer than the indexes reach, and the widest
+                // rungs, which are cheap and where lens distortion can defeat
+                // the index's 4-star hypotheses.
+                let covered = indexes.iter().map(|ix| ix.min_fov_deg()).fold(f64::INFINITY, f64::min);
+                spiral_rungs = rungs
+                    .iter()
+                    .copied()
+                    .filter(|r| r.fov_deg < covered || r.fov_deg >= SPIRAL_WIDE_RUNG_DEG)
+                    .collect();
+                ctx.rungs = &spiral_rungs;
+                tracing::warn!(
+                    frame = %frame_name,
+                    index_min_fov_deg = covered,
+                    spiral_rungs = spiral_rungs.len(),
+                    "quad-index search found nothing — spiral over the rungs the indexes do not cover"
+                );
             }
         }
     }
