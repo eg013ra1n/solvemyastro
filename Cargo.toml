@@ -25,7 +25,8 @@ path = "src/main.rs"
 # lib = `astroimage`.
 # Versions pinned to the workspace lock to avoid duplicate crate versions
 # (project rule). CLI uses std::env::args (project convention — no clap).
-rustafits = { path = "../rustafits" }
+# By version so solvemyastro builds as a git dependency outside Athenaeum, which patches it back to its submodule.
+rustafits = "1.9.1"
 nalgebra = "0.35"
 rayon = "1.10"
 anyhow = "1"
