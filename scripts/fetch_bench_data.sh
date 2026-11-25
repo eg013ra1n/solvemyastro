@@ -5,7 +5,7 @@
 #
 # Leaves <dest>/bench/*.fits|*.fit|*.xisf and <dest>/catalogs/tier_*/stars.smac,
 # ready for:
-#   SOLVEMYASTRO_BENCH_DIR=<dest>/bench SOLVEMYASTRO_TIER_DIR=<dest>/catalogs \
+#   SMA_BENCH_DIR=<dest>/bench SOLVEMYASTRO_TIER_DIR=<dest>/catalogs \
 #     cargo test --release --test corpus_bench -- --ignored corpus_layered_tiers --nocapture
 #
 # Re-running skips whatever is already in place. About 1.5 GB of frames and

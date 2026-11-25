@@ -9,6 +9,7 @@ repository = "https://github.com/eg013ra1n/solvemyastro"
 readme = "README.md"
 keywords = ["astronomy", "astrometry", "plate-solving", "wcs", "astrophotography"]
 categories = ["science", "command-line-utilities"]
+exclude = [".github/"]
 
 [lib]
 name = "solvemyastro"
