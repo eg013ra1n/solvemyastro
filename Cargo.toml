@@ -23,6 +23,10 @@ required-features = ["cli"]
 name = "gaia_ingest"
 required-features = ["catalog"]
 
+[[test]]
+name = "catalog_build"
+required-features = ["catalog"]
+
 [features]
 default = []
 # The catalog layer: Gaia ingest, tier and index-pack writers, zip/hash helpers.

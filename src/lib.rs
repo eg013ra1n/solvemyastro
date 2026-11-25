@@ -27,12 +27,16 @@ pub mod manifest;
 pub(crate) mod math;
 pub(crate) mod nn;
 pub mod orchestrate;
+#[cfg(feature = "catalog")]
+pub mod package;
 pub mod project;
 pub mod quad;
 pub mod register;
 pub(crate) mod refine;
 pub mod select;
 pub mod sip;
+#[cfg(feature = "catalog")]
+pub mod tiers;
 pub mod verify;
 pub mod wcs;
 pub mod wcs_fit;
