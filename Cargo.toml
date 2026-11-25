@@ -19,6 +19,10 @@ name = "solvemyastro"
 path = "src/main.rs"
 required-features = ["cli"]
 
+[[test]]
+name = "gaia_ingest"
+required-features = ["catalog"]
+
 [features]
 default = []
 # The catalog layer: Gaia ingest, tier and index-pack writers, zip/hash helpers.

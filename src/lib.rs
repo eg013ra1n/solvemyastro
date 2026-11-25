@@ -18,6 +18,8 @@ pub mod accept;
 pub mod bins;
 pub mod cache;
 pub mod diag;
+#[cfg(feature = "catalog")]
+pub mod gaia;
 pub mod healpix;
 pub mod index;
 pub mod layout;
