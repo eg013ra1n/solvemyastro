@@ -14,6 +14,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
+pub mod accept;
 pub mod bins;
 pub mod cache;
 pub mod diag;
