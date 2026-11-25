@@ -10,12 +10,11 @@
 //! The output does not depend on file order or thread count: every bin is
 //! written through [`crate::bins::write_records`], which sorts by a total key.
 
-pub mod binner;
+pub(crate) mod binner;
 pub mod coverage;
 pub mod ingest;
-pub mod md5_list;
+pub(crate) mod md5_list;
 
-pub use binner::HealpixBinner;
 pub use coverage::{Coverage, CoveredFile};
 pub use ingest::{ingest, IngestOptions, IngestProgress, IngestSummary};
 

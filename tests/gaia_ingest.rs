@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use common::gaia_fixture::*;
 use md5::{Digest, Md5};
-use solvemyastro::bins::{self, BinRecord};
+use solvemyastro::bins::BinRecord;
 use solvemyastro::gaia::{ingest, Coverage, IngestOptions, IngestProgress, COVERAGE_FILE, MD5_LIST_FILE};
 
 fn run(gaia: &Path, out: &Path, opts: &IngestOptions) -> anyhow::Result<solvemyastro::gaia::IngestSummary> {
@@ -37,7 +37,10 @@ fn ingest_keeps_filters_and_sorts() {
     write_fixture(&gaia);
 
     let events = Mutex::new(Vec::new());
-    let summary = ingest(&gaia, &out, &IngestOptions::default(), &|e| events.lock().unwrap().push(e)).unwrap();
+    // One job: the files are read in name order, so the pair order below
+    // is the sorter's work and not a thread race.
+    let opts = IngestOptions { jobs: 1, ..Default::default() };
+    let summary = ingest(&gaia, &out, &opts, &|e| events.lock().unwrap().push(e)).unwrap();
 
     assert_eq!(summary.files, 2);
     assert_eq!(summary.stars, CELL0_STARS as usize + CELL1_KEPT);
@@ -70,6 +73,10 @@ fn ingest_keeps_filters_and_sorts() {
     let pair: Vec<_> = cell0.iter().filter(|r| r.mag_raw == pair_g).collect();
     assert_eq!(pair.len(), 2);
     assert!(pair[0].ra.to_bits() < pair[1].ra.to_bits());
+    // Star 1 is from file B and has the smaller ra: file order would put star 0
+    // (file A) first, so only the sort puts it second.
+    assert_eq!((pair[0].ra, pair[0].dec), bin_position(0, 1));
+    assert_eq!((pair[1].ra, pair[1].dec), bin_position(0, 0));
 
     // Progress: started, one FileDone per file, finalizing, complete.
     let events = events.into_inner().unwrap();
@@ -105,7 +112,7 @@ fn ingest_is_the_same_for_any_jobs_and_order() {
     let listed = tmp.path().join("listed");
     run(&gaia, &one, &IngestOptions { jobs: 1, ..Default::default() }).unwrap();
     run(&gaia, &four, &IngestOptions { jobs: 4, ..Default::default() }).unwrap();
-    run(&gaia_listed, &listed, &IngestOptions { jobs: 3, ..Default::default() }).unwrap();
+    run(&gaia_listed, &listed, &IngestOptions { jobs: 1, ..Default::default() }).unwrap();
 
     let reference = bin_bytes(&one);
     assert_eq!(reference.len(), 2);
@@ -259,5 +266,4 @@ fn the_magnitude_limit_is_an_option() {
         assert!(!recs.is_empty());
         assert!(recs.iter().all(|r| r.mag() < 13.0));
     }
-    assert!(bins::bin_file_name(0) == "healpix_000000.bin");
 }

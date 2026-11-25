@@ -364,4 +364,16 @@ mod tests {
         // No usable scale with detections: the radius is 1.5 deg, only 1.4 counts.
         assert_eq!(expected_bright_in_fov(&caches, crval, 0.0, 100, epoch), 1);
     }
+
+    /// The gate counts bright stars to `VERIFY_MAG_LIMIT`; moving it moves
+    /// every embedding app's gate verdicts.
+    #[test]
+    fn the_verify_magnitude_limit_is_pinned() {
+        assert_eq!(
+            crate::orchestrate::VERIFY_MAG_LIMIT,
+            12.0,
+            "VERIFY_MAG_LIMIT moves the gate's bright-star count and with it embedding apps' \
+             gate verdicts: bump their solve-recipe version (Athenaeum's config::SOLVE_RECIPE_VERSION)"
+        );
+    }
 }

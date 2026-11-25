@@ -63,7 +63,9 @@ impl HealpixBinner {
         for entry in std::fs::read_dir(&self.scratch_dir)
             .with_context(|| format!("list scratch {}", self.scratch_dir.display()))?
         {
-            let path = entry?.path();
+            let path = entry
+                .with_context(|| format!("read an entry of scratch {}", self.scratch_dir.display()))?
+                .path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let Some(pixel_str) = name.strip_prefix("p_").and_then(|s| s.strip_suffix(".raw")) else {
                 continue;

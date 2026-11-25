@@ -1,6 +1,7 @@
 //! A tiny Gaia DR3 download: two `GaiaSource_*.csv.gz` files whose ranges make
 //! level-6 cell 0 complete and cell 1 partial, with generated stars in both
-//! cells and one row for every filter the ingest applies.
+//! cells and one row for every filter the ingest applies. File A's range lies
+//! wholly in cell 0, so every cell 1 row is in file B.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -111,14 +112,14 @@ fn cell0_g(k: u32) -> String {
 /// The rows of the two files, `(file A, file B)`.
 pub fn fixture_rows() -> (Vec<Row>, Vec<Row>) {
     let (mut a, mut b) = (Vec::new(), Vec::new());
-    let mut put = |k: u32, row: Row| if k % 2 == 0 { a.push(row) } else { b.push(row) };
     for k in 0..CELL0_STARS {
         let (ra, dec) = star_in_cell(0, k);
-        put(k, Row::star(ra, dec, &cell0_g(k)));
+        let row = Row::star(ra, dec, &cell0_g(k));
+        if k % 2 == 0 { a.push(row) } else { b.push(row) }
     }
     for k in 0..CELL1_STARS {
         let (ra, dec) = star_in_cell(1, k);
-        put(k, Row::star(ra, dec, &format!("{:.3}", 12.0 + k as f64 * 0.1)));
+        b.push(Row::star(ra, dec, &format!("{:.3}", 12.0 + k as f64 * 0.1)));
     }
     let case = |k: u32, g: &str| {
         let (ra, dec) = star_in_cell(1, k);
@@ -137,16 +138,7 @@ pub fn fixture_rows() -> (Vec<Row>, Vec<Row>) {
     bad_ra.ra = "not-a-number".into();
     let mut ruwe_under = case(K_RUWE_UNDER_CAP, "15.8");
     ruwe_under.ruwe = "1.39".into();
-    for (k, row) in [
-        (K_G_AT_LIMIT, at_limit),
-        (K_RUWE_AT_CAP, ruwe_cap),
-        (K_EMPTY_RUWE, empty_ruwe),
-        (K_NULL_PM, null_pm),
-        (K_BAD_RA, bad_ra),
-        (K_RUWE_UNDER_CAP, ruwe_under),
-    ] {
-        put(k, row);
-    }
+    b.extend([at_limit, ruwe_cap, empty_ruwe, null_pm, bad_ra, ruwe_under]);
     (a, b)
 }
 

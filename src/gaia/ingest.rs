@@ -196,7 +196,9 @@ fn work(
 
 fn refuse_filled_output(out_bins: &Path) -> Result<()> {
     for entry in std::fs::read_dir(out_bins).with_context(|| format!("list {}", out_bins.display()))? {
-        let name = entry?.file_name();
+        let name = entry
+            .with_context(|| format!("read an entry of {}", out_bins.display()))?
+            .file_name();
         let name = name.to_string_lossy();
         if name == COVERAGE_FILE || (name.starts_with("healpix_") && name.ends_with(".bin")) {
             anyhow::bail!("output folder already holds bins: {}; choose an empty folder", out_bins.display());
@@ -251,7 +253,7 @@ fn list_inputs(gaia_dir: &Path, verify_md5: bool) -> Result<Vec<Input>> {
 fn csv_gz_names(dir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("list {}", dir.display()))? {
-        let entry = entry?;
+        let entry = entry.with_context(|| format!("read an entry of {}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.ends_with(".csv.gz") && entry.path().is_file() {
             names.push(name);
