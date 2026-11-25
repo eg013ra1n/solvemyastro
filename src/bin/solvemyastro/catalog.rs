@@ -1,12 +1,14 @@
 //! The catalog-building commands: Gaia files to bins, tiers, index packs and
 //! the publish tree.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Args};
 
+use solvemyastro::bins::RECORD_SIZE;
 use solvemyastro::cache::{build_cache_from_legacy_dir, BuildProgress, StarRecord};
 use solvemyastro::gaia::{self, IngestOptions, IngestProgress};
 use solvemyastro::index::{self, BuildParams, Preset};
@@ -101,9 +103,36 @@ pub struct BuildCacheArgs {
     epoch: f64,
 }
 
+/// Every `healpix_*.bin` in `dir` can be statted, is a regular file and holds a
+/// whole number of records. `build_cache_from_legacy_dir` reads each bin with
+/// the error turned into an empty list, so a torn or unreadable bin must be
+/// refused here, by name, before it is called. A read that fails after this
+/// check has passed is not covered.
+fn check_bins(dir: &Path) -> Result<()> {
+    let entries = std::fs::read_dir(dir).with_context(|| format!("read bins folder {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read bins folder {}", dir.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !(name.starts_with("healpix_") && name.ends_with(".bin")) {
+            continue;
+        }
+        let path = entry.path();
+        let meta = std::fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if !meta.is_file() {
+            bail!("{} is not a file", path.display());
+        }
+        if meta.len() % RECORD_SIZE as u64 != 0 {
+            bail!("{} is {} bytes, not a whole number of {RECORD_SIZE}-byte records", path.display(), meta.len());
+        }
+    }
+    Ok(())
+}
+
 pub fn build_cache(a: BuildCacheArgs) -> Result<()> {
     let from = a.bins.or(a.from).context("--bins <dir> or --from <dir> is required")?;
     let (out, epoch) = (a.out, a.epoch);
+    check_bins(&from).inspect_err(|e| tracing::error!(from = %from.display(), error = %format!("{e:#}"), "bins refused"))?;
     std::fs::create_dir_all(&out).with_context(|| format!("create --out {}", out.display()))?;
     tracing::info!(from = %from.display(), out = %out.display(), epoch, "build-cache");
     let total = build_cache_from_legacy_dir(&from, &out, epoch, |p| match p {
@@ -167,8 +196,24 @@ pub fn build_bright_cache(a: BuildBrightCacheArgs) -> Result<()> {
     let bright_floor_v = bright_floor;
     let target_density_v = target_density;
     let mode_v = mode.clone();
+    // The first pixel that cannot be read stops the selection (later pixels
+    // give nothing) and fails the build below, naming it.
+    let first_error: RefCell<Option<anyhow::Error>> = RefCell::new(None);
+    let first_error_ref = &first_error;
+    let from_ref = &from;
     let pixel_iter = (0..N_PIXELS).flat_map(move |px| {
-        let records = src.iter_pixel_records(px).unwrap_or_default();
+        let records = if first_error_ref.borrow().is_some() {
+            Vec::new()
+        } else {
+            match src.iter_pixel_records(px) {
+                Ok(r) => r,
+                Err(e) => {
+                    let e = e.context(format!("read pixel {px} of the cache in {}", from_ref.display()));
+                    *first_error_ref.borrow_mut() = Some(e);
+                    Vec::new()
+                }
+            }
+        };
         let selected: Vec<StarRecord> = match mode_v.as_str() {
             "floor-only" => records.into_iter().take_while(|r| r.mag < bright_floor_v).collect(),
             "cap-only" => records.into_iter().take(target_density_v).collect(),
@@ -188,7 +233,7 @@ pub fn build_bright_cache(a: BuildBrightCacheArgs) -> Result<()> {
         selected.into_iter()
     });
 
-    let total = solvemyastro::cache::build_cache(pixel_iter, &out, src_epoch, |p| match p {
+    let built = solvemyastro::cache::build_cache(pixel_iter, &out, src_epoch, |p| match p {
         BuildProgress::Ingesting { records } => {
             if records % 500_000 == 0 {
                 tracing::info!(records, "ingesting");
@@ -200,7 +245,18 @@ pub fn build_bright_cache(a: BuildBrightCacheArgs) -> Result<()> {
             }
         }
         BuildProgress::Complete { records } => tracing::info!(records, "done"),
-    })?;
+    });
+    if let Some(e) = first_error.take() {
+        tracing::warn!(error = %format!("{e:#}"), out = %out.display(), "a source pixel was unreadable; the bright cache is discarded");
+        let smac = out.join(STARS_FILE);
+        match std::fs::remove_file(&smac) {
+            Ok(()) => {}
+            Err(re) if re.kind() == std::io::ErrorKind::NotFound => {}
+            Err(re) => tracing::error!(path = %smac.display(), error = %re, "could not remove the half-written cache"),
+        }
+        return Err(e);
+    }
+    let total = built?;
 
     // Sidecar metadata for debugging + future stale-cache detection.
     let meta = format!(
@@ -209,7 +265,7 @@ pub fn build_bright_cache(a: BuildBrightCacheArgs) -> Result<()> {
          \"mode\": \"{}\",\n  \"output_star_count\": {}\n}}\n",
         src_count, src_epoch, bright_floor, target_density, mode, total,
     );
-    std::fs::write(out.join("bright.meta.json"), &meta).context("write bright.meta.json")?;
+    std::fs::write(out.join("bright.meta.json"), &meta).with_context(|| format!("write bright.meta.json in {}", out.display()))?;
     println!("build-bright-cache: wrote {total} stars to {}", out.join(STARS_FILE).display());
     Ok(())
 }
@@ -308,12 +364,17 @@ pub fn package(a: PackageArgs) -> Result<()> {
     if a.tiers.is_none() && a.index.is_empty() {
         bail!("nothing to package: give --tiers <dir> and/or --index <name>=<dir>");
     }
+    let packs: Vec<(&str, &Path)> = a.index.iter().map(|(n, d)| (n.as_str(), d.as_path())).collect();
+    // The index packs are checked before the tiers are written, so a refused
+    // pack name leaves no half-written publish tree.
+    if !packs.is_empty() {
+        solvemyastro::package::check_index_packs(&packs)?;
+    }
     if let Some(tiers) = &a.tiers {
         let m = solvemyastro::package::package_tiers(tiers, &a.out)?;
         println!("package: {} tiers (catalog epoch J{}) -> {}", m.tiers.len(), m.catalog_epoch, a.out.display());
     }
-    if !a.index.is_empty() {
-        let packs: Vec<(&str, &Path)> = a.index.iter().map(|(n, d)| (n.as_str(), d.as_path())).collect();
+    if !packs.is_empty() {
         let m = solvemyastro::package::package_index(&packs, &a.out)?;
         println!("package: {} index packs (catalog epoch J{}) -> {}", m.packs.len(), m.catalog_epoch, a.out.display());
     }

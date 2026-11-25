@@ -246,3 +246,90 @@ fn build_bright_cache_writes_a_sidecar() {
     let out = run(args!["build-bright-cache", "--from", deep, "--out", bright, "--mode", "sideways"]);
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// The first `healpix_NNNNNN.bin` in `bins`, by name.
+fn first_bin(bins: &Path) -> std::path::PathBuf {
+    let mut names: Vec<_> = fs::read_dir(bins)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("healpix_") && n.ends_with(".bin")))
+        .collect();
+    names.sort();
+    names.into_iter().next().expect("the fixture writes at least one bin")
+}
+
+#[test]
+fn build_cache_refuses_a_torn_bin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gaia, bins, out_dir) = (tmp.path().join("gaia"), tmp.path().join("bins"), tmp.path().join("out"));
+    fs::create_dir(&gaia).unwrap();
+    write_fixture(&gaia);
+    ok(args!["ingest", "--gaia", gaia, "--out", bins]);
+    let torn = first_bin(&bins);
+    let len = fs::metadata(&torn).unwrap().len();
+    assert!(len > 3 && len % 14 == 0, "the fixture's bin is whole records");
+    fs::OpenOptions::new().write(true).open(&torn).unwrap().set_len(len - 3).unwrap();
+
+    for flag in ["--bins", "--from"] {
+        let out = run(args!["build-cache", flag, bins, "--out", out_dir]);
+        assert_eq!(out.status.code(), Some(1), "{flag}");
+        let err = text(&out.stderr);
+        let name = torn.file_name().unwrap().to_str().unwrap();
+        assert!(err.contains(name), "{flag}: the torn bin {name} is not named in:\n{err}");
+        assert!(!out_dir.join("stars.smac").exists(), "{flag}: a refused build leaves no cache");
+    }
+}
+
+#[test]
+fn build_bright_cache_refuses_an_unreadable_pixel_and_removes_its_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gaia, bins, deep, bright) =
+        (tmp.path().join("gaia"), tmp.path().join("bins"), tmp.path().join("deep"), tmp.path().join("bright"));
+    fs::create_dir(&gaia).unwrap();
+    write_fixture(&gaia);
+    ok(args!["ingest", "--gaia", gaia, "--out", bins]);
+    ok(args!["build-cache", "--bins", bins, "--out", deep]);
+
+    // Point one filled pixel's directory entry (12 bytes after a 64-byte header:
+    // u64 offset, u32 count) far beyond the end of the file.
+    let px = {
+        let cache = StarCache::open(&deep).unwrap();
+        (0..49_152u64).find(|&p| !cache.iter_pixel_records(p).unwrap().is_empty()).expect("a filled pixel")
+    };
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = fs::OpenOptions::new().write(true).open(deep.join("stars.smac")).unwrap();
+        f.seek(SeekFrom::Start(64 + px * 12)).unwrap();
+        f.write_all(&(1u64 << 40).to_le_bytes()).unwrap();
+    }
+
+    let out = run(args!["build-bright-cache", "--from", deep, "--out", bright, "--mode", "cap-only"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(err.contains(&format!("pixel {px}")), "the pixel is not named in:\n{err}");
+    assert!(err.contains("deep"), "the source folder is not named in:\n{err}");
+    assert!(!bright.join("stars.smac").exists(), "the half-written cache is removed");
+    assert!(!bright.join("bright.meta.json").exists(), "no sidecar for a failed build");
+}
+
+#[test]
+fn package_refuses_repeated_pack_names_before_writing_the_tiers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tiers = fixture_tiers(tmp.path());
+    let publish = tmp.path().join("publish");
+    let pack = tmp.path().join("pack");
+    ok(args!["build-index", "--tiers", tiers, "--out", pack, "--min-depth", "2", "--max-depth", "3"]);
+    let (a, b) = (format!("a={}", pack.display()), format!("A={}", pack.display()));
+    let out = run(args!["package", "--tiers", tiers, "--index", a, "--index", b, "--out", publish]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("differ by case only"), "{}", text(&out.stderr));
+    assert!(!publish.exists(), "the tiers are not written when an index name is refused");
+}
+
+#[test]
+fn solve_position_flags_need_each_other() {
+    let out = run(args!["solve", "frame.fits", "--tiers", "t", "--ra", "10"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    let out = run(args!["solve", "frame.fits", "--tiers", "t", "--dec", "-10"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+}

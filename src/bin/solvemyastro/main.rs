@@ -10,8 +10,8 @@
 //! solvemyastro info <dir>
 //! ```
 //!
-//! Results go to stdout, progress and the closing summary to stderr through
-//! `tracing`. Exit code 0 on success, 1 on a failure or a refused solve, 2 on
+//! Results and each command's closing summary go to stdout, progress to stderr
+//! through `tracing`. Exit code 0 on success, 1 on a failure or a refused solve, 2 on
 //! bad arguments (clap).
 
 mod catalog;

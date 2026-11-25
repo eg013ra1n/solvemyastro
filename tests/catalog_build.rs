@@ -251,7 +251,10 @@ fn package_index_refuses_unusable_and_repeated_pack_names_before_writing() {
 
     // index_Base.zip and index_base.zip are one file on macOS and Windows.
     let err = package_index(&[("base", base.as_path()), ("Base", base.as_path())], &publish).unwrap_err();
-    assert!(format!("{err:#}").contains("\"Base\""), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("the pack names \"base\" and \"Base\" differ by case only"),
+        "{err:#}"
+    );
     assert!(!publish.exists(), "nothing is written for names that differ by case only");
 
     for bad in ["", ".", "..", "a/b", "a\\b"] {

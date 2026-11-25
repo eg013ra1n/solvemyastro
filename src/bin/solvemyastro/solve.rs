@@ -25,10 +25,10 @@ pub struct SolveArgs {
     #[arg(long, value_name = "DIR")]
     index: Vec<PathBuf>,
     /// Right ascension of the field centre, degrees.
-    #[arg(long, allow_negative_numbers = true)]
+    #[arg(long, allow_negative_numbers = true, requires = "dec")]
     ra: Option<f64>,
     /// Declination of the field centre, degrees.
-    #[arg(long, allow_negative_numbers = true)]
+    #[arg(long, allow_negative_numbers = true, requires = "ra")]
     dec: Option<f64>,
     /// Field of view, degrees.
     #[arg(long, conflicts_with = "scale")]
@@ -62,6 +62,14 @@ impl fmt::Display for Refused {
 }
 
 impl std::error::Error for Refused {}
+
+/// What the refusal says: the gate's verdict and the numbers it judged.
+fn refusal_message(inliers: usize, inlier_ratio: f64, scale_arcsec: f64, expected_in_fov: usize) -> String {
+    format!(
+        "rejected: low confidence ({inliers} inliers, ratio {inlier_ratio:.2}, {scale_arcsec:.2}\"/px, \
+         {expected_in_fov} stars expected in the field)"
+    )
+}
 
 /// The `--json` object.
 #[derive(Serialize)]
@@ -126,9 +134,11 @@ pub fn run(a: SolveArgs) -> Result<()> {
     };
     let accepted = gate.accepts(&metrics);
     if !accepted && !a.no_gate {
-        return Err(Refused(format!(
-            "rejected: low confidence ({} inliers, ratio {:.2}, {:.2}\"/px, {} stars expected in the field)",
-            sol.matched_stars, sol.inlier_ratio, sol.pixel_scale_arcsec, expected_in_fov
+        return Err(Refused(refusal_message(
+            sol.matched_stars,
+            sol.inlier_ratio,
+            sol.pixel_scale_arcsec,
+            expected_in_fov,
         ))
         .into());
     }
@@ -160,4 +170,39 @@ pub fn run(a: SolveArgs) -> Result<()> {
         println!("gate: {gate_word}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_keys_are_the_documented_set() {
+        let out = JsonOut {
+            ra: 1.0,
+            dec: -2.0,
+            scale: 1.5,
+            rot: 10.0,
+            matched: 40,
+            rms_px: 0.3,
+            inlier_ratio: 0.9,
+            expected_in_fov: 60,
+            gate: "passed",
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want = ["ra", "dec", "scale", "rot", "matched", "rms_px", "inlier_ratio", "expected_in_fov", "gate"];
+        want.sort_unstable();
+        assert_eq!(keys, want);
+        assert_eq!(v["gate"], "passed");
+    }
+
+    #[test]
+    fn a_refusal_reads_rejected_and_stands_alone() {
+        let msg = refusal_message(12, 0.456, 1.234, 80);
+        assert!(msg.starts_with("rejected: "), "{msg}");
+        assert!(msg.contains("12 inliers") && msg.contains("80 stars expected"), "{msg}");
+        assert_eq!(Refused(msg.clone()).to_string(), msg);
+    }
 }

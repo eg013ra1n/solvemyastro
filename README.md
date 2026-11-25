@@ -51,7 +51,9 @@ folder of bins or a publish tree, with its counts. `cache-info` is the old name.
 ## Building the star catalog
 
 The chain from Gaia files to what the solver reads. Every command runs its
-stage from scratch each time and writes its final files only at the end.
+stage from scratch each time. A stage that fails midway (`build-tiers`,
+`build-cache`) can leave a partly written output folder: delete it and run the
+stage again.
 
 1. **Gaia data.** Download the Gaia DR3 `GaiaSource_*.csv.gz` files from ESA's
    archive (<https://cdn.gea.esac.esa.int/Gaia/gdr3/gaia_source/>) into one
@@ -96,7 +98,8 @@ tiers are thinner than the density they are named for.
 **Credit.** Catalogs built from Gaia data should carry ESA's line: "This work
 has made use of data from the European Space Agency (ESA) mission Gaia
 (https://www.cosmos.esa.int/gaia), processed by the Gaia Data Processing and
-Analysis Consortium (DPAC)". The published catalogs do.
+Analysis Consortium (DPAC)". `package` writes no credit of its own: whoever
+publishes catalogs built from Gaia carries that line.
 
 ## Benchmarks
 

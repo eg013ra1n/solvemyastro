@@ -149,18 +149,14 @@ fn check_pack_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Package the quad-index packs `(name, dir)` — `dir` holds `quads.smaq` —
-/// into `publish_dir` as `index_<name>.zip` (entry `<name>/quads.smaq`), its
-/// sidecar and `index_manifest.json`, in the order given. Names must be usable
-/// and unique (case aside), every pack must open and all must be built from the same
-/// catalog epoch, which the manifest records; all of that is checked before
-/// anything is written. No pack at all is an error.
-pub fn package_index(packs: &[(&str, &Path)], publish_dir: &Path) -> Result<IndexManifest> {
+/// What [`check_packs`] learns about the packs it accepts: the one catalog
+/// epoch, and per pack its name, `quads.smaq` and minimum field of view.
+type CheckedPacks<'a> = (f64, Vec<(&'a str, std::path::PathBuf, f64)>);
+
+fn check_packs<'a>(packs: &[(&'a str, &Path)]) -> Result<CheckedPacks<'a>> {
     if packs.is_empty() {
         bail!("no index pack to package");
     }
-
-    // Check every pack before the first byte is written.
     let mut epoch: Option<(f64, &str)> = None;
     let mut checked = Vec::with_capacity(packs.len());
     for (i, &(name, dir)) in packs.iter().enumerate() {
@@ -195,6 +191,26 @@ pub fn package_index(packs: &[(&str, &Path)], publish_dir: &Path) -> Result<Inde
         checked.push((name, dir.join(INDEX_FILE), min_fov_deg));
     }
     let (catalog_epoch, _) = epoch.expect("packs is not empty");
+    Ok((catalog_epoch, checked))
+}
+
+/// Everything [`package_index`] checks before it writes a byte: the names are
+/// usable and unique (case aside), every pack opens, all share one catalog
+/// epoch, and there is at least one pack. A caller that also packages tiers
+/// runs this first, so a refused index name leaves no half-written tree.
+pub fn check_index_packs(packs: &[(&str, &Path)]) -> Result<()> {
+    check_packs(packs).map(|_| ())
+}
+
+/// Package the quad-index packs `(name, dir)` — `dir` holds `quads.smaq` —
+/// into `publish_dir` as `index_<name>.zip` (entry `<name>/quads.smaq`), its
+/// sidecar and `index_manifest.json`, in the order given. Names must be usable
+/// and unique (case aside), every pack must open and all must be built from the same
+/// catalog epoch, which the manifest records; all of that is checked
+/// ([`check_index_packs`]) before anything is written. No pack at all is an error.
+pub fn package_index(packs: &[(&str, &Path)], publish_dir: &Path) -> Result<IndexManifest> {
+    // Check every pack before the first byte is written.
+    let (catalog_epoch, checked) = check_packs(packs)?;
 
     fs::create_dir_all(publish_dir).with_context(|| format!("create {}", publish_dir.display()))?;
     let mut entries = Vec::with_capacity(checked.len());
