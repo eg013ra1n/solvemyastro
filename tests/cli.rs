@@ -113,6 +113,35 @@ fn info_reads_an_index_pack_folder() {
     }
     assert!(info.contains("quads"), "{info}");
     assert!(info.contains("min fov"), "{info}");
+
+    // The same folder with the pack folders gone, as on a machine where no pack is
+    // installed yet: the cached manifest alone is an index manifest, not a publish tree.
+    let only = tmp.path().join("smac_index_only");
+    fs::create_dir(&only).unwrap();
+    fs::write(
+        only.join(MANIFEST_FILE),
+        r#"{
+  "version": 1,
+  "format": 3,
+  "catalog_epoch": 2016.0,
+  "packs": [
+    {"name": "base", "zip": "index_base.zip", "sha256": "00", "dir": "base", "size_bytes": 123456, "min_fov_deg": 0.5},
+    {"name": "narrow", "zip": "index_narrow.zip", "sha256": "11", "dir": "narrow", "size_bytes": 654321, "min_fov_deg": 0.25}
+  ]
+}
+"#,
+    )
+    .unwrap();
+    let info = text(&ok(args!["info", only]).stdout);
+    assert!(info.starts_with("index manifest:"), "{info}");
+    assert!(info.contains("format 3") && info.contains("J2016"), "{info}");
+    assert!(info.contains("base: 123456 bytes, min fov 0.50 deg"), "{info}");
+    assert!(info.contains("narrow: 654321 bytes, min fov 0.25 deg"), "{info}");
+    assert!(!info.contains("publish:"), "{info}");
+
+    // Pack folders and a manifest together report both.
+    let info = text(&ok(args!["info", root]).stdout);
+    assert!(info.contains("index manifest") && info.contains("format 3"), "{info}");
 }
 
 #[test]

@@ -39,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rejected: ...` on stderr and nothing on stdout (`--no-gate` prints it). `--json`
   gains `rms_px`, `inlier_ratio`, `expected_in_fov` and `gate`.
 - `info` reports a bins folder's complete and partial cells by file range, and
-  each pack of an index folder (the app's `smac_index`).
+  each pack of an index folder (the app's `smac_index`), and reads a lone
+  `manifest.json` that is an index manifest (the app's cached one) as such.
 - Known issue: the acceptance gate's in-field radius takes the square root of
   the detected star count for the image side, so `expected_in_fov` comes out far
   too low and the dense-field ratio check rarely arms. A fix changes verdicts and

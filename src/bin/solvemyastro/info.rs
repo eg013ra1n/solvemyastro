@@ -87,6 +87,10 @@ fn index_packs(dir: &Path, packs: &[PathBuf]) -> Result<()> {
         println!("  {name}:");
         pack_lines(pack, "    ")?;
     }
+    if let Some(Manifests::Index(m)) = read_manifest(dir)? {
+        println!("index manifest: {}", dir.join(MANIFEST_FILE).display());
+        index_manifest_lines(&m);
+    }
     Ok(())
 }
 
@@ -167,25 +171,57 @@ fn bins(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn publish(dir: &Path) -> Result<()> {
-    println!("publish: {}", dir.display());
+/// What `manifest.json` holds: a publish tree's tier manifest, or the index
+/// manifest the app caches in its `smac_index` folder.
+enum Manifests {
+    Tiers(Manifest),
+    Index(IndexManifest),
+}
+
+/// The folder's `manifest.json`, told apart by its shape. `None` when there is none.
+fn read_manifest(dir: &Path) -> Result<Option<Manifests>> {
     let path = dir.join(MANIFEST_FILE);
-    if path.is_file() {
-        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let m = Manifest::from_json_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-        println!("  tiers (catalog epoch J{}):", m.catalog_epoch);
-        for t in &m.tiers {
-            println!("    {}: {} bytes, min fov {:.2} deg", t.zip, t.size_bytes, t.min_fov_deg);
-        }
+    if !path.is_file() {
+        return Ok(None);
     }
-    let path = dir.join(INDEX_MANIFEST_FILE);
-    if path.is_file() {
-        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let m = IndexManifest::from_json_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-        println!("  index packs (format {}, catalog epoch J{}):", m.format, m.catalog_epoch);
-        for p in &m.packs {
-            println!("    {}: {} bytes, min fov {:.2} deg", p.name, p.size_bytes, p.min_fov_deg);
+    let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    match Manifest::from_json_slice(&bytes) {
+        Ok(m) => Ok(Some(Manifests::Tiers(m))),
+        Err(tiers_err) => match IndexManifest::from_json_slice(&bytes) {
+            Ok(m) => Ok(Some(Manifests::Index(m))),
+            // Neither: the tier manifest's complaint is the one a publish tree needs.
+            Err(_) => Err(tiers_err).with_context(|| format!("parse {}", path.display())),
+        },
+    }
+}
+
+fn index_manifest_lines(m: &IndexManifest) {
+    println!("  index packs (format {}, catalog epoch J{}):", m.format, m.catalog_epoch);
+    for p in &m.packs {
+        println!("    {}: {} bytes, min fov {:.2} deg", p.name, p.size_bytes, p.min_fov_deg);
+    }
+}
+
+fn publish(dir: &Path) -> Result<()> {
+    let manifest = read_manifest(dir)?;
+    let index_file = dir.join(INDEX_MANIFEST_FILE);
+    // A `manifest.json` that is an index manifest, with no publish files beside it, is the app's cached one.
+    let index_only = matches!(manifest, Some(Manifests::Index(_))) && !index_file.is_file();
+    println!("{}: {}", if index_only { "index manifest" } else { "publish" }, dir.display());
+    match &manifest {
+        Some(Manifests::Tiers(m)) => {
+            println!("  tiers (catalog epoch J{}):", m.catalog_epoch);
+            for t in &m.tiers {
+                println!("    {}: {} bytes, min fov {:.2} deg", t.zip, t.size_bytes, t.min_fov_deg);
+            }
         }
+        Some(Manifests::Index(m)) => index_manifest_lines(m),
+        None => {}
+    }
+    if index_file.is_file() {
+        let bytes = std::fs::read(&index_file).with_context(|| format!("read {}", index_file.display()))?;
+        let m = IndexManifest::from_json_slice(&bytes).with_context(|| format!("parse {}", index_file.display()))?;
+        index_manifest_lines(&m);
     }
     Ok(())
 }
