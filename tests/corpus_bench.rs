@@ -3,10 +3,11 @@
 //! Run with:
 //!   cargo test -p solvemyastro --release --test corpus_bench -- --ignored --nocapture
 //!
-//! Data paths default to the bench machine's layout; override with
-//! `SOLVEMYASTRO_BENCH_DIR`, `SOLVEMYASTRO_SMAC_GAIA` and
-//! `SOLVEMYASTRO_SMAC_GAIA_BRIGHT` (and `SOLVEMYASTRO_TIER_DIR` for the
-//! tier-stack tests). The frames are published at
+//! Data paths default to a layout under `$HOME`; override with
+//! `SOLVEMYASTRO_BENCH_DIR` (default `$HOME/Pictures/Astro/Platesolve Bench`),
+//! `SOLVEMYASTRO_SMAC_GAIA` (default `$HOME/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia`)
+//! and `SOLVEMYASTRO_SMAC_GAIA_BRIGHT` (same with `smac_gaia_bright`); `SOLVEMYASTRO_TIER_DIR`
+//! sets the tier-stack tests' catalog. The frames are published at
 //! <https://artfrom.space/builds/platesolve_bench/platesolve_bench.zip> and
 //! the tier catalog at <https://artfrom.space/catalogs/>;
 //! `scripts/fetch_bench_data.sh <dest>` downloads and unpacks both.
@@ -30,13 +31,15 @@ use solvemyastro::{solve, SolveConfig, SolveHints, StarCache};
 // Corpus directory + cached reference-truth table
 // ---------------------------------------------------------------------------
 
-const BENCH_DIR: &str =
-    "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench";
-const SMAC_GAIA: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia";
+/// Default locations, relative to `$HOME`.
+const BENCH_DIR: &str = "Pictures/Astro/Platesolve Bench";
+const SMAC_GAIA: &str =
+    "Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia";
 /// Optional bright sub-catalog path. If present, the bench uses
 /// `Caches::tiered(&deep, &bright)`; if absent, it falls back to
 /// `Caches::deep_only(&deep)` (byte-identical to the pre-bright bench).
-const SMAC_GAIA_BRIGHT: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia_bright";
+const SMAC_GAIA_BRIGHT: &str =
+    "Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia_bright";
 
 /// Corpus directory: `$SOLVEMYASTRO_BENCH_DIR`, else [`BENCH_DIR`].
 fn bench_dir() -> PathBuf {
@@ -54,7 +57,9 @@ fn smac_gaia_bright_dir() -> PathBuf {
 }
 
 fn env_path_or(var: &str, default: &str) -> PathBuf {
-    std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(default))
+    std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(default)
+    })
 }
 
 /// Key: distinctive filename substring; value: (ra_deg, dec_deg, scale_arcsec_per_px)
@@ -311,7 +316,7 @@ fn hints_from_fits(hdr: &HashMap<String, String>, long_px: u32) -> SolveHints {
 
     // Pixel scale: use FOCALLEN + XPIXSZ from the native camera.
     // Exception: images with an existing plate-solved WCS (CRVAL1 present) may have
-    // been drizzled/resampled in PixInsight, where the FOCALLEN/CDELT1 metadata reflects
+    // been drizzled/resampled in a processing program, where the FOCALLEN/CDELT1 metadata reflects
     // the original sub-frame camera scale rather than the actual drizzled pixel scale.
     // For those, suppress the scale hint and let the solver do a full blind scale search
     // (it already has an accurate position hint from CRVAL1/CRVAL2, so only the scale

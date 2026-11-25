@@ -147,7 +147,7 @@ const MAX_MATCH_PX: f64 = 20.0;
 /// athenaeum refine.rs VERIFY_MAG_LIMIT). We use the deep catalog for quad
 /// matching, but only bright stars for inlier acceptance to avoid the
 /// `expected / 15%` floor being inflated by thousands of faint Gaia stars.
-const VERIFY_MAG_LIMIT: f32 = 12.0;
+pub(crate) const VERIFY_MAG_LIMIT: f32 = 12.0;
 
 // ---------------------------------------------------------------------------
 // FOV ladder
@@ -2039,7 +2039,7 @@ fn verify_trials(
             let required = required_inliers(verify_stars.len(), image_pts.len());
             v.required = required;
 
-            // Verification gate: Bayesian log-odds (astrometry.net style) by
+            // Verification gate: Bayesian log-odds (as in a common open solver) by
             // default; legacy 5%-of-FOV-inlier floor available behind
             // `use_bayesian_verify=false` for emergency revert.
             let gate_decision = if cfg.use_bayesian_verify {

@@ -192,6 +192,67 @@ impl Default for BuildParams {
     }
 }
 
+/// A published index pack: the build parameters and the density tiers it is
+/// built from. The two presets are what the published `base` and `narrow`
+/// packs were built with; a pack built any other way is not one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preset {
+    /// Depths 2-7 over the 500 stars/deg2 tier: fields from about 1.1 degrees up.
+    Base,
+    /// Depth 8 only, over the 500 and 2000 tiers: narrower fields.
+    Narrow,
+}
+
+impl Preset {
+    /// The pack's short name, also its directory and manifest name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Preset::Base => "base",
+            Preset::Narrow => "narrow",
+        }
+    }
+
+    /// The preset called `name`, if there is one.
+    pub fn from_name(name: &str) -> Option<Preset> {
+        match name {
+            "base" => Some(Preset::Base),
+            "narrow" => Some(Preset::Narrow),
+            _ => None,
+        }
+    }
+
+    /// The build parameters of the published pack.
+    pub fn params(self) -> BuildParams {
+        match self {
+            Preset::Base => BuildParams::default(),
+            Preset::Narrow => BuildParams { min_depth: 8, max_depth: 8, stars_per_cell: 10, quads_per_cell: 4 },
+        }
+    }
+
+    /// The tier directories (under the tiers folder) the pack's layers come
+    /// from, base layer first.
+    pub fn tier_dirs(self) -> &'static [&'static str] {
+        match self {
+            Preset::Base => &["tier_500"],
+            Preset::Narrow => &["tier_500", "tier_2000"],
+        }
+    }
+}
+
+/// Open the tier caches `preset` is built from, under `tiers_dir`. A tier the
+/// preset needs and the folder lacks is an error that names it.
+pub fn open_preset_layers(tiers_dir: &Path, preset: Preset) -> Result<Vec<StarCache>> {
+    preset
+        .tier_dirs()
+        .iter()
+        .map(|name| {
+            let dir = tiers_dir.join(name);
+            StarCache::open(&dir)
+                .with_context(|| format!("open {} (the {} pack needs it)", dir.display(), preset.name()))
+        })
+        .collect()
+}
+
 /// A uniform-selection star: magnitude and unit vector.
 type CellStar = (f32, [f64; 3]);
 
@@ -582,6 +643,12 @@ impl QuadIndex {
     /// its smallest quad. Narrower fields need a finer pack or the spiral.
     pub fn min_fov_deg(&self) -> f64 {
         self.bands.iter().map(|b| b.ab_lo).fold(f64::INFINITY, f64::min).to_degrees() * 4.0
+    }
+
+    /// The catalog epoch (Julian year) of the star layers the index was built
+    /// from, as its header records it.
+    pub fn catalog_epoch(&self) -> f64 {
+        f64_at(&self.mmap, 24)
     }
 
     fn code(&self, band: &Band, q: usize) -> [f64; 4] {

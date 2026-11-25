@@ -1,14 +1,19 @@
 [package]
 name = "solvemyastro"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Vilen Sharifov <vilen.sharifov@gmail.com>"]
-description = "Standalone astrometric plate solver — precise WCS with SIP distortion. Rust lib + CLI."
+description = "Standalone astrometric plate solver — precise WCS with SIP distortion. Rust lib + CLI, with the catalog tools that turn Gaia files into star catalogs and quad indexes."
 license = "Apache-2.0"
 repository = "https://github.com/eg013ra1n/solvemyastro"
 readme = "README.md"
 keywords = ["astronomy", "astrometry", "plate-solving", "wcs", "astrophotography"]
 categories = ["science", "command-line-utilities"]
+exclude = [".github/"]
+rust-version = "1.96"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "solvemyastro"
@@ -16,7 +21,27 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "solvemyastro"
-path = "src/main.rs"
+path = "src/bin/solvemyastro/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "gaia_ingest"
+required-features = ["catalog"]
+
+[[test]]
+name = "catalog_build"
+required-features = ["catalog"]
+
+[[test]]
+name = "cli"
+required-features = ["cli"]
+
+[features]
+default = []
+# The catalog layer: Gaia ingest, tier and index-pack writers, zip/hash helpers.
+catalog = ["dep:flate2", "dep:md-5", "dep:zip", "dep:sha2"]
+# The `solvemyastro` command.
+cli = ["catalog", "dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
 # FITS/XISF decode + raw star detection (ImageAnalyzer). solvemyastro adds
@@ -24,7 +49,8 @@ path = "src/main.rs"
 # detection stays in rustafits (dual-use). Crate package = `rustafits`,
 # lib = `astroimage`.
 # Versions pinned to the workspace lock to avoid duplicate crate versions
-# (project rule). CLI uses std::env::args (project convention — no clap).
+# (project rule). The `solvemyastro` command is clap-based and behind the
+# `cli` feature, so the library layer does not compile it.
 # By version so solvemyastro builds as a git dependency outside Athenaeum, which patches it back to its submodule.
 rustafits = "1.9.1"
 nalgebra = "0.35"
@@ -40,12 +66,17 @@ rand_xoshiro = "0.8"
 # Structured-logging facade only (no subscriber here). solvemyastro is a
 # library — events flow through whatever subscriber the embedding process
 # installs (the athenaeum host subscriber when used as a workspace dep;
-# emitted nowhere when run standalone with no subscriber installed, e.g.
-# the `solvemyastro` CLI binary, which keeps its own println/eprintln).
+# the `solvemyastro` command installs its own, from `tracing-subscriber`).
 tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# Optional layers, versions as in Athenaeum's lock (one version per shared crate).
+flate2 = { version = "1.0", optional = true }
+md-5 = { version = "0.11", optional = true }
+zip = { version = "8", default-features = false, features = ["deflate", "time"], optional = true }
+sha2 = { version = "0.11", optional = true }
+clap = { version = "4.6", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-# Machine-readable corpus-bench baseline (precision+speed regression gate).
-# Pinned to the workspace version to avoid duplicate crate versions.
-serde_json = "1"

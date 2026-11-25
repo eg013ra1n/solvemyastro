@@ -1,0 +1,402 @@
+//! The `solvemyastro` command, run as a process: the catalog chain from Gaia
+//! files to a publish tree, exit codes, and the stage commands' flags.
+
+mod common;
+
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
+
+use common::gaia_fixture::write_fixture;
+use solvemyastro::index::{build_index, BuildParams, INDEX_FILE};
+use solvemyastro::manifest::{INDEX_MANIFEST_FILE, MANIFEST_FILE};
+use solvemyastro::cache::build_cache;
+use solvemyastro::{StarCache, StarRecord};
+
+/// Run the binary with `args`; the log filter is left to the command.
+fn run(args: &[&std::ffi::OsStr]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_solvemyastro"))
+        .args(args)
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("the binary starts")
+}
+
+fn ok(args: &[&std::ffi::OsStr]) -> Output {
+    let out = run(args);
+    assert!(
+        out.status.success(),
+        "{args:?} exited {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// `&[&OsStr]` from literals and paths.
+macro_rules! args {
+    ($($a:expr),* $(,)?) => { &[$(std::ffi::OsStr::new(&$a)),*] };
+}
+
+/// The fixture's files ingested and cut into tiers under `root`.
+fn fixture_tiers(root: &Path) -> std::path::PathBuf {
+    let (gaia, bins, tiers) = (root.join("gaia"), root.join("bins"), root.join("tiers"));
+    fs::create_dir_all(&gaia).unwrap();
+    write_fixture(&gaia);
+    ok(args!["ingest", "--gaia", gaia, "--out", bins]);
+    ok(args!["build-tiers", "--bins", bins, "--out", tiers]);
+    tiers
+}
+
+#[test]
+fn cli_chain_runs_in_a_folder_with_a_space() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("a b");
+    let (gaia, bins, tiers) = (root.join("gaia"), root.join("bins"), root.join("tiers"));
+    let (packs, publish) = (root.join("packs"), root.join("publish"));
+    fs::create_dir_all(&gaia).unwrap();
+    write_fixture(&gaia);
+
+    ok(args!["ingest", "--gaia", gaia, "--out", bins]);
+    ok(args!["build-tiers", "--bins", bins, "--out", tiers]);
+    let base = packs.join("base");
+    ok(args!["build-index", "--tiers", tiers, "--out", base, "--min-depth", "2", "--max-depth", "3"]);
+    let index_arg = format!("base={}", base.display());
+    ok(args!["package", "--tiers", tiers, "--index", index_arg, "--out", publish]);
+
+    let info = text(&ok(args!["info", bins]).stdout);
+    assert!(info.lines().any(|l| l.starts_with("complete cells: 1")), "{info}");
+    assert!(info.contains("complete by file range"), "{info}");
+    let info = text(&ok(args!["info", tiers]).stdout);
+    for tier in ["tier_500", "tier_2000", "tier_5000", "tier_8000"] {
+        assert!(info.contains(tier), "{tier} missing from:\n{info}");
+    }
+    let info = text(&ok(args!["info", base]).stdout);
+    assert!(info.contains("quads"), "{info}");
+    assert!(info.contains("min fov"), "{info}");
+    ok(args!["info", tiers.join("tier_500")]);
+    ok(args!["cache-info", tiers.join("tier_500")]);
+    let info = text(&ok(args!["info", publish]).stdout);
+    assert!(info.contains("base"), "{info}");
+
+    assert!(publish.join(MANIFEST_FILE).is_file());
+    assert!(publish.join(INDEX_MANIFEST_FILE).is_file());
+    assert!(publish.join("tier_500.zip").is_file());
+    assert!(publish.join("index_base.zip").is_file());
+}
+
+#[test]
+fn info_reads_an_index_pack_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tiers = fixture_tiers(tmp.path());
+    // The shape of the app's `smac_index` folder: a pack per subfolder and the
+    // index manifest it cached, which is not a tier manifest.
+    let root = tmp.path().join("smac_index");
+    for name in ["base", "narrow"] {
+        let pack = root.join(name);
+        ok(args!["build-index", "--tiers", tiers, "--out", pack, "--min-depth", "2", "--max-depth", "3"]);
+    }
+    fs::write(
+        root.join(MANIFEST_FILE),
+        r#"{"version":1,"format":3,"catalog_epoch":2016.0,"packs":[]}"#,
+    )
+    .unwrap();
+
+    let out = ok(args!["info", root]);
+    let info = text(&out.stdout);
+    for name in ["base", "narrow"] {
+        assert!(info.lines().any(|l| l.trim_start().starts_with(&format!("{name}:"))), "{name} missing from:\n{info}");
+    }
+    assert!(info.contains("quads"), "{info}");
+    assert!(info.contains("min fov"), "{info}");
+
+    // The same folder with the pack folders gone, as on a machine where no pack is
+    // installed yet: the cached manifest alone is an index manifest, not a publish tree.
+    let only = tmp.path().join("smac_index_only");
+    fs::create_dir(&only).unwrap();
+    fs::write(
+        only.join(MANIFEST_FILE),
+        r#"{
+  "version": 1,
+  "format": 3,
+  "catalog_epoch": 2016.0,
+  "packs": [
+    {"name": "base", "zip": "index_base.zip", "sha256": "00", "dir": "base", "size_bytes": 123456, "min_fov_deg": 0.5},
+    {"name": "narrow", "zip": "index_narrow.zip", "sha256": "11", "dir": "narrow", "size_bytes": 654321, "min_fov_deg": 0.25}
+  ]
+}
+"#,
+    )
+    .unwrap();
+    let info = text(&ok(args!["info", only]).stdout);
+    assert!(info.starts_with("index manifest:"), "{info}");
+    assert!(info.contains("format 3") && info.contains("J2016"), "{info}");
+    assert!(info.contains("base: 123456 bytes, min fov 0.50 deg"), "{info}");
+    assert!(info.contains("narrow: 654321 bytes, min fov 0.25 deg"), "{info}");
+    assert!(!info.contains("publish:"), "{info}");
+
+    // Pack folders and a manifest together report both.
+    let info = text(&ok(args!["info", root]).stdout);
+    assert!(info.contains("index manifest") && info.contains("format 3"), "{info}");
+}
+
+#[test]
+fn info_does_not_take_a_partial_tier_folder_for_a_tier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tiers = fixture_tiers(tmp.path());
+    let only_partial = tmp.path().join("only_partial");
+    fs::create_dir(&only_partial).unwrap();
+    fs::rename(tiers.join("tier_500"), only_partial.join("tier_500.partial")).unwrap();
+    let out = run(args!["info", only_partial]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(text(&out.stderr).contains("holds no"), "{}", text(&out.stderr));
+}
+
+#[test]
+fn ingest_into_a_filled_folder_exits_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gaia, bins) = (tmp.path().join("gaia"), tmp.path().join("bins"));
+    fs::create_dir(&gaia).unwrap();
+    write_fixture(&gaia);
+    ok(args!["ingest", "--gaia", gaia, "--out", bins]);
+
+    let out = run(args!["ingest", "--gaia", gaia, "--out", bins]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("already holds bins"), "{err}");
+    assert!(err.starts_with("error: ") || err.contains("\nerror: "), "{err}");
+}
+
+#[test]
+fn bad_arguments_exit_2() {
+    let out = run(args!["build-index", "--preset", "base", "--min-depth", "3", "--tiers", "t", "--out", "o"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    let out = run(args!["no-such-command"]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = run(args!["build-cache", "--out", "o"]);
+    assert_eq!(out.status.code(), Some(2), "a source folder is required");
+    let out = run(args!["build-cache", "--bins", "a", "--from", "b", "--out", "o"]);
+    assert_eq!(out.status.code(), Some(2), "the two sources exclude each other");
+}
+
+#[test]
+fn solve_without_a_catalog_exits_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let image = tmp.path().join("frame.fits");
+    fs::write(&image, b"not a frame").unwrap();
+    let out = run(args!["solve", image]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let err = text(&out.stderr);
+    assert!(err.contains("--catalog") && err.contains("--tiers"), "{err}");
+}
+
+#[test]
+fn package_without_an_input_exits_1_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let publish = tmp.path().join("publish");
+    let out = run(args!["package", "--out", publish]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!publish.exists());
+    let out = run(args!["package", "--index", "no-equals-sign", "--out", publish]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+}
+
+/// A full-sky synthetic cache in `dir`: the fixture's tiers only fill one cell,
+/// which the index of a second layer cannot be told from the first by.
+fn sky_tier(dir: &Path) {
+    let mut s = 7u64;
+    let mut rnd = || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (s >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let stars: Vec<StarRecord> = (0..20_000)
+        .map(|_| StarRecord {
+            ra: rnd() * 360.0,
+            dec: (rnd() * 2.0 - 1.0).asin().to_degrees(),
+            mag: (14.0 + rnd() * 2.0) as f32,
+            pmra_mas_yr: 0.0,
+            pmdec_mas_yr: 0.0,
+        })
+        .collect();
+    build_cache(stars, dir, 2016.0, |_| {}).unwrap();
+}
+
+#[test]
+fn build_index_without_preset_keeps_todays_layers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tiers = fixture_tiers(tmp.path());
+    // The fixture's tier_500 and a tier_2000 that covers the whole sky.
+    fs::remove_dir_all(tiers.join("tier_2000")).unwrap();
+    sky_tier(&tiers.join("tier_2000"));
+    let out_dir = tmp.path().join("cli-pack");
+    ok(args![
+        "build-index", "--tiers", tiers, "--out", out_dir, "--min-depth", "2", "--max-depth", "2",
+        "--stars-per-cell", "12", "--quads-per-cell", "5"
+    ]);
+
+    let (l500, l2000) = (
+        StarCache::open(&tiers.join("tier_500")).unwrap(),
+        StarCache::open(&tiers.join("tier_2000")).unwrap(),
+    );
+    let params = BuildParams { min_depth: 2, max_depth: 2, stars_per_cell: 12, quads_per_cell: 5 };
+    let direct = tmp.path().join("direct-pack");
+    build_index(&[&l500, &l2000], &direct, &params, |_| {}).unwrap();
+    let built = fs::read(out_dir.join(INDEX_FILE)).unwrap();
+    assert_eq!(built, fs::read(direct.join(INDEX_FILE)).unwrap());
+
+    // The second layer is part of the pack: the test can tell it from the base layer alone.
+    let alone = tmp.path().join("alone-pack");
+    build_index(&[&l500], &alone, &params, |_| {}).unwrap();
+    assert!(built != fs::read(alone.join(INDEX_FILE)).unwrap(), "tier_2000 changes nothing here");
+}
+
+#[test]
+fn build_index_preset_names_the_missing_tier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tiers = fixture_tiers(tmp.path());
+    fs::remove_dir_all(tiers.join("tier_2000")).unwrap();
+    let out = run(args!["build-index", "--preset", "narrow", "--tiers", tiers, "--out", tmp.path().join("p")]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("tier_2000"), "{}", text(&out.stderr));
+}
+
+#[test]
+fn log_file_gets_json_lines_and_quiet_silences_progress() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gaia, bins, log) = (tmp.path().join("gaia"), tmp.path().join("bins"), tmp.path().join("run.jsonl"));
+    fs::create_dir(&gaia).unwrap();
+    write_fixture(&gaia);
+    let out = ok(args!["--log", log, "-q", "ingest", "--gaia", gaia, "--out", bins]);
+    assert!(!text(&out.stderr).contains("INFO"), "{}", text(&out.stderr));
+
+    let lines = fs::read_to_string(&log).unwrap();
+    assert!(!lines.trim().is_empty(), "the log file is empty");
+    for line in lines.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        assert!(v.get("fields").is_some(), "{line}");
+    }
+    assert!(lines.contains("gaia ingest complete"), "{lines}");
+}
+
+#[test]
+fn build_cache_takes_bins_or_from() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gaia, bins) = (tmp.path().join("gaia"), tmp.path().join("bins"));
+    fs::create_dir(&gaia).unwrap();
+    write_fixture(&gaia);
+    ok(args!["ingest", "--gaia", gaia, "--out", bins]);
+    let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+    ok(args!["build-cache", "--bins", bins, "--out", a]);
+    ok(args!["build-cache", "--from", bins, "--out", b]);
+    assert_eq!(fs::read(a.join("stars.smac")).unwrap(), fs::read(b.join("stars.smac")).unwrap());
+    let info = text(&ok(args!["info", a]).stdout);
+    assert!(info.contains("stars"), "{info}");
+}
+
+#[test]
+fn build_bright_cache_writes_a_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gaia, bins, deep, bright) =
+        (tmp.path().join("gaia"), tmp.path().join("bins"), tmp.path().join("deep"), tmp.path().join("bright"));
+    fs::create_dir(&gaia).unwrap();
+    write_fixture(&gaia);
+    ok(args!["ingest", "--gaia", gaia, "--out", bins]);
+    ok(args!["build-cache", "--bins", bins, "--out", deep]);
+    ok(args!["build-bright-cache", "--from", deep, "--out", bright, "--target-density", "50", "--mode", "cap-only"]);
+    let meta = fs::read_to_string(bright.join("bright.meta.json")).unwrap();
+    assert!(meta.contains("\"mode\": \"cap-only\""), "{meta}");
+    let out = run(args!["build-bright-cache", "--from", deep, "--out", bright, "--mode", "sideways"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// The first `healpix_NNNNNN.bin` in `bins`, by name.
+fn first_bin(bins: &Path) -> std::path::PathBuf {
+    let mut names: Vec<_> = fs::read_dir(bins)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("healpix_") && n.ends_with(".bin")))
+        .collect();
+    names.sort();
+    names.into_iter().next().expect("the fixture writes at least one bin")
+}
+
+#[test]
+fn build_cache_refuses_a_torn_bin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gaia, bins, out_dir) = (tmp.path().join("gaia"), tmp.path().join("bins"), tmp.path().join("out"));
+    fs::create_dir(&gaia).unwrap();
+    write_fixture(&gaia);
+    ok(args!["ingest", "--gaia", gaia, "--out", bins]);
+    let torn = first_bin(&bins);
+    let len = fs::metadata(&torn).unwrap().len();
+    assert!(len > 3 && len % 14 == 0, "the fixture's bin is whole records");
+    fs::OpenOptions::new().write(true).open(&torn).unwrap().set_len(len - 3).unwrap();
+
+    for flag in ["--bins", "--from"] {
+        let out = run(args!["build-cache", flag, bins, "--out", out_dir]);
+        assert_eq!(out.status.code(), Some(1), "{flag}");
+        let err = text(&out.stderr);
+        let name = torn.file_name().unwrap().to_str().unwrap();
+        assert!(err.contains(name), "{flag}: the torn bin {name} is not named in:\n{err}");
+        assert!(!out_dir.join("stars.smac").exists(), "{flag}: a refused build leaves no cache");
+    }
+}
+
+#[test]
+fn build_bright_cache_refuses_an_unreadable_pixel_and_removes_its_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gaia, bins, deep, bright) =
+        (tmp.path().join("gaia"), tmp.path().join("bins"), tmp.path().join("deep"), tmp.path().join("bright"));
+    fs::create_dir(&gaia).unwrap();
+    write_fixture(&gaia);
+    ok(args!["ingest", "--gaia", gaia, "--out", bins]);
+    ok(args!["build-cache", "--bins", bins, "--out", deep]);
+
+    // Point one filled pixel's directory entry (12 bytes after a 64-byte header:
+    // u64 offset, u32 count) far beyond the end of the file.
+    let px = {
+        let cache = StarCache::open(&deep).unwrap();
+        (0..49_152u64).find(|&p| !cache.iter_pixel_records(p).unwrap().is_empty()).expect("a filled pixel")
+    };
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = fs::OpenOptions::new().write(true).open(deep.join("stars.smac")).unwrap();
+        f.seek(SeekFrom::Start(64 + px * 12)).unwrap();
+        f.write_all(&(1u64 << 40).to_le_bytes()).unwrap();
+    }
+
+    let out = run(args!["build-bright-cache", "--from", deep, "--out", bright, "--mode", "cap-only"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(err.contains(&format!("pixel {px}")), "the pixel is not named in:\n{err}");
+    assert!(err.contains("deep"), "the source folder is not named in:\n{err}");
+    assert!(!bright.join("stars.smac").exists(), "the half-written cache is removed");
+    assert!(!bright.join("bright.meta.json").exists(), "no sidecar for a failed build");
+}
+
+#[test]
+fn package_refuses_repeated_pack_names_before_writing_the_tiers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tiers = fixture_tiers(tmp.path());
+    let publish = tmp.path().join("publish");
+    let pack = tmp.path().join("pack");
+    ok(args!["build-index", "--tiers", tiers, "--out", pack, "--min-depth", "2", "--max-depth", "3"]);
+    let (a, b) = (format!("a={}", pack.display()), format!("A={}", pack.display()));
+    let out = run(args!["package", "--tiers", tiers, "--index", a, "--index", b, "--out", publish]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("differ by case only"), "{}", text(&out.stderr));
+    assert!(!publish.exists(), "the tiers are not written when an index name is refused");
+}
+
+#[test]
+fn solve_position_flags_need_each_other() {
+    let out = run(args!["solve", "frame.fits", "--tiers", "t", "--ra", "10"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    let out = run(args!["solve", "frame.fits", "--tiers", "t", "--dec", "-10"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+}

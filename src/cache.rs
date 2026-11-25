@@ -1214,6 +1214,26 @@ mod tests {
     use byteorder::WriteBytesExt;
     use tempfile::TempDir;
 
+    /// Bench frames: `$SOLVEMYASTRO_BENCH_DIR`, else `$HOME/Pictures/Astro/Platesolve Bench`.
+    fn bench_dir() -> std::path::PathBuf {
+        std::env::var_os("SOLVEMYASTRO_BENCH_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                    .join("Pictures/Astro/Platesolve Bench")
+            })
+    }
+
+    /// Deep catalog: `$SOLVEMYASTRO_SMAC_GAIA`, else the Athenaeum app-data `smac_gaia` under `$HOME`.
+    fn gaia_dir() -> std::path::PathBuf {
+        std::env::var_os("SOLVEMYASTRO_SMAC_GAIA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                    .join("Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia")
+            })
+    }
+
     #[test]
     fn parallel_builder_writes_correct_pixels() {
         let tmp = TempDir::new().unwrap();
@@ -2101,13 +2121,8 @@ mod tests {
         use astroimage::ImageAnalyzer;
         use crate::wcs::WcsSolution;
 
-        let m78_path = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench/\
-             2024-01-13_20-27-32_L_-10.00_120.00s_0081.fits",
-        );
-        let home = std::env::var("HOME").expect("$HOME not set");
-        let smac_gaia = std::path::PathBuf::from(&home)
-            .join("Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia");
+        let m78_path = bench_dir().join("2024-01-13_20-27-32_L_-10.00_120.00s_0081.fits");
+        let smac_gaia = gaia_dir();
 
         if !m78_path.exists() {
             println!("SKIP detection_adequacy_m78: M78 frame not found at {}", m78_path.display());
@@ -2290,12 +2305,10 @@ mod tests {
     fn diag_truth_wcs_match() {
         use astroimage::ImageAnalyzer;
         use crate::wcs::WcsSolution;
-        let bench = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench",
-        );
-        let smac = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia",
-        );
+        let bench = bench_dir();
+        let bench = bench.as_path();
+        let smac = gaia_dir();
+        let smac = smac.as_path();
         if !bench.is_dir() || !smac.is_dir() {
             eprintln!("SKIP diag_truth_wcs_match: bench dir or smac_gaia missing");
             return;
@@ -2459,12 +2472,10 @@ mod tests {
     fn diag_dump_2_18_detections() {
         use astroimage::ImageAnalyzer;
         use crate::wcs::WcsSolution;
-        let path = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench/2_18_r_1_P.fit",
-        );
-        let smac = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia",
-        );
+        let path = bench_dir().join("2_18_r_1_P.fit");
+        let path = path.as_path();
+        let smac = gaia_dir();
+        let smac = smac.as_path();
         if !path.exists() || !smac.is_dir() {
             eprintln!("SKIP diag_dump_2_18_detections: frame or smac_gaia missing");
             return;
@@ -2539,9 +2550,8 @@ mod tests {
     #[ignore = "needs bench frames"]
     fn diag_phase3_saturation_histogram() {
         use astroimage::ImageAnalyzer;
-        let bench = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench",
-        );
+        let bench = bench_dir();
+        let bench = bench.as_path();
         if !bench.is_dir() {
             eprintln!("SKIP: bench dir missing");
             return;
@@ -2672,9 +2682,8 @@ mod tests {
     #[test]
     #[ignore = "needs ~/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia"]
     fn diag_real_cache_panic_region() {
-        let cache_dir = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia",
-        );
+        let cache_dir = gaia_dir();
+        let cache_dir = cache_dir.as_path();
         if !cache_dir.exists() {
             eprintln!("SKIP: smac_gaia cache not present");
             return;
@@ -2713,12 +2722,10 @@ mod tests {
     #[ignore = "needs the bench frame + smac_gaia cache"]
     fn diag_solve_3_18_r_01_P() {
         use crate::{SolveConfig, SolveHints};
-        let cache_dir = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia",
-        );
-        let image = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench/3_18_r_01_P.fit",
-        );
+        let cache_dir = gaia_dir();
+        let cache_dir = cache_dir.as_path();
+        let image = bench_dir().join("3_18_r_01_P.fit");
+        let image = image.as_path();
         if !cache_dir.exists() || !image.exists() {
             eprintln!("SKIP: cache or image missing");
             return;
@@ -2768,12 +2775,10 @@ mod tests {
     #[ignore = "needs the bench frame + smac_gaia cache"]
     fn diag_solve_1_18_r_1_p() {
         use crate::{SolveConfig, SolveHints};
-        let cache_dir = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia",
-        );
-        let image = std::path::Path::new(
-            "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench/1_18_r_1_P.fit",
-        );
+        let cache_dir = gaia_dir();
+        let cache_dir = cache_dir.as_path();
+        let image = bench_dir().join("1_18_r_1_P.fit");
+        let image = image.as_path();
         if !cache_dir.exists() || !image.exists() {
             eprintln!("SKIP: cache or image missing");
             return;

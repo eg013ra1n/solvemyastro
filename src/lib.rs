@@ -14,18 +14,29 @@ use std::path::Path;
 
 use anyhow::Result;
 
+pub mod accept;
+pub mod bins;
 pub mod cache;
 pub mod diag;
+#[cfg(feature = "catalog")]
+pub mod gaia;
+pub mod healpix;
 pub mod index;
+pub mod layout;
+pub mod manifest;
 pub(crate) mod math;
 pub(crate) mod nn;
 pub mod orchestrate;
+#[cfg(feature = "catalog")]
+pub mod package;
 pub mod project;
 pub mod quad;
 pub mod register;
 pub(crate) mod refine;
 pub mod select;
 pub mod sip;
+#[cfg(feature = "catalog")]
+pub mod tiers;
 pub mod verify;
 pub mod wcs;
 pub mod wcs_fit;
@@ -163,7 +174,7 @@ pub struct SolveConfig {
     /// Set to `true` from `corpus_bench` and ad-hoc profiling to see where
     /// wall-clock actually goes.
     pub print_timing: bool,
-    /// Use the Bayesian log-odds verification gate (astrometry.net style).
+    /// Use the Bayesian log-odds verification gate (the standard Bayesian verification of a common open solver).
     /// Default `true`. When `false`, falls back to the legacy 5%-of-FOV
     /// inlier floor (kept for emergency revert; documented to over-reject
     /// valid solves in dense fields).
