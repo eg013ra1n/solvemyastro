@@ -181,7 +181,7 @@ pub struct VerifyTrace {
     /// is rejected — a tight seed_rms with low inliers means the gate threw
     /// away a valid near-miss; a loose seed_rms means the matches were noise.
     pub seed_rms_px: f64,
-    /// Bayesian log-odds for the seed-stage inliers (astrometry.net formula).
+    /// Bayesian log-odds for the seed-stage inliers (the standard Bayesian verification formula).
     /// `f64::NEG_INFINITY` when the gate was not evaluated (e.g. legacy
     /// `use_bayesian_verify=false` path or pre-verify reject).
     pub log_odds: f64,

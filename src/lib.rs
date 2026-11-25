@@ -174,7 +174,7 @@ pub struct SolveConfig {
     /// Set to `true` from `corpus_bench` and ad-hoc profiling to see where
     /// wall-clock actually goes.
     pub print_timing: bool,
-    /// Use the Bayesian log-odds verification gate (astrometry.net style).
+    /// Use the Bayesian log-odds verification gate (the standard Bayesian verification of a common open solver).
     /// Default `true`. When `false`, falls back to the legacy 5%-of-FOV
     /// inlier floor (kept for emergency revert; documented to over-reject
     /// valid solves in dense fields).

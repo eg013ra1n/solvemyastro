@@ -311,7 +311,7 @@ fn hints_from_fits(hdr: &HashMap<String, String>, long_px: u32) -> SolveHints {
 
     // Pixel scale: use FOCALLEN + XPIXSZ from the native camera.
     // Exception: images with an existing plate-solved WCS (CRVAL1 present) may have
-    // been drizzled/resampled in PixInsight, where the FOCALLEN/CDELT1 metadata reflects
+    // been drizzled/resampled in a processing program, where the FOCALLEN/CDELT1 metadata reflects
     // the original sub-frame camera scale rather than the actual drizzled pixel scale.
     // For those, suppress the scale hint and let the solver do a full blind scale search
     // (it already has an accurate position hint from CRVAL1/CRVAL2, so only the scale

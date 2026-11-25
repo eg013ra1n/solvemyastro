@@ -1,4 +1,4 @@
-//! Bayesian log-odds verification (astrometry.net style).
+//! Bayesian log-odds verification (the formula of a common open solver).
 //!
 //! Replaces the brittle 5%-of-FOV-catalog inlier floor with a principled
 //! foreground-vs-background log-likelihood ratio. The Bayesian gate is
@@ -11,7 +11,7 @@
 //! - Tighter centroid residuals → matches contribute dramatically more →
 //!   rewards centroid accuracy.
 //!
-//! Formula (per [astrometry.net's verify.c](https://github.com/dstndstn/astrometry.net/blob/main/solver/verify.c)):
+//! Formula (foreground-vs-background log-likelihood ratio over the matched stars):
 //!
 //! ```text
 //! log_odds = Σ_{matched stars} (log_fg_i - log_bg)
@@ -25,13 +25,13 @@
 //! - `A`  = search area (px²)
 //! - `d_i`= pixel distance of each inlier from its predicted position
 
-/// Default acceptance threshold (astrometry.net's `DLOG_ODDS_MIN`).
+/// Default acceptance threshold (the value a common open solver uses).
 /// `log(1e6) ≈ 13.815` — odds 1,000,000:1 in favour of the WCS being correct.
 pub const DEFAULT_LOG_ODDS_MIN: f64 = 13.815_510_557_964_274; // log(1e6)
 
 /// Default distractor fraction. 0.25 means we expect ~25% of catalog stars in
 /// FOV to have no matching detection (below detection threshold, masked,
-/// near edge, etc.). Matches astrometry.net's default.
+/// near edge, etc.). Matches the default of a common open solver.
 pub const DEFAULT_DISTRACTOR_FRACTION: f64 = 0.25;
 
 /// Safety floor: a candidate must have at least this many inliers regardless

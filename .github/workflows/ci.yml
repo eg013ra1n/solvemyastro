@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Every feature layer on Linux: the base library, the catalog layer, the command (which holds the catalog layer), and all.
+  linux:
+    name: Linux (${{ matrix.features.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - { name: base, args: "" }
+          - { name: catalog, args: "--features catalog" }
+          - { name: cli, args: "--features cli" }
+          - { name: all, args: "--all-features" }
+    steps:
+      - uses: actions/checkout@v5
+      # rustup reads rust-toolchain.toml and installs what it pins on the first call that needs it.
+      - name: Resolve the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features.name }}
+      - name: Test
+        run: cargo test --locked ${{ matrix.features.args }}
+      # The binary installs as a user would install it and starts.
+      - name: Install the solvemyastro command
+        if: matrix.features.name == 'cli'
+        run: |
+          cargo install --path . --features cli --locked --root "$RUNNER_TEMP/sma"
+          "$RUNNER_TEMP/sma/bin/solvemyastro" --version
+
+  # All layers on the other two platforms.
+  platforms:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked --all-features
+
+  # What crates.io would receive builds from the packaged tree.
+  publish-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --locked

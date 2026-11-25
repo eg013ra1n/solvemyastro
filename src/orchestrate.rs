@@ -2039,7 +2039,7 @@ fn verify_trials(
             let required = required_inliers(verify_stars.len(), image_pts.len());
             v.required = required;
 
-            // Verification gate: Bayesian log-odds (astrometry.net style) by
+            // Verification gate: Bayesian log-odds (as in a common open solver) by
             // default; legacy 5%-of-FOV-inlier floor available behind
             // `use_bayesian_verify=false` for emergency revert.
             let gate_decision = if cfg.use_bayesian_verify {
