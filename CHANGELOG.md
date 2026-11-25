@@ -5,7 +5,7 @@ All notable changes to solvemyastro will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] — unreleased
+## [0.3.0] — 2026-11-26
 
 ### Catalog building moves here
 
@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build and names the file.
 - `ingest` reads a file the `_MD5SUM.txt` list does not name (with a warning that
   names it); `--verify` refuses the run instead, naming it.
-  `package_index` refuses pack names that differ by case only.
+- `package_index` refuses pack names that differ by case only.
 
 ### The `solvemyastro` command
 
