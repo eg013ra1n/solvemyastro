@@ -1,7 +1,7 @@
 //! Solves the "Pane 4" bench frame with the deep catalog only.
 //!
-//! The data paths come from `$SMA_BENCH_DIR` (default `$HOME/Pictures/Astro/Platesolve Bench`)
-//! and `$SMA_GAIA_DIR` (default
+//! The data paths come from `$SOLVEMYASTRO_BENCH_DIR` (default `$HOME/Pictures/Astro/Platesolve Bench`)
+//! and `$SOLVEMYASTRO_SMAC_GAIA` (default
 //! `$HOME/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia`).
 
 fn env_dir(var: &str, under_home: &str) -> std::path::PathBuf {
@@ -13,7 +13,7 @@ fn env_dir(var: &str, under_home: &str) -> std::path::PathBuf {
 fn main() {
     let cache = solvemyastro::StarCache::open(
         &env_dir(
-            "SMA_GAIA_DIR",
+            "SOLVEMYASTRO_SMAC_GAIA",
             "Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia",
         ),
     ).unwrap();
@@ -28,7 +28,7 @@ fn main() {
         epoch: None,
     };
     let cfg = solvemyastro::SolveConfig::default();
-    let path = env_dir("SMA_BENCH_DIR", "Pictures/Astro/Platesolve Bench")
+    let path = env_dir("SOLVEMYASTRO_BENCH_DIR", "Pictures/Astro/Platesolve Bench")
         .join("Light_Pane 4_300.0s_Bin1_O_gain111_20211011-024956_-10.0C_0002_c_lps_r.xisf");
     let path = path.as_path();
 

@@ -112,7 +112,7 @@ downloads both sets and unpacks them:
   `tier_8000`, SHA-256 checked) → `<dest>/catalogs`
 
 ```
-SMA_BENCH_DIR=<dest>/bench SOLVEMYASTRO_TIER_DIR=<dest>/catalogs \
+SOLVEMYASTRO_BENCH_DIR=<dest>/bench SOLVEMYASTRO_TIER_DIR=<dest>/catalogs \
   cargo test --release --test corpus_bench -- --ignored corpus_layered_tiers --nocapture
 ```
 

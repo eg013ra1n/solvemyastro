@@ -4,9 +4,9 @@
 //!   cargo test -p solvemyastro --release --test corpus_bench -- --ignored --nocapture
 //!
 //! Data paths default to a layout under `$HOME`; override with
-//! `SMA_BENCH_DIR` (default `$HOME/Pictures/Astro/Platesolve Bench`),
-//! `SMA_GAIA_DIR` (default `$HOME/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia`)
-//! and `SMA_GAIA_BRIGHT_DIR` (same with `smac_gaia_bright`); `SOLVEMYASTRO_TIER_DIR`
+//! `SOLVEMYASTRO_BENCH_DIR` (default `$HOME/Pictures/Astro/Platesolve Bench`),
+//! `SOLVEMYASTRO_SMAC_GAIA` (default `$HOME/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia`)
+//! and `SOLVEMYASTRO_SMAC_GAIA_BRIGHT` (same with `smac_gaia_bright`); `SOLVEMYASTRO_TIER_DIR`
 //! sets the tier-stack tests' catalog. The frames are published at
 //! <https://artfrom.space/builds/platesolve_bench/platesolve_bench.zip> and
 //! the tier catalog at <https://artfrom.space/catalogs/>;
@@ -41,19 +41,19 @@ const SMAC_GAIA: &str =
 const SMAC_GAIA_BRIGHT: &str =
     "Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia_bright";
 
-/// Corpus directory: `$SMA_BENCH_DIR`, else [`BENCH_DIR`].
+/// Corpus directory: `$SOLVEMYASTRO_BENCH_DIR`, else [`BENCH_DIR`].
 fn bench_dir() -> PathBuf {
-    env_path_or("SMA_BENCH_DIR", BENCH_DIR)
+    env_path_or("SOLVEMYASTRO_BENCH_DIR", BENCH_DIR)
 }
 
-/// Deep catalog: `$SMA_GAIA_DIR`, else [`SMAC_GAIA`].
+/// Deep catalog: `$SOLVEMYASTRO_SMAC_GAIA`, else [`SMAC_GAIA`].
 fn smac_gaia_dir() -> PathBuf {
-    env_path_or("SMA_GAIA_DIR", SMAC_GAIA)
+    env_path_or("SOLVEMYASTRO_SMAC_GAIA", SMAC_GAIA)
 }
 
-/// Bright sub-catalog: `$SMA_GAIA_BRIGHT_DIR`, else [`SMAC_GAIA_BRIGHT`].
+/// Bright sub-catalog: `$SOLVEMYASTRO_SMAC_GAIA_BRIGHT`, else [`SMAC_GAIA_BRIGHT`].
 fn smac_gaia_bright_dir() -> PathBuf {
-    env_path_or("SMA_GAIA_BRIGHT_DIR", SMAC_GAIA_BRIGHT)
+    env_path_or("SOLVEMYASTRO_SMAC_GAIA_BRIGHT", SMAC_GAIA_BRIGHT)
 }
 
 fn env_path_or(var: &str, default: &str) -> PathBuf {

@@ -22,7 +22,7 @@
 //! Run:
 //!   cargo test -p solvemyastro --test catalog_truth -- --ignored --nocapture
 //!
-//! Catalog path: `$SMA_GAIA_DIR` or the default app-data location.
+//! Catalog path: `$SOLVEMYASTRO_SMAC_GAIA` or the default app-data location.
 
 use std::path::PathBuf;
 
@@ -42,7 +42,7 @@ const CATALOG_EPOCH: f64 = 2016.0;
 /// Magnitude ceiling — must match how the catalog was built (Gaia G < 16).
 const MAG_LIMIT: f32 = 16.0;
 
-/// Default catalog location under `$HOME` when `$SMA_GAIA_DIR` is unset.
+/// Default catalog location under `$HOME` when `$SOLVEMYASTRO_SMAC_GAIA` is unset.
 const DEFAULT_SMAC_GAIA: &str =
     "Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia";
 
@@ -147,7 +147,7 @@ fn sep_arcsec(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
 }
 
 fn smac_gaia_path() -> PathBuf {
-    std::env::var("SMA_GAIA_DIR")
+    std::env::var("SOLVEMYASTRO_SMAC_GAIA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(DEFAULT_SMAC_GAIA)
@@ -168,7 +168,7 @@ fn catalog_matches_gaia_dr3_truth() {
     if !cache_dir.is_dir() {
         println!(
             "SKIP catalog_truth: smac_gaia not found at {}\n\
-             Set $SMA_GAIA_DIR to override.",
+             Set $SOLVEMYASTRO_SMAC_GAIA to override.",
             cache_dir.display()
         );
         return;

@@ -1214,9 +1214,9 @@ mod tests {
     use byteorder::WriteBytesExt;
     use tempfile::TempDir;
 
-    /// Bench frames: `$SMA_BENCH_DIR`, else `$HOME/Pictures/Astro/Platesolve Bench`.
+    /// Bench frames: `$SOLVEMYASTRO_BENCH_DIR`, else `$HOME/Pictures/Astro/Platesolve Bench`.
     fn bench_dir() -> std::path::PathBuf {
-        std::env::var_os("SMA_BENCH_DIR")
+        std::env::var_os("SOLVEMYASTRO_BENCH_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
@@ -1224,9 +1224,9 @@ mod tests {
             })
     }
 
-    /// Deep catalog: `$SMA_GAIA_DIR`, else the Athenaeum app-data `smac_gaia` under `$HOME`.
+    /// Deep catalog: `$SOLVEMYASTRO_SMAC_GAIA`, else the Athenaeum app-data `smac_gaia` under `$HOME`.
     fn gaia_dir() -> std::path::PathBuf {
-        std::env::var_os("SMA_GAIA_DIR")
+        std::env::var_os("SOLVEMYASTRO_SMAC_GAIA")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
