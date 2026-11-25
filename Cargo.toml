@@ -17,6 +17,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "solvemyastro"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+# The catalog layer: Gaia ingest, tier and index-pack writers, zip/hash helpers.
+catalog = ["dep:flate2", "dep:md-5", "dep:zip", "dep:sha2"]
+# The `solvemyastro` command.
+cli = ["catalog", "dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
 # FITS/XISF decode + raw star detection (ImageAnalyzer). solvemyastro adds
@@ -43,9 +51,15 @@ rand_xoshiro = "0.8"
 # emitted nowhere when run standalone with no subscriber installed, e.g.
 # the `solvemyastro` CLI binary, which keeps its own println/eprintln).
 tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Optional layers, versions as in Athenaeum's lock (one version per shared crate).
+flate2 = { version = "1.0", optional = true }
+md-5 = { version = "0.11", optional = true }
+zip = { version = "8", default-features = false, features = ["deflate", "time"], optional = true }
+sha2 = { version = "0.11", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-# Machine-readable corpus-bench baseline (precision+speed regression gate).
-# Pinned to the workspace version to avoid duplicate crate versions.
-serde_json = "1"

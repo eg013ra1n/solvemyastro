@@ -14,9 +14,13 @@ use std::path::Path;
 
 use anyhow::Result;
 
+pub mod bins;
 pub mod cache;
 pub mod diag;
+pub mod healpix;
 pub mod index;
+pub mod layout;
+pub mod manifest;
 pub(crate) mod math;
 pub(crate) mod nn;
 pub mod orchestrate;
