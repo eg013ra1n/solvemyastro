@@ -53,8 +53,24 @@ solvemyastro build-index --tiers <catalog dir> --out <index dir>/narrow \
     --min-depth 8 --max-depth 8 --quads-per-cell 4
 ```
 
+The published packs are rebuilt with `--preset`, which fixes both the layers and
+the parameters of what was published:
+
+```
+solvemyastro build-index --tiers <catalog dir> --out <index dir>/base --preset base
+solvemyastro build-index --tiers <catalog dir> --out <index dir>/narrow --preset narrow
+```
+
+`base` is `tier_500` alone at the defaults below (depth 2-7, 10 stars and 8 quads
+per cell); `narrow` is `tier_500` + `tier_2000` at depth 8, 10 stars and 4 quads
+per cell. A preset names a tier the folder lacks and stops; it cannot be mixed
+with the four parameter flags. Without `--preset` the command builds from
+`tier_500` + `tier_2000` at the flags given, as before, so the examples above
+keep producing the same files.
+
 | Flag | Default | Meaning |
 |------|---------|---------|
+| `--preset base\|narrow` | none | The published pack's layers and parameters; excludes the four flags below. |
 | `--tiers <dir>` | required | Directory containing `tier_500` (and `tier_2000`). |
 | `--out <dir>` | required | Output directory; `quads.smaq` is written into it. |
 | `--min-depth <d>` | 2 | Coarsest band. Depth 2 = quads of 10–21°. |

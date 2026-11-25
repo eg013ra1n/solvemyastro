@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 use crate::bins::{read_records_until_mag, RECORD_SIZE};
 use crate::cache::{build_cache_parallel, StarRecord};
 use crate::gaia::Coverage;
-use crate::layout::tier_dir_name;
+use crate::layout::{tier_dir_name, STARS_FILE};
 
 /// Cumulative density targets (stars/deg²) for the 4 additive tiers.
 pub const TIER_DENSITIES: [u32; 4] = [500, 2000, 5000, 8000];
@@ -107,6 +107,19 @@ fn coverage_gap(coverage: Option<&Coverage>) -> Option<CoverageGap> {
     }
 }
 
+/// Remove the star cache of a tier whose build failed. A removal that fails
+/// is logged: the file is then still there and the person must know.
+fn remove_failed_cache(tier_dir: &Path) {
+    let path = tier_dir.join(STARS_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not remove the star cache of the failed tier");
+        }
+    }
+}
+
 /// Build `out_dir/tier_<density>/stars.smac` for each tier from the bins.
 /// Returns `(density, star_count)` per tier in [`TIER_DENSITIES`] order. Each
 /// tier build saturates all cores; tiers run sequentially.
@@ -154,9 +167,18 @@ pub fn build_tiers(bins_dir: &Path, out_dir: &Path, epoch: f64) -> Result<Vec<(u
             }
         });
         if let Some(e) = failure.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            // The cache that was written lacks the unreadable cell but looks
+            // whole: it must not stay where a packaging run could take it.
+            remove_failed_cache(&tier_dir);
             return Err(e.context(format!("build {}", tier_dir_name(density))));
         }
-        let n = built.with_context(|| format!("build {}", tier_dir_name(density)))?;
+        let n = match built {
+            Ok(n) => n,
+            Err(e) => {
+                remove_failed_cache(&tier_dir);
+                return Err(e.context(format!("build {}", tier_dir_name(density))));
+            }
+        };
         tracing::info!(density, stars = n, "tier built");
         out.push((density, n));
     }

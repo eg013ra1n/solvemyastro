@@ -246,8 +246,13 @@ fn package_index_refuses_unusable_and_repeated_pack_names_before_writing() {
 
     let publish = tmp.path().join("twice");
     let err = package_index(&[("base", base.as_path()), ("base", base.as_path())], &publish).unwrap_err();
-    assert!(format!("{err:#}").contains("base"), "{err:#}");
+    assert!(format!("{err:#}").contains("the pack name \"base\" is given twice"), "{err:#}");
     assert!(!publish.exists(), "nothing is written for a repeated name");
+
+    // index_Base.zip and index_base.zip are one file on macOS and Windows.
+    let err = package_index(&[("base", base.as_path()), ("Base", base.as_path())], &publish).unwrap_err();
+    assert!(format!("{err:#}").contains("\"Base\""), "{err:#}");
+    assert!(!publish.exists(), "nothing is written for names that differ by case only");
 
     for bad in ["", ".", "..", "a/b", "a\\b"] {
         let publish = tmp.path().join("bad");
@@ -267,7 +272,10 @@ fn package_tiers_refuses_mixed_epochs_before_writing() {
 
     let err = package_tiers(&tiers, &publish).unwrap_err();
     let text = format!("{err:#}");
-    assert!(text.contains("tier_500") && text.contains("tier_5000") && text.contains("epoch"), "{text}");
+    assert!(
+        text.contains("tier_5000 is built from catalog epoch 2020 but tier_500 from 2016"),
+        "the message names the odd tier, then the first one: {text}"
+    );
     assert!(!publish.exists(), "nothing is written for a set of mixed epochs");
 }
 
@@ -349,6 +357,9 @@ fn an_unreadable_bin_fails_the_tier_build() {
     fs::write(&bin, &healthy[..healthy.len() - 3]).unwrap();
     let err = build_tiers(&bins_dir, &tmp.path().join("cut"), 2016.0).unwrap_err();
     assert!(format!("{err:#}").contains(&name), "{err:#}");
+    // The failed tier leaves no star cache that could be packaged: it would be
+    // valid-looking and lack a cell.
+    assert!(!tmp.path().join("cut").join("tier_500").join("stars.smac").exists());
 
     // A folder where the bin should be a file.
     fs::remove_file(&bin).unwrap();

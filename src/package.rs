@@ -152,7 +152,7 @@ fn check_pack_name(name: &str) -> Result<()> {
 /// Package the quad-index packs `(name, dir)` — `dir` holds `quads.smaq` —
 /// into `publish_dir` as `index_<name>.zip` (entry `<name>/quads.smaq`), its
 /// sidecar and `index_manifest.json`, in the order given. Names must be usable
-/// and unique, every pack must open and all must be built from the same
+/// and unique (case aside), every pack must open and all must be built from the same
 /// catalog epoch, which the manifest records; all of that is checked before
 /// anything is written. No pack at all is an error.
 pub fn package_index(packs: &[(&str, &Path)], publish_dir: &Path) -> Result<IndexManifest> {
@@ -165,8 +165,17 @@ pub fn package_index(packs: &[(&str, &Path)], publish_dir: &Path) -> Result<Inde
     let mut checked = Vec::with_capacity(packs.len());
     for (i, &(name, dir)) in packs.iter().enumerate() {
         check_pack_name(name)?;
-        if packs[..i].iter().any(|&(other, _)| other == name) {
-            bail!("the pack name {name:?} is given twice");
+        // The names become file names: index_Base.zip and index_base.zip are one
+        // file on macOS and Windows, so a repeat is judged without case.
+        let lower = name.to_lowercase();
+        if let Some(&(other, _)) = packs[..i].iter().find(|&&(other, _)| other.to_lowercase() == lower) {
+            if other == name {
+                bail!("the pack name {name:?} is given twice");
+            }
+            bail!(
+                "the pack names {other:?} and {name:?} differ by case only: index_<name>.zip would be \
+                 one file on macOS and Windows"
+            );
         }
         let ix = QuadIndex::open(dir)
             .with_context(|| format!("the {name} pack at {} does not open", dir.display()))?;

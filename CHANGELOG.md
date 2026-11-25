@@ -5,6 +5,40 @@ All notable changes to solvemyastro will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — unreleased
+
+### Catalog building moves here
+
+- The Gaia catalog builder leaves Athenaeum: `gaia` (ingest of the
+  `GaiaSource_*.csv.gz` files into bins, with a coverage record and an optional
+  `_MD5SUM.txt` check), `bins`, `tiers` (the four density tiers), `package` (the
+  publish tree), `manifest`, `layout`, `healpix`, `accept` (the acceptance gate)
+  and the index presets (`index::Preset`, `open_preset_layers`) are modules of
+  this crate. Ingest, tiers and packages are behind the `catalog` feature; the
+  base layer has none of their dependencies.
+- **SA-6:** a bin sorts by a total key, `(mag_raw, ra, dec, pmra_raw, pmdec_raw)`,
+  so the bins are the same for any `--jobs` and any file order. Records with
+  equal magnitudes used to come out in the order threads delivered them.
+- A bin that exists and cannot be read fails `build_tiers` and names the file; the
+  tier's `stars.smac` is removed rather than left looking whole.
+  `package_index` refuses pack names that differ by case only.
+
+### The `solvemyastro` command
+
+- clap-based, behind the `cli` feature: `ingest`, `build-tiers`, `build-cache`,
+  `build-bright-cache`, `build-index` (with `--preset base|narrow`), `package`,
+  `solve` and `info` (`cache-info` stays as an alias). Global `--log <file>`
+  (JSON lines) and `-q`. Exit codes: 0 ok, 1 failure or refused solve, 2 bad
+  arguments.
+- `solve` runs the acceptance gate: a refused solution prints
+  `rejected: ...` on stderr and nothing on stdout (`--no-gate` prints it). `--json`
+  gains `rms_px`, `inlier_ratio`, `expected_in_fov` and `gate`.
+- `info` reports a bins folder's complete and partial cells by file range.
+- `cargo install solvemyastro --features cli --locked` installs the command; a
+  plain `cargo install solvemyastro` no longer builds it (the `cli` feature is
+  required).
+- `rustafits` is a version dependency, so the crate builds outside Athenaeum.
+
 ## [0.2.0] — 2026-10-25
 
 ### Quad index
