@@ -9,10 +9,11 @@
 //! a whole one; [`build_tiers`] says so when the coverage record shows it.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::Path;
+use std::sync::Mutex;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::bins::{read_records_until_mag, RECORD_SIZE};
 use crate::cache::{build_cache_parallel, StarRecord};
@@ -55,23 +56,35 @@ fn to_smac(r: &crate::bins::BinRecord) -> StarRecord {
 
 /// Read pixel `px`'s band `[lo, hi)` from its `healpix_<px>.bin` tile (records
 /// mag-sorted). Reads only the first `min(hi, total)` records — the bands are
-/// prefixes of the sorted cell, so dense cells are never fully parsed. Missing
-/// tiles (empty pixels) yield an empty band.
-fn read_band(bins_dir: &Path, px: u64, lo: usize, hi: usize) -> Vec<StarRecord> {
+/// prefixes of the sorted cell, so dense cells are never fully parsed. A tile
+/// that does not exist (an empty pixel) yields an empty band; a tile that
+/// exists and cannot be read whole (not a file, not a whole number of records,
+/// a failed read) is an error naming it, never an empty band.
+fn read_band(bins_dir: &Path, px: u64, lo: usize, hi: usize) -> Result<Vec<StarRecord>> {
     let path = bins_dir.join(crate::bins::bin_file_name(px));
-    let total = std::fs::metadata(&path).map(|m| m.len() as usize / RECORD_SIZE).unwrap_or(0);
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+    };
+    if !meta.is_file() {
+        bail!("{} is not a file", path.display());
+    }
+    if meta.len() % RECORD_SIZE as u64 != 0 {
+        bail!("{} is {} bytes, not a whole number of {RECORD_SIZE}-byte records", path.display(), meta.len());
+    }
+    let total = (meta.len() / RECORD_SIZE as u64) as usize;
     let n = hi.min(total); // records to actually read (prefix)
     if n == 0 || lo >= n {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut buf = vec![0u8; n * RECORD_SIZE];
-    if let Err(e) = File::open(&path).and_then(|mut f| f.read_exact(&mut buf)) {
-        tracing::warn!(path = %path.display(), error = %e, "bin unreadable, its stars are skipped");
-        return Vec::new();
-    }
+    File::open(&path)
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .with_context(|| format!("read {}", path.display()))?;
     // The bin is mag-sorted, so the first n records are the n brightest.
     let cell = read_records_until_mag(&buf, f32::MAX);
-    slice_select(&cell, lo, hi).iter().map(to_smac).collect()
+    Ok(slice_select(&cell, lo, hi).iter().map(to_smac).collect())
 }
 
 /// What the coverage record says is wrong with the bins, if anything.
@@ -98,6 +111,9 @@ fn coverage_gap(coverage: Option<&Coverage>) -> Option<CoverageGap> {
 /// Returns `(density, star_count)` per tier in [`TIER_DENSITIES`] order. Each
 /// tier build saturates all cores; tiers run sequentially.
 ///
+/// A bin that exists but cannot be read fails the build, naming it: a tier
+/// that silently lacked a cell's stars would be published.
+///
 /// A bins folder with no coverage record, or one whose record shows cells the
 /// files reached in part only, still builds: the tiers are then thinner there
 /// than the density they are named for, and the log says so.
@@ -122,8 +138,25 @@ pub fn build_tiers(bins_dir: &Path, out_dir: &Path, epoch: f64) -> Result<Vec<(u
         let (lo, hi) = (bounds[k], bounds[k + 1]);
         let tier_dir = out_dir.join(tier_dir_name(density));
         tracing::info!(density, lo, hi, "building tier");
-        let n = build_cache_parallel(&tier_dir, epoch, |px| read_band(bins_dir, px, lo, hi))
-            .with_context(|| format!("build {}", tier_dir_name(density)))?;
+        // The cache builder's closure cannot fail: the first unreadable bin is
+        // kept here and an empty band stands in for it, then the build is
+        // abandoned below.
+        let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let built = build_cache_parallel(&tier_dir, epoch, |px| match read_band(bins_dir, px, lo, hi) {
+            Ok(band) => band,
+            Err(e) => {
+                let mut first = failure.lock().unwrap_or_else(|p| p.into_inner());
+                if first.is_none() {
+                    tracing::warn!(density, error = %format!("{e:#}"), "bin unreadable, the tier build fails");
+                    *first = Some(e);
+                }
+                Vec::new()
+            }
+        });
+        if let Some(e) = failure.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            return Err(e.context(format!("build {}", tier_dir_name(density))));
+        }
+        let n = built.with_context(|| format!("build {}", tier_dir_name(density)))?;
         tracing::info!(density, stars = n, "tier built");
         out.push((density, n));
     }

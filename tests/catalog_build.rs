@@ -233,6 +233,42 @@ fn package_index_takes_one_pack_and_refuses_none_a_missing_one_and_mixed_epochs(
     let err = package_index(&[("base", base.as_path()), ("narrow", narrow.as_path())], &tmp.path().join("mixed"))
         .unwrap_err();
     assert!(format!("{err:#}").contains("epoch"), "{err:#}");
+    assert!(!tmp.path().join("mixed").exists(), "a refused set writes nothing, not even the first pack");
+}
+
+#[test]
+fn package_index_refuses_unusable_and_repeated_pack_names_before_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (tiers, packs) = (tmp.path().join("tiers"), tmp.path().join("packs"));
+    tiny_tier(&tiers.join("tier_500"), 2016.0);
+    tiny_pack(&tiers, &packs, "base");
+    let base = packs.join("base");
+
+    let publish = tmp.path().join("twice");
+    let err = package_index(&[("base", base.as_path()), ("base", base.as_path())], &publish).unwrap_err();
+    assert!(format!("{err:#}").contains("base"), "{err:#}");
+    assert!(!publish.exists(), "nothing is written for a repeated name");
+
+    for bad in ["", ".", "..", "a/b", "a\\b"] {
+        let publish = tmp.path().join("bad");
+        let err = package_index(&[("base", base.as_path()), (bad, base.as_path())], &publish).unwrap_err();
+        assert!(format!("{err:#}").contains("pack name"), "{bad:?}: {err:#}");
+        assert!(!publish.exists(), "nothing is written for the name {bad:?}");
+    }
+}
+
+#[test]
+fn package_tiers_refuses_mixed_epochs_before_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (tiers, publish) = (tmp.path().join("tiers"), tmp.path().join("publish"));
+    tiny_tier(&tiers.join("tier_500"), 2016.0);
+    tiny_tier(&tiers.join("tier_2000"), 2016.0);
+    tiny_tier(&tiers.join("tier_5000"), 2020.0);
+
+    let err = package_tiers(&tiers, &publish).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("tier_500") && text.contains("tier_5000") && text.contains("epoch"), "{text}");
+    assert!(!publish.exists(), "nothing is written for a set of mixed epochs");
 }
 
 #[test]
@@ -289,11 +325,39 @@ fn tiers_from_fixture_bins_are_deterministic() {
     let cell0 = read_bin(&bins_dir, 0);
     for (k, d) in TIER_DENSITIES.iter().enumerate() {
         let cache = StarCache::open(&one.join(format!("tier_{d}"))).unwrap();
-        let got: Vec<f32> = cache.iter_pixel_records(0).unwrap().iter().map(|r| r.mag).collect();
+        let got: Vec<(f64, f64, f32)> =
+            cache.iter_pixel_records(0).unwrap().iter().map(|r| (r.ra, r.dec, r.mag)).collect();
         let hi = bounds[k + 1].min(cell0.len());
-        let want: Vec<f32> = cell0[bounds[k].min(hi)..hi].iter().map(|r| r.mag()).collect();
+        let want: Vec<(f64, f64, f32)> =
+            cell0[bounds[k].min(hi)..hi].iter().map(|r| (r.ra as f64, r.dec as f64, r.mag())).collect();
         assert_eq!(got, want, "tier_{d}, cell 0");
         let n1 = cache.iter_pixel_records(1).unwrap().len();
         assert_eq!(n1, if k == 0 { CELL1_KEPT } else { 0 }, "tier_{d}, cell 1");
     }
+}
+
+#[test]
+fn an_unreadable_bin_fails_the_tier_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bins_dir = fixture_bins(tmp.path());
+    let name = bins::bin_file_name(1);
+    let bin = bins_dir.join(&name);
+    let healthy = fs::read(&bin).unwrap();
+    build_tiers(&bins_dir, &tmp.path().join("healthy"), 2016.0).unwrap();
+
+    // Not a whole number of records: the bin is corrupt, its cell is not empty.
+    fs::write(&bin, &healthy[..healthy.len() - 3]).unwrap();
+    let err = build_tiers(&bins_dir, &tmp.path().join("cut"), 2016.0).unwrap_err();
+    assert!(format!("{err:#}").contains(&name), "{err:#}");
+
+    // A folder where the bin should be a file.
+    fs::remove_file(&bin).unwrap();
+    fs::create_dir(&bin).unwrap();
+    let err = build_tiers(&bins_dir, &tmp.path().join("dir"), 2016.0).unwrap_err();
+    assert!(format!("{err:#}").contains(&name), "{err:#}");
+
+    // A cell with no bin at all is an empty cell, not an error.
+    fs::remove_dir(&bin).unwrap();
+    let counts = build_tiers(&bins_dir, &tmp.path().join("gone"), 2016.0).unwrap();
+    assert_eq!(counts, vec![(500, 420), (2000, 1259), (5000, 321), (8000, 0)]);
 }
