@@ -40,7 +40,8 @@ pub struct SolveArgs {
     /// Search radius around the position, degrees.
     #[arg(long)]
     radius: Option<f64>,
-    /// Julian year to bring catalog positions to. Defaults to the catalog's own.
+    /// Julian year of the observation, to bring catalog positions to (proper motion). Without it the
+    /// solver assumes 2024.04, and the gate's star count uses the catalog's own epoch.
     #[arg(long)]
     epoch: Option<f64>,
     /// Print the solution as one JSON object.

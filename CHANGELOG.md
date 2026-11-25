@@ -16,11 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the index presets (`index::Preset`, `open_preset_layers`) are modules of
   this crate. Ingest, tiers and packages are behind the `catalog` feature; the
   base layer has none of their dependencies.
-- **SA-6:** a bin sorts by a total key, `(mag_raw, ra, dec, pmra_raw, pmdec_raw)`,
-  so the bins are the same for any `--jobs` and any file order. Records with
-  equal magnitudes used to come out in the order threads delivered them.
-- A bin that exists and cannot be read fails `build_tiers` and names the file; the
-  tier's `stars.smac` is removed rather than left looking whole.
+- A bin sorts by a total key: magnitude, then position and proper motion, so
+  any input order and any `--jobs` give the same bytes. Records with equal
+  magnitudes used to come out in the order threads delivered them.
+- `build_tiers` builds each tier in `tier_<d>.partial/` and renames it to
+  `tier_<d>/` only when the tier is finished, so a killed run leaves no folder
+  that looks like a tier; a failed tier removes its folder, and the next run
+  removes one a killed run left. A bin that exists and cannot be read fails the
+  build and names the file.
+- `ingest` reads a file the `_MD5SUM.txt` list does not name (with a warning that
+  names it); `--verify` refuses the run instead, naming it.
   `package_index` refuses pack names that differ by case only.
 
 ### The `solvemyastro` command
@@ -33,7 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `solve` runs the acceptance gate: a refused solution prints
   `rejected: ...` on stderr and nothing on stdout (`--no-gate` prints it). `--json`
   gains `rms_px`, `inlier_ratio`, `expected_in_fov` and `gate`.
-- `info` reports a bins folder's complete and partial cells by file range.
+- `info` reports a bins folder's complete and partial cells by file range, and
+  each pack of an index folder (the app's `smac_index`).
+- Known issue: the acceptance gate's in-field radius takes the square root of
+  the detected star count for the image side, so `expected_in_fov` comes out far
+  too low and the dense-field ratio check rarely arms. A fix changes verdicts and
+  is planned.
 - `cargo install solvemyastro --features cli --locked` installs the command; a
   plain `cargo install solvemyastro` no longer builds it (the `cli` feature is
   required).

@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["astronomy", "astrometry", "plate-solving", "wcs", "astrophotography"]
 categories = ["science", "command-line-utilities"]
 exclude = [".github/"]
+rust-version = "1.96"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "solvemyastro"

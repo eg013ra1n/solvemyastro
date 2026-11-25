@@ -37,7 +37,7 @@ pub struct IngestOptions {
     /// Files read (and checked) in parallel.
     pub jobs: usize,
     /// Check every file against `_MD5SUM.txt` before reading any. A missing
-    /// list is then an error.
+    /// list, or a file it does not name, is then an error.
     pub verify_md5: bool,
 }
 
@@ -73,7 +73,8 @@ pub struct IngestSummary {
 /// Ingest every `*.csv.gz` file of `gaia_dir` into `out_bins`.
 ///
 /// The files are taken in the order of `_MD5SUM.txt` (those present) when the
-/// list exists, else sorted by name. `out_bins` must not already hold bins or a
+/// list exists, followed by the files it does not name (read unchecked, with a
+/// warning), else sorted by name. `out_bins` must not already hold bins or a
 /// coverage record. `<out_bins>/.scratch/` is cleared at the start and removed
 /// at the end. `coverage.json` is written last: a folder without one is not a
 /// finished ingest. Any file error stops the run with the file's name in it.
@@ -215,23 +216,40 @@ fn remove_scratch(scratch: &Path) -> Result<()> {
     }
 }
 
-/// The files to read: the list's order (those present) when `_MD5SUM.txt`
-/// exists, else every `*.csv.gz` sorted by name.
+/// The files to read: with `_MD5SUM.txt`, the list's order (those present)
+/// then any file the list does not name, by name; without it, every `*.csv.gz`
+/// sorted by name. A file the list does not name has no checksum to check, so
+/// it is read with a warning, and `verify_md5` refuses the run naming it.
 fn list_inputs(gaia_dir: &Path, verify_md5: bool) -> Result<Vec<Input>> {
     let list_path = gaia_dir.join(MD5_LIST_FILE);
     let inputs: Vec<Input> = if list_path.is_file() {
         let listed = read_md5_list(&list_path)?;
-        let present: Vec<Input> = listed
+        let mut present: Vec<Input> = listed
             .into_iter()
             .map(|f| Input { path: gaia_dir.join(&f.name), name: f.name, md5_hex: Some(f.md5_hex) })
             .filter(|i| i.path.is_file())
             .collect();
-        let unlisted = csv_gz_names(gaia_dir)?
+        let unlisted: Vec<String> = csv_gz_names(gaia_dir)?
             .into_iter()
             .filter(|n| !present.iter().any(|i| &i.name == n))
-            .count();
-        if unlisted > 0 {
-            tracing::warn!(unlisted, list = MD5_LIST_FILE, "gaia files not in the checksum list are not ingested");
+            .collect();
+        if !unlisted.is_empty() {
+            if verify_md5 {
+                anyhow::bail!(
+                    "cannot verify {} file(s) the checksum list {MD5_LIST_FILE} does not name: {}",
+                    unlisted.len(),
+                    unlisted.join(", ")
+                );
+            }
+            tracing::warn!(
+                unlisted = unlisted.len(),
+                files = %unlisted.join(", "),
+                list = MD5_LIST_FILE,
+                "gaia files not in the checksum list are ingested unchecked"
+            );
+            present.extend(
+                unlisted.into_iter().map(|name| Input { path: gaia_dir.join(&name), name, md5_hex: None }),
+            );
         }
         present
     } else {

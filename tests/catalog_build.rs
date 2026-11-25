@@ -362,7 +362,9 @@ fn an_unreadable_bin_fails_the_tier_build() {
     assert!(format!("{err:#}").contains(&name), "{err:#}");
     // The failed tier leaves no star cache that could be packaged: it would be
     // valid-looking and lack a cell.
-    assert!(!tmp.path().join("cut").join("tier_500").join("stars.smac").exists());
+    let cut = tmp.path().join("cut");
+    assert!(!cut.join("tier_500").exists());
+    assert!(!cut.join("tier_500.partial").exists(), "the folder it was built in goes too");
 
     // A folder where the bin should be a file.
     fs::remove_file(&bin).unwrap();
@@ -374,4 +376,60 @@ fn an_unreadable_bin_fails_the_tier_build() {
     fs::remove_dir(&bin).unwrap();
     let counts = build_tiers(&bins_dir, &tmp.path().join("gone"), 2016.0).unwrap();
     assert_eq!(counts, vec![(500, 420), (2000, 1259), (5000, 321), (8000, 0)]);
+}
+
+/// A folder of the kind a killed `build-tiers` leaves: a star cache that opens
+/// and reports its counts, with records that were never written.
+fn plant_partial(out: &Path, density: u32) -> std::path::PathBuf {
+    let partial = out.join(format!("tier_{density}.partial"));
+    tiny_tier(&partial, 2016.0);
+    partial
+}
+
+#[test]
+fn a_stale_partial_folder_goes_and_a_rebuilt_tier_replaces_the_old_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bins_dir = fixture_bins(tmp.path());
+    let out = tmp.path().join("out");
+    let counts = build_tiers(&bins_dir, &out, 2016.0).unwrap();
+    let want = fs::read(out.join("tier_500").join("stars.smac")).unwrap();
+
+    // An earlier killed run, and a file of the previous tier that must not survive the rebuild.
+    plant_partial(&out, 500);
+    plant_partial(&out, 8000);
+    fs::write(out.join("tier_500").join("left_over.txt"), b"x").unwrap();
+
+    assert_eq!(build_tiers(&bins_dir, &out, 2016.0).unwrap(), counts);
+    for d in TIER_DENSITIES {
+        assert!(!out.join(format!("tier_{d}.partial")).exists(), "tier_{d}.partial");
+    }
+    assert!(!out.join("tier_500").join("left_over.txt").exists(), "the old tier is replaced whole");
+    assert_eq!(fs::read(out.join("tier_500").join("stars.smac")).unwrap(), want);
+}
+
+#[test]
+fn a_failed_rebuild_keeps_the_old_tier_and_leaves_no_partial() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bins_dir = fixture_bins(tmp.path());
+    let out = tmp.path().join("out");
+    build_tiers(&bins_dir, &out, 2016.0).unwrap();
+    let before = fs::read(out.join("tier_500").join("stars.smac")).unwrap();
+
+    let bin = bins_dir.join(bins::bin_file_name(1));
+    let healthy = fs::read(&bin).unwrap();
+    fs::write(&bin, &healthy[..healthy.len() - 3]).unwrap();
+    plant_partial(&out, 500);
+    build_tiers(&bins_dir, &out, 2016.0).unwrap_err();
+    assert!(!out.join("tier_500.partial").exists());
+    assert_eq!(fs::read(out.join("tier_500").join("stars.smac")).unwrap(), before);
+}
+
+#[test]
+fn package_tiers_never_takes_a_partial_tier_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tiers = tmp.path().join("tiers");
+    plant_partial(&tiers, 500);
+    let err = package_tiers(&tiers, &tmp.path().join("publish")).unwrap_err();
+    assert!(format!("{err:#}").contains("no tier found"), "{err:#}");
+    assert!(!tmp.path().join("publish").exists());
 }

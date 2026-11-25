@@ -90,6 +90,44 @@ fn cli_chain_runs_in_a_folder_with_a_space() {
 }
 
 #[test]
+fn info_reads_an_index_pack_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tiers = fixture_tiers(tmp.path());
+    // The shape of the app's `smac_index` folder: a pack per subfolder and the
+    // index manifest it cached, which is not a tier manifest.
+    let root = tmp.path().join("smac_index");
+    for name in ["base", "narrow"] {
+        let pack = root.join(name);
+        ok(args!["build-index", "--tiers", tiers, "--out", pack, "--min-depth", "2", "--max-depth", "3"]);
+    }
+    fs::write(
+        root.join(MANIFEST_FILE),
+        r#"{"version":1,"format":3,"catalog_epoch":2016.0,"packs":[]}"#,
+    )
+    .unwrap();
+
+    let out = ok(args!["info", root]);
+    let info = text(&out.stdout);
+    for name in ["base", "narrow"] {
+        assert!(info.lines().any(|l| l.trim_start().starts_with(&format!("{name}:"))), "{name} missing from:\n{info}");
+    }
+    assert!(info.contains("quads"), "{info}");
+    assert!(info.contains("min fov"), "{info}");
+}
+
+#[test]
+fn info_does_not_take_a_partial_tier_folder_for_a_tier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tiers = fixture_tiers(tmp.path());
+    let only_partial = tmp.path().join("only_partial");
+    fs::create_dir(&only_partial).unwrap();
+    fs::rename(tiers.join("tier_500"), only_partial.join("tier_500.partial")).unwrap();
+    let out = run(args!["info", only_partial]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(text(&out.stderr).contains("holds no"), "{}", text(&out.stderr));
+}
+
+#[test]
 fn ingest_into_a_filled_folder_exits_1() {
     let tmp = tempfile::tempdir().unwrap();
     let (gaia, bins) = (tmp.path().join("gaia"), tmp.path().join("bins"));

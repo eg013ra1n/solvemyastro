@@ -123,6 +123,10 @@ pub fn gate_tol_px(pixel_scale_arcsec: f64, base_arcsec: f64) -> f64 {
 /// degrees when both are positive, else 1.5. A cone error counts 0 and is
 /// logged.
 ///
+/// Known issue: `sqrt(n)` stands in for the image side, so `expected_in_fov`
+/// comes out far too low and the dense-field ratio check rarely arms; a fix
+/// changes verdicts and is planned.
+///
 /// A change to the radius formula or to the magnitude limit changes the
 /// accept/refuse verdicts an embedding app has cached: the app must bump its
 /// solve-recipe version (Athenaeum's `config::SOLVE_RECIPE_VERSION`).

@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 use crate::bins::{read_records_until_mag, RECORD_SIZE};
 use crate::cache::{build_cache_parallel, StarRecord};
 use crate::gaia::Coverage;
-use crate::layout::{tier_dir_name, STARS_FILE};
+use crate::layout::{tier_dir_name, tier_partial_dir_name};
 
 /// Cumulative density targets (stars/deg²) for the 4 additive tiers.
 pub const TIER_DENSITIES: [u32; 4] = [500, 2000, 5000, 8000];
@@ -107,22 +107,46 @@ fn coverage_gap(coverage: Option<&Coverage>) -> Option<CoverageGap> {
     }
 }
 
-/// Remove the star cache of a tier whose build failed. A removal that fails
-/// is logged: the file is then still there and the person must know.
-fn remove_failed_cache(tier_dir: &Path) {
-    let path = tier_dir.join(STARS_FILE);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "could not remove the star cache of the failed tier");
-        }
+/// Remove a tier's `.partial` folder. `NotFound` is fine; any other failure is
+/// returned for the caller to log or to fail on.
+fn remove_partial(partial: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(partial) {
+        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
+}
+
+/// Remove the folder of a tier whose build failed. A removal that fails is
+/// logged: the folder is then still there and the person must know (it is
+/// named `.partial`, so no reader takes it for a tier).
+fn remove_failed_partial(partial: &Path) {
+    if let Err(e) = remove_partial(partial) {
+        tracing::warn!(path = %partial.display(), error = %e, "could not remove the folder of the failed tier");
+    }
+}
+
+/// Make a finished `.partial` folder the tier: the tier of an earlier run, if
+/// any, goes first (a rename does not replace a folder on every platform).
+fn publish_tier(partial: &Path, tier_dir: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(tier_dir) {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("remove the earlier {}", tier_dir.display()));
+        }
+        _ => {}
+    }
+    std::fs::rename(partial, tier_dir)
+        .with_context(|| format!("move {} to {}", partial.display(), tier_dir.display()))
 }
 
 /// Build `out_dir/tier_<density>/stars.smac` for each tier from the bins.
 /// Returns `(density, star_count)` per tier in [`TIER_DENSITIES`] order. Each
 /// tier build saturates all cores; tiers run sequentially.
+///
+/// A tier is built in `tier_<density>.partial` and takes its name only when
+/// the build has finished: a killed run leaves no folder that looks like a
+/// tier (the cache writer gives the star file its full length before it fills
+/// the records, so a half-built one opens and reports full counts). A failed
+/// tier removes its folder; one a killed run left is removed at the start.
 ///
 /// A bin that exists but cannot be read fails the build, naming it: a tier
 /// that silently lacked a cell's stars would be published.
@@ -135,7 +159,7 @@ pub fn build_tiers(bins_dir: &Path, out_dir: &Path, epoch: f64) -> Result<Vec<(u
     match coverage_gap(coverage.as_ref()) {
         None => {}
         Some(CoverageGap::NoRecord) => {
-            tracing::warn!(bins = %bins_dir.display(), "no coverage record, so which cells are whole is unknown")
+            tracing::warn!(bins = %bins_dir.display(), "no coverage record (or an unfinished ingest), so which cells are whole is unknown")
         }
         Some(CoverageGap::UnknownFiles) => {
             tracing::warn!(bins = %bins_dir.display(), "coverage record has files without a range, so which cells are whole is unknown")
@@ -145,17 +169,27 @@ pub fn build_tiers(bins_dir: &Path, out_dir: &Path, epoch: f64) -> Result<Vec<(u
         }
     }
 
+    // What an earlier killed run left.
+    for &density in &TIER_DENSITIES {
+        let stale = out_dir.join(tier_partial_dir_name(density));
+        if stale.exists() {
+            tracing::info!(path = %stale.display(), "removing the unfinished tier of an earlier run");
+        }
+        remove_partial(&stale).with_context(|| format!("remove {}", stale.display()))?;
+    }
+
     let bounds = cell_cum_counts();
     let mut out = Vec::with_capacity(TIER_DENSITIES.len());
     for (k, &density) in TIER_DENSITIES.iter().enumerate() {
         let (lo, hi) = (bounds[k], bounds[k + 1]);
         let tier_dir = out_dir.join(tier_dir_name(density));
+        let partial = out_dir.join(tier_partial_dir_name(density));
         tracing::info!(density, lo, hi, "building tier");
         // The cache builder's closure cannot fail: the first unreadable bin is
         // kept here and an empty band stands in for it, then the build is
         // abandoned below.
         let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-        let built = build_cache_parallel(&tier_dir, epoch, |px| match read_band(bins_dir, px, lo, hi) {
+        let built = build_cache_parallel(&partial, epoch, |px| match read_band(bins_dir, px, lo, hi) {
             Ok(band) => band,
             Err(e) => {
                 let mut first = failure.lock().unwrap_or_else(|p| p.into_inner());
@@ -169,16 +203,20 @@ pub fn build_tiers(bins_dir: &Path, out_dir: &Path, epoch: f64) -> Result<Vec<(u
         if let Some(e) = failure.into_inner().unwrap_or_else(|p| p.into_inner()) {
             // The cache that was written lacks the unreadable cell but looks
             // whole: it must not stay where a packaging run could take it.
-            remove_failed_cache(&tier_dir);
+            remove_failed_partial(&partial);
             return Err(e.context(format!("build {}", tier_dir_name(density))));
         }
         let n = match built {
             Ok(n) => n,
             Err(e) => {
-                remove_failed_cache(&tier_dir);
+                remove_failed_partial(&partial);
                 return Err(e.context(format!("build {}", tier_dir_name(density))));
             }
         };
+        if let Err(e) = publish_tier(&partial, &tier_dir) {
+            remove_failed_partial(&partial);
+            return Err(e.context(format!("finish {}", tier_dir_name(density))));
+        }
         tracing::info!(density, stars = n, "tier built");
         out.push((density, n));
     }

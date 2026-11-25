@@ -18,6 +18,16 @@ pub fn tier_dir_name(density: u32) -> String {
     format!("tier_{density}")
 }
 
+/// Suffix of the folder a tier is built in. It is renamed to the tier's own
+/// name only when the build has finished, so a killed build leaves nothing
+/// that looks like a tier. Nothing in this crate reads such a folder.
+pub const PARTIAL_SUFFIX: &str = ".partial";
+
+/// Directory name a tier of `density` stars per square degree is built in.
+pub fn tier_partial_dir_name(density: u32) -> String {
+    format!("{}{PARTIAL_SUFFIX}", tier_dir_name(density))
+}
+
 /// Ordered `tier_<density>/` dirs (ascending density) under `catalog_root`.
 ///
 /// Falls back to `[catalog_root]` when no tiers exist but a legacy
@@ -119,6 +129,28 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
         assert_eq!(names, vec!["base", "narrow"]);
+    }
+
+    #[test]
+    fn a_partial_tier_folder_is_never_a_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A killed build-tiers leaves the folder it was building in, with a
+        // star cache that opens and is not whole.
+        let partial = root.join(tier_partial_dir_name(500));
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join(STARS_FILE), b"x").unwrap();
+        assert!(discover_layers(root).is_empty(), "only a partial folder is no catalog");
+
+        // Next to a real tier it is not listed either.
+        std::fs::create_dir_all(root.join("tier_2000")).unwrap();
+        std::fs::write(root.join("tier_2000").join(STARS_FILE), b"x").unwrap();
+        let names: Vec<_> = discover_layers(root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["tier_2000"]);
+        assert_eq!(tier_partial_dir_name(500), "tier_500.partial");
     }
 
     #[test]

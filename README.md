@@ -41,19 +41,25 @@ the scale against `--scale` when given). A refused solve prints the reason
 `--json` prints `ra, dec, scale, rot, matched, rms_px, inlier_ratio,
 expected_in_fov` and `gate` (`"passed"` or `"off"`).
 
+Known issue: the gate's in-field radius takes the square root of the detected
+star count for the image side, so `expected_in_fov` comes out far too low and the
+dense-field ratio check rarely arms. A fix changes verdicts and is planned.
+
 ```
 solvemyastro solve frame.fits --tiers ~/catalog --index ~/catalog/index/base --json
 ```
 
-`info` says what a folder is: a star cache, a folder of tiers, an index pack, a
-folder of bins or a publish tree, with its counts. `cache-info` is the old name.
+`info` says what a folder is: a star cache, a folder of tiers, an index pack or a
+folder of packs, a folder of bins or a publish tree, with its counts. `cache-info` is the old name.
 
 ## Building the star catalog
 
 The chain from Gaia files to what the solver reads. Every command runs its
-stage from scratch each time. A stage that fails midway (`build-tiers`,
-`build-cache`) can leave a partly written output folder: delete it and run the
-stage again.
+stage from scratch each time. `build-tiers` builds each tier in
+`tier_<d>.partial/` and gives it its name only when the tier is finished, so a
+killed run never leaves output that looks complete (the next run clears what it
+left). `build-cache` writes its folder in place: if it fails midway, delete the
+folder and run it again.
 
 1. **Gaia data.** Download the Gaia DR3 `GaiaSource_*.csv.gz` files from ESA's
    archive (<https://cdn.gea.esac.esa.int/Gaia/gdr3/gaia_source/>) into one

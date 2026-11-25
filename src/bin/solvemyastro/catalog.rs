@@ -32,7 +32,8 @@ pub struct IngestArgs {
     /// Files read in parallel.
     #[arg(long, default_value_t = gaia::DEFAULT_JOBS)]
     jobs: usize,
-    /// Check every file against `_MD5SUM.txt` before reading any.
+    /// Check every file against `_MD5SUM.txt` before reading any. A missing list, or a file it does
+    /// not name, fails the run.
     #[arg(long)]
     verify: bool,
 }

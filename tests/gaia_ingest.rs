@@ -64,7 +64,7 @@ fn ingest_keeps_filters_and_sorts() {
     let plain = has_star(&cell1, 1, 0).unwrap();
     assert_eq!((plain.pmra_raw, plain.pmdec_raw), (150, -250));
 
-    // Every bin is sorted by the SA-6 key.
+    // Every bin is sorted by the total key (magnitude, then position and proper motion).
     for recs in [&cell0, &cell1] {
         assert!(recs.windows(2).all(|w| sort_key(&w[0]) <= sort_key(&w[1])));
     }
@@ -242,6 +242,46 @@ fn md5_verify_catches_a_changed_file_and_parses_crlf() {
     write_fixture(&bare);
     let err = run(&bare, &tmp.path().join("out4"), &verify).unwrap_err();
     assert!(err.to_string().contains(MD5_LIST_FILE), "{err:#}");
+}
+
+/// A folder holding both fixture files with a checksum list that names only the first.
+fn folder_with_a_list_naming_one_file(tmp: &Path) -> std::path::PathBuf {
+    let gaia = tmp.join("gaia");
+    std::fs::create_dir(&gaia).unwrap();
+    write_fixture(&gaia);
+    std::fs::write(gaia.join(MD5_LIST_FILE), format!("{}  {FILE_A}\n", md5_hex(&gaia.join(FILE_A)))).unwrap();
+    gaia
+}
+
+#[test]
+fn an_unlisted_file_is_ingested_without_verify() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gaia = folder_with_a_list_naming_one_file(tmp.path());
+    let bare = tmp.path().join("bare");
+    std::fs::create_dir(&bare).unwrap();
+    write_fixture(&bare);
+
+    // A renamed or newly added file is still read: ingest takes what is in the folder.
+    let summary = run(&gaia, &tmp.path().join("out"), &IngestOptions::default()).unwrap();
+    assert_eq!(summary.files, 2);
+    run(&bare, &tmp.path().join("ref"), &IngestOptions::default()).unwrap();
+    assert_eq!(bin_bytes(&tmp.path().join("out")), bin_bytes(&tmp.path().join("ref")));
+    assert_eq!(
+        std::fs::read(tmp.path().join("out").join(COVERAGE_FILE)).unwrap(),
+        std::fs::read(tmp.path().join("ref").join(COVERAGE_FILE)).unwrap()
+    );
+}
+
+#[test]
+fn an_unlisted_file_fails_verify() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gaia = folder_with_a_list_naming_one_file(tmp.path());
+    let out = tmp.path().join("out");
+    let verify = IngestOptions { verify_md5: true, ..Default::default() };
+    let err = run(&gaia, &out, &verify).unwrap_err();
+    assert!(err.to_string().contains(FILE_B), "{err:#}");
+    assert!(bin_bytes(&out).is_empty(), "nothing is binned after a failed check");
+    assert!(!out.join(COVERAGE_FILE).exists());
 }
 
 #[test]

@@ -8,13 +8,13 @@ use clap::Args;
 use solvemyastro::bins::RECORD_SIZE;
 use solvemyastro::gaia::Coverage;
 use solvemyastro::index::{QuadIndex, FORMAT_VERSION, INDEX_FILE};
-use solvemyastro::layout::{discover_layers, STARS_FILE};
+use solvemyastro::layout::{discover_index_packs, discover_layers, STARS_FILE};
 use solvemyastro::manifest::{IndexManifest, Manifest, INDEX_MANIFEST_FILE, MANIFEST_FILE};
 use solvemyastro::StarCache;
 
 #[derive(Args)]
 pub struct InfoArgs {
-    /// A star cache, a folder of tiers, an index pack, a folder of bins or a publish folder.
+    /// A star cache, a folder of tiers, an index pack or a folder of them, a folder of bins or a publish folder.
     dir: PathBuf,
 }
 
@@ -35,11 +35,15 @@ pub fn run(a: InfoArgs) -> Result<()> {
     if !tier_dirs(dir).is_empty() {
         return tiers(dir);
     }
+    let packs = discover_index_packs(dir);
+    if !packs.is_empty() {
+        return index_packs(dir, &packs);
+    }
     if dir.join(MANIFEST_FILE).is_file() || dir.join(INDEX_MANIFEST_FILE).is_file() {
         return publish(dir);
     }
     bail!(
-        "{} holds no {STARS_FILE}, {INDEX_FILE}, tier_* folder, healpix_*.bin file or manifest",
+        "{} holds no {STARS_FILE}, {INDEX_FILE}, tier_* folder, index pack folder, healpix_*.bin file or manifest",
         dir.display()
     )
 }
@@ -70,6 +74,23 @@ fn tiers(dir: &Path) -> Result<()> {
 }
 
 fn index_pack(dir: &Path) -> Result<()> {
+    println!("index pack: {}", dir.display());
+    pack_lines(dir, "  ")
+}
+
+/// A folder of index packs, one subfolder each (the app's `smac_index`; its
+/// cached `manifest.json` is an index manifest, which `info` does not need).
+fn index_packs(dir: &Path, packs: &[PathBuf]) -> Result<()> {
+    println!("index packs: {}", dir.display());
+    for pack in packs {
+        let name = pack.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        println!("  {name}:");
+        pack_lines(pack, "    ")?;
+    }
+    Ok(())
+}
+
+fn pack_lines(dir: &Path, indent: &str) -> Result<()> {
     let ix = QuadIndex::open(dir)?;
     let (mut quads, mut stars) = (0usize, 0usize);
     for b in ix.bands() {
@@ -77,13 +98,12 @@ fn index_pack(dir: &Path) -> Result<()> {
         stars += b.n_stars();
     }
     let (first, last) = (ix.bands().first().map(|b| b.depth), ix.bands().last().map(|b| b.depth));
-    println!("index pack: {}", dir.display());
-    println!("  format:        {FORMAT_VERSION}");
-    println!("  catalog epoch: J{}", ix.catalog_epoch());
-    println!("  min fov:       {:.2} deg", ix.min_fov_deg());
-    println!("  bands:         {} (depth {}..{})", ix.bands().len(), first.unwrap_or(0), last.unwrap_or(0));
-    println!("  quads:         {quads}");
-    println!("  stars:         {stars}");
+    println!("{indent}format:        {FORMAT_VERSION}");
+    println!("{indent}catalog epoch: J{}", ix.catalog_epoch());
+    println!("{indent}min fov:       {:.2} deg", ix.min_fov_deg());
+    println!("{indent}bands:         {} (depth {}..{})", ix.bands().len(), first.unwrap_or(0), last.unwrap_or(0));
+    println!("{indent}quads:         {quads}");
+    println!("{indent}stars:         {stars}");
     Ok(())
 }
 
