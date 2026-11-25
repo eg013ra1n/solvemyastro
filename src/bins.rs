@@ -170,8 +170,10 @@ mod tests {
         let a = BinRecord::from_values(10.0, 5.0, 12.345, 0.0, 0.0);
         let b = BinRecord::from_values(9.0, 5.0, 12.345, 0.0, 0.0);
         let c = BinRecord::from_values(9.0, 4.0, 12.345, 0.0, 0.0);
-        let mut one = vec![a.clone(), b.clone(), c.clone()];
-        let mut two = vec![c, a, b];
+        let d = BinRecord::from_values(9.0, 4.0, 12.345, 1.0, 0.0);
+        let e = BinRecord::from_values(9.0, 4.0, 12.345, 0.0, 1.0);
+        let mut one = vec![a.clone(), b.clone(), c.clone(), d.clone(), e.clone()];
+        let mut two = vec![e, d, c, a, b];
         let (mut x, mut y) = (Vec::new(), Vec::new());
         write_records(&mut x, &mut one).unwrap();
         write_records(&mut y, &mut two).unwrap();

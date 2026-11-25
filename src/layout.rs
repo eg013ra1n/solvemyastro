@@ -51,7 +51,7 @@ pub fn discover_layers(catalog_root: &Path) -> Vec<PathBuf> {
 }
 
 /// Pack directories under `root` that hold a `quads.smaq`, sorted by name.
-/// Whether the file opens is for [`open_index_packs`] to find out.
+/// Whether the file opens is for the caller to find out.
 pub fn discover_index_packs(root: &Path) -> Vec<PathBuf> {
     let mut packs: Vec<(String, PathBuf)> = match std::fs::read_dir(root) {
         Ok(rd) => rd
