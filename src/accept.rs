@@ -122,6 +122,10 @@ pub fn gate_tol_px(pixel_scale_arcsec: f64, base_arcsec: f64) -> f64 {
 /// scale and the detection count: `min(3, scale * sqrt(n) / 3600 / 2 * 1.41)`
 /// degrees when both are positive, else 1.5. A cone error counts 0 and is
 /// logged.
+///
+/// A change to the radius formula or to the magnitude limit changes the
+/// accept/refuse verdicts an embedding app has cached: the app must bump its
+/// solve-recipe version (Athenaeum's `config::SOLVE_RECIPE_VERSION`).
 pub fn expected_bright_in_fov(
     caches: &Caches<'_>,
     crval: (f64, f64),
@@ -238,7 +242,37 @@ mod tests {
         // The default floor is 6: five refuses, six passes.
         let d = Gate::default();
         assert!(!d.accepts(&GateMetrics { inliers: 5, ..base.clone() }));
-        assert!(d.accepts(&GateMetrics { inliers: 6, ..base }));
+        assert!(d.accepts(&GateMetrics { inliers: 6, ..base.clone() }));
+    }
+
+    /// The strict edges of the gate. The inputs are exact in f64 (4.0 * 2.5 =
+    /// 10.0, 8.0 / 1.0 = 8.0, 1.0 / 8.0 = 0.125), so no assert is float-fragile.
+    #[test]
+    fn gate_boundaries_are_pinned() {
+        let gate = Gate::default();
+        let base = GateMetrics {
+            inliers: 40,
+            expected_in_fov: 800,
+            rms_px: 1.0,
+            tol_px: 4.0,
+            inlier_ratio: 0.30,
+            recovered_scale_arcsec: 1.0,
+            header_scale_arcsec: Some(1.0),
+        };
+        assert!(gate.accepts(&base));
+        // rms exactly at the ceiling accepts; just above refuses.
+        assert!(gate.accepts(&GateMetrics { rms_px: 10.0, ..base.clone() }));
+        assert!(!gate.accepts(&GateMetrics { rms_px: 10.5, ..base.clone() }));
+        // 100 expected stars is exempt from the ratio rule; 101 is gated.
+        let low = GateMetrics { inlier_ratio: 0.001, ..base.clone() };
+        assert!(gate.accepts(&GateMetrics { expected_in_fov: 100, ..low.clone() }));
+        assert!(!gate.accepts(&GateMetrics { expected_in_fov: 101, ..low }));
+        // A header ratio exactly at the tolerance accepts, either way round;
+        // beyond it refuses.
+        assert!(gate.accepts(&GateMetrics { recovered_scale_arcsec: 8.0, ..base.clone() }));
+        assert!(gate.accepts(&GateMetrics { recovered_scale_arcsec: 0.125, ..base.clone() }));
+        assert!(!gate.accepts(&GateMetrics { recovered_scale_arcsec: 8.5, ..base.clone() }));
+        assert!(!gate.accepts(&GateMetrics { recovered_scale_arcsec: 0.1, ..base }));
     }
 
     #[test]
@@ -282,7 +316,9 @@ mod tests {
             "first",
             vec![star(10.0, 20.30, 10.0), star(10.0, 20.40, 10.0), star(10.0, 20.10, 13.0)],
         );
-        let second = build("second", Vec::new());
+        // The second layer holds a mag-10 star inside the radius: a union of
+        // layers would count 2, the first layer alone counts 1.
+        let second = build("second", vec![star(10.0, 20.20, 10.0)]);
         let crval = (10.0, 20.0);
 
         // 3.6"/px, 250 000 detections: radius 3.6 * 500 / 3600 / 2 * 1.41 = 0.3525 deg.
@@ -295,8 +331,37 @@ mod tests {
         let stack = [&first, &second];
         let layered = Caches::layered(&stack);
         assert_eq!(expected_bright_in_fov(&layered, crval, 3.6, 250_000, epoch), 1);
+        // The second layer alone would count 1 as well; only the first is read.
+        let swapped = [&second, &first];
+        assert_eq!(
+            expected_bright_in_fov(&Caches::layered(&swapped), crval, 3.6, 250_000, epoch),
+            1
+        );
         // An empty stack counts 0.
         let none: [&StarCache; 0] = [];
         assert_eq!(expected_bright_in_fov(&Caches::layered(&none), crval, 3.6, 0, epoch), 0);
+    }
+
+    #[test]
+    fn expected_bright_in_fov_caps_the_radius_and_falls_back_without_a_scale() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let epoch = 2016.0;
+        let dir = tmp.path().join("wide");
+        // Mag-10 stars at 1.4, 1.6, 2.5 and 3.2 deg north of (10, 20).
+        let recs = vec![
+            star(10.0, 21.4, 10.0),
+            star(10.0, 21.6, 10.0),
+            star(10.0, 22.5, 10.0),
+            star(10.0, 23.2, 10.0),
+        ];
+        build_cache(recs, &dir, epoch, |_| {}).expect("build_cache");
+        let cache = StarCache::open(&dir).expect("open");
+        let caches = Caches::deep_only(&cache);
+        let crval = (10.0, 20.0);
+        // The formula gives 3.6 * 1e4 / 3600 / 2 * 1.41 = 7.05 deg; the cap
+        // is 3 deg, so 1.4, 1.6 and 2.5 count and 3.2 does not.
+        assert_eq!(expected_bright_in_fov(&caches, crval, 3.6, 100_000_000, epoch), 3);
+        // No usable scale with detections: the radius is 1.5 deg, only 1.4 counts.
+        assert_eq!(expected_bright_in_fov(&caches, crval, 0.0, 100, epoch), 1);
     }
 }
