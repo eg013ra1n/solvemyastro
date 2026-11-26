@@ -1615,6 +1615,37 @@ fn corpus_layered_tiers() {
         Err(e) => Some(format!("{bname}: solve_bounded failed: {e}")),
     };
 
+    // A bounded solve that must fail (no odds are enough) still carries the
+    // traces it scored: the lab reads them off the failure (PC-14).
+    let never = SolveConfig { accept_log10_odds: f64::INFINITY, ..cfg.clone() };
+    let bounded_fail_problem: Option<String> = match solvemyastro::orchestrate::solve_bounded(
+        &bpath,
+        &bhints,
+        &caches,
+        &[],
+        &never,
+        None,
+        (bscale * 0.9, bscale * 1.1),
+    ) {
+        Ok(_) => Some(format!("{bname}: solved with an infinite bar")),
+        Err(e) => match e.downcast_ref::<solvemyastro::SolveFailure>() {
+            Some(f) if !f.verifies.is_empty() => {
+                println!(
+                    "solve_bounded failure: {bname} class {} with {} verify traces",
+                    f.class.as_str(),
+                    f.verifies.len()
+                );
+                if matches!(f.class, solvemyastro::FailureClass::NotConfident { .. }) {
+                    None
+                } else {
+                    Some(format!("{bname}: class {} is not NOT_CONFIDENT", f.class.as_str()))
+                }
+            }
+            Some(_) => Some(format!("{bname}: the failure carries no verify traces")),
+            None => Some(format!("{bname}: not a SolveFailure: {e}")),
+        },
+    };
+
     let run = serde_json::json!({
         "schema_version": 1,
         "frames": tier_frames,
@@ -1663,6 +1694,10 @@ fn corpus_layered_tiers() {
     assert!(missed.is_empty(), "GATE FAIL: truth frame(s) not solved: {missed:?}");
     assert!(index_ran, "GATE FAIL: the blind index pass did not run (SOLVEMYASTRO_INDEX_DIR)");
     assert!(bounded_problem.is_none(), "GATE FAIL: solve_bounded: {bounded_problem:?}");
+    assert!(
+        bounded_fail_problem.is_none(),
+        "GATE FAIL: solve_bounded failure: {bounded_fail_problem:?}"
+    );
     assert!(index_wrong.is_empty(), "GATE FAIL: wrong blind index solve(s): {index_wrong:?}");
     assert_eq!(
         index_correct,

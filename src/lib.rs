@@ -196,9 +196,12 @@ pub struct SolveConfig {
     /// the solve ([`crate::verify::required_log10_odds`]). Default
     /// [`verify::ACCEPT_LOG10_ODDS`] = 9.
     pub accept_log10_odds: f64,
-    /// Fewest stars matched within 1σ on the final WCS (own stars and scanned
-    /// stars, [`SolveSolution::matched_stars`]) for a candidate to reach the
-    /// decision. Default 6.
+    /// Fewest linear inliers (`final_inliers`: verification stars within the
+    /// tolerance of a detection on the refit linear WCS, counted per catalog
+    /// star, so two catalog stars may share one detection) for a candidate to
+    /// reach the decision. It is not a floor on
+    /// [`SolveSolution::matched_stars`], which counts one-to-one on the final
+    /// WCS; the acceptance gate (`accept`) judges that count. Default 6.
     pub min_final_inliers: usize,
     /// Minimum bright-cache cone stars before the quad-matching path
     /// falls back to the deep cache for the same cone. Only honoured
@@ -311,9 +314,10 @@ pub struct SolveSolution {
     /// decision's score, [`crate::verify::scan_log10_odds`]). At least
     /// [`SolveConfig::accept_log10_odds`] for every returned solution.
     pub log10_odds: f64,
-    /// `N_R`: the verification stars (the cone ladder's list, G ≤ 12, then 14,
-    /// then the configured limit, until the density floor) that project into
-    /// the frame on the final WCS.
+    /// `N_R`: the decision's reference stars that project into the frame on
+    /// the final WCS (the verification ladder's list, deepened over G ≤ 12,
+    /// 14, then the configured limit on a frame-centred cone until the frame
+    /// holds the density floor).
     pub reference_stars_in_frame: usize,
     /// Hypotheses verified so far in this solve, this one included, across
     /// every pass and fallback step (the `H` of the decision's bar).
@@ -521,13 +525,7 @@ fn solve_with_index_stats(
             f.hypotheses_verified = stats.hypotheses();
             f.prefilter_passed = stats.prefilter_passed();
             f.verifies = stats.verifies_snapshot();
-            let best = f
-                .verifies
-                .iter()
-                .filter_map(|v| v.log10_odds)
-                .filter(|o| o.is_finite())
-                .fold(None, |acc: Option<f64>, o| Some(acc.map_or(o, |a| a.max(o))));
-            if let Some(best_log10_odds) = best {
+            if let Some(best_log10_odds) = diag::best_finite_log10_odds(&f.verifies) {
                 f.class = FailureClass::NotConfident { best_log10_odds };
             }
         }

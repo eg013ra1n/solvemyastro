@@ -372,6 +372,19 @@ impl fmt::Display for SolveFailure {
 
 impl std::error::Error for SolveFailure {}
 
+/// The largest finite decision score among `verifies`, `None` when no
+/// candidate reached the decision with a finite score. The one fold behind
+/// [`FailureClass::NotConfident`] for a single trace and for a whole solve.
+pub(crate) fn best_finite_log10_odds<'a>(
+    verifies: impl IntoIterator<Item = &'a VerifyTrace>,
+) -> Option<f64> {
+    verifies
+        .into_iter()
+        .filter_map(|v| v.log10_odds)
+        .filter(|o| o.is_finite())
+        .fold(None, |acc: Option<f64>, o| Some(acc.map_or(o, |a| a.max(o))))
+}
+
 impl SolveTrace {
     pub fn classify(&self) -> FailureClass {
         if matches!(self.outcome, TraceOutcome::Solved { .. }) {
@@ -401,12 +414,7 @@ impl SolveTrace {
             return FailureClass::MatchStarved;
         }
         // A candidate that reached the decision and scored below the bar.
-        let best_odds = all_verifies
-            .iter()
-            .filter_map(|v| v.log10_odds)
-            .filter(|o| o.is_finite())
-            .fold(None, |acc: Option<f64>, o| Some(acc.map_or(o, |a| a.max(o))));
-        if let Some(best_log10_odds) = best_odds {
+        if let Some(best_log10_odds) = best_finite_log10_odds(all_verifies.iter().copied()) {
             return FailureClass::NotConfident { best_log10_odds };
         }
         let (best_inl, best_req) = all_verifies.iter().fold((0usize, 0usize), |acc, v| {
@@ -679,7 +687,12 @@ mod tests {
 
     #[test]
     fn a_search_that_reached_the_decision_is_not_confident() {
-        let t = trace_with(vec![verify(30, 10, Some(6.2)), verify(40, 10, Some(7.5))]);
+        // The best score is neither the last verify's nor the best-seed one's.
+        let t = trace_with(vec![
+            verify(40, 10, Some(6.2)),
+            verify(30, 10, Some(7.5)),
+            verify(35, 10, Some(7.0)),
+        ]);
         assert_eq!(t.classify(), FailureClass::NotConfident { best_log10_odds: 7.5 });
     }
 

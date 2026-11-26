@@ -716,8 +716,10 @@ fn inliers_outside_own(
 }
 
 /// The verification stars that project into the frame on `wcs`: finite pixel
-/// positions in `[0, width) x [0, height)`. This is the decision's reference
-/// list `R` (`N_R` = its length), the cone ladder's list as it stands.
+/// positions in `[0, width) x [0, height)`. Applied to `decision_references`'
+/// output (the ladder's list deepened on this in-frame count from a
+/// frame-centred cone, CR-1a) it gives the decision's reference list `R`
+/// (`N_R` = its length).
 fn references_in_frame(
     wcs: &WcsSolution,
     cat: &[CatalogStar],
@@ -1600,7 +1602,7 @@ pub(crate) fn solve_inner(
         message: msg,
         hypotheses_verified: stats.hypotheses(),
         prefilter_passed: stats.prefilter_passed(),
-        verifies: Vec::new(),
+        verifies: stats.verifies_snapshot(),
     }))
 }
 
