@@ -11,8 +11,9 @@
 //! as a check of what an embedding app stored or what `--no-gate` printed.
 //! The RMS ceiling, the matched-star floor and the scale checks are backstops.
 //!
-//! A change to a threshold here, or to the verification magnitude limit
-//! (`orchestrate::VERIFY_MAG_LIMIT`), changes the verdicts an
+//! A change to a threshold here (the solver's base bar
+//! [`crate::verify::ACCEPT_LOG10_ODDS`] among them), or to the verification
+//! magnitude limit (`orchestrate::VERIFY_MAG_LIMIT`), changes the verdicts an
 //! embedding app has cached: it must bump its solve-recipe version
 //! (Athenaeum's `config::SOLVE_RECIPE_VERSION`).
 
@@ -129,7 +130,8 @@ impl Gate {
             return Some(GateRefusal::TooFewMatched { matched: m.inliers, needed: self.inlier_floor });
         }
         // The primary false-positive gate: the solver's own odds, read at the
-        // bar the solver applies (`!(x >= bar)` also refuses NaN).
+        // solver's base bar `ACCEPT_LOG10_ODDS`, not the hypothesis-raised
+        // one; a non-finite value refuses.
         if !m.log10_odds.is_finite() || m.log10_odds < ACCEPT_LOG10_ODDS {
             return Some(GateRefusal::NotConfident {
                 log10_odds: m.log10_odds,
@@ -217,6 +219,8 @@ mod tests {
             gate.refusal(&GateMetrics { log10_odds: f64::NEG_INFINITY, ..base() }),
             Some(GateRefusal::NotConfident { .. })
         ));
+        // Scale 100 against the header's 1.9 also fails the header rule, so
+        // this case pins plausible-scale before scale-against-header.
         assert!(matches!(
             gate.refusal(&GateMetrics { recovered_scale_arcsec: 100.0, ..base() }),
             Some(GateRefusal::ImplausibleScale { .. })
@@ -232,10 +236,22 @@ mod tests {
                 Some(GateRefusal::LooseFit { .. })
             ));
         }
-        // The first failing check wins.
+        // The first failing check wins: every adjacent pair of the order.
         assert!(matches!(
             gate.refusal(&GateMetrics { rms_px: 20.0, log10_odds: 3.0, ..base() }),
             Some(GateRefusal::LooseFit { .. })
+        ));
+        assert!(matches!(
+            gate.refusal(&GateMetrics { rms_px: 20.0, inliers: 5, ..base() }),
+            Some(GateRefusal::LooseFit { .. })
+        ));
+        assert_eq!(
+            gate.refusal(&GateMetrics { inliers: 5, log10_odds: 3.0, ..base() }),
+            Some(GateRefusal::TooFewMatched { matched: 5, needed: 6 })
+        );
+        assert!(matches!(
+            gate.refusal(&GateMetrics { log10_odds: 3.0, recovered_scale_arcsec: 100.0, ..base() }),
+            Some(GateRefusal::NotConfident { .. })
         ));
         // No header scale: the header rule is skipped entirely.
         assert_eq!(
@@ -246,6 +262,18 @@ mod tests {
             }),
             None
         );
+        // The plausible-scale range, edges inclusive (no header to compare).
+        let no_header = |recovered_scale_arcsec| GateMetrics {
+            header_scale_arcsec: None,
+            recovered_scale_arcsec,
+            ..base()
+        };
+        assert!(matches!(
+            gate.refusal(&no_header(0.01)),
+            Some(GateRefusal::ImplausibleScale { .. })
+        ));
+        assert_eq!(gate.refusal(&no_header(0.05)), None);
+        assert_eq!(gate.refusal(&no_header(60.0)), None);
     }
 
     /// The strict edges of the gate. The inputs are exact in f64 (4.0 * 2.5 =
@@ -345,7 +373,11 @@ mod tests {
         assert_eq!(g.scale_sanity_min, 0.05);
         assert_eq!(g.scale_sanity_max, 60.0);
         assert_eq!(g.scale_header_tol, 8.0);
-        assert_eq!(ACCEPT_LOG10_ODDS, 9.0);
+        assert_eq!(
+            ACCEPT_LOG10_ODDS, 9.0,
+            "ACCEPT_LOG10_ODDS is the gate's odds bar: moving it changes embedding apps' cached \
+             verdicts: bump their solve-recipe version (Athenaeum's config::SOLVE_RECIPE_VERSION)"
+        );
     }
 
     #[test]
