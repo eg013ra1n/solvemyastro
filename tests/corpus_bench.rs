@@ -1159,6 +1159,16 @@ fn wcs_moved(run: &serde_json::Value, base: &serde_json::Value) -> Option<String
     })
 }
 
+/// The baseline text, or `None` when the file does not exist. Any other read
+/// error is a failure of the gate, never "no baseline".
+fn read_baseline(res: std::io::Result<String>) -> Option<String> {
+    match res {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("read {LAYERED_BASELINE_FILE}: {e}"),
+    }
+}
+
 /// The names of the solved frames in a list of frame records.
 fn solved_names(frames: &serde_json::Value) -> std::collections::BTreeSet<String> {
     frames
@@ -1411,6 +1421,8 @@ fn corpus_layered_tiers() {
     // Blind index pass: the base pack, no hints beyond the epoch.
     let mut index_frames: Vec<serde_json::Value> = Vec::new();
     let mut index_correct = 0usize;
+    let mut index_wrong: Vec<String> = Vec::new();
+    let mut index_panicked: Vec<String> = Vec::new();
     let mut index_ran = false;
     match std::env::var("SOLVEMYASTRO_INDEX_DIR") {
         Err(_) => println!("SKIP: SOLVEMYASTRO_INDEX_DIR not set"),
@@ -1441,31 +1453,57 @@ fn corpus_layered_tiers() {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     solvemyastro::solve_with_index(path, &hints, &caches, &[&index], &cfg, None)
                 }));
+                let did_panic = res.is_err();
                 let res = res.unwrap_or_else(|_| Err(anyhow::anyhow!("panicked")));
+                // A solve outside the truth's 30" / 2 % is WRONG: reported with
+                // its position and scale, kept under "wrong" (a key `wcs_moved`
+                // ignores), never recorded as a solve.
+                let mut wrong_solve: Option<(f64, f64, f64)> = None;
                 let correct = match &res {
                     Ok(s) => {
-                        sep_arcsec(tra, tdec, s.wcs.crval.0, s.wcs.crval.1) < 30.0
-                            && (s.pixel_scale_arcsec - tscale).abs() / tscale * 100.0 < 2.0
+                        let ok = sep_arcsec(tra, tdec, s.wcs.crval.0, s.wcs.crval.1) < 30.0
+                            && (s.pixel_scale_arcsec - tscale).abs() / tscale * 100.0 < 2.0;
+                        if !ok {
+                            wrong_solve =
+                                Some((s.wcs.crval.0, s.wcs.crval.1, s.pixel_scale_arcsec));
+                        }
+                        ok
                     }
                     Err(_) => false,
                 };
                 if correct {
                     index_correct += 1;
                 }
-                println!(
-                    "index pass: {:50} {}",
-                    &name[..name.len().min(50)],
-                    if correct { "OK" } else { "MISSED" }
-                );
-                // A wrong solve is not recorded as a solve.
-                index_frames.push(frame_json(
-                    &name,
-                    &if correct { res } else { Err(anyhow::anyhow!("not a truth solve")) },
-                ));
+                let tag = if correct {
+                    "OK".to_string()
+                } else if did_panic {
+                    index_panicked.push(name.clone());
+                    "PANICKED".to_string()
+                } else if let Some((ra, dec, sc)) = wrong_solve {
+                    index_wrong.push(name.clone());
+                    format!("WRONG ra={ra:.3} dec={dec:+.3} {sc:.3}\"/px")
+                } else {
+                    "MISSED".to_string()
+                };
+                println!("index pass: {:50} {tag}", &name[..name.len().min(50)]);
+                let mut rec = if correct {
+                    frame_json(&name, &res)
+                } else {
+                    frame_json(&name, &Err(anyhow::anyhow!("not a truth solve")))
+                };
+                if let Some((ra, dec, sc)) = wrong_solve {
+                    rec["wrong"] = serde_json::json!({
+                        "crval": [ra, dec],
+                        "scale_arcsec_px": sc,
+                        "wcs": frame_json(&name, &res),
+                    });
+                }
+                index_frames.push(rec);
             }
         }
     }
     println!("index pass: {index_correct} solved of {}", INDEX_PASS_FRAMES.len());
+    panicked.extend(index_panicked);
 
     let run = serde_json::json!({
         "schema_version": 1,
@@ -1479,37 +1517,49 @@ fn corpus_layered_tiers() {
     )
     .unwrap_or_else(|e| panic!("write {LAYERED_RUN_FILE}: {e}"));
 
+    // The WCS gate: both lists against the frozen baseline. Every line is
+    // printed before any assert, so one run shows every difference.
+    let freezing = std::env::var("SOLVEMYASTRO_FREEZE").is_ok_and(|v| v == "1");
+    let mut problems: Vec<String> = Vec::new();
+    match read_baseline(std::fs::read_to_string(manifest.join(LAYERED_BASELINE_FILE))) {
+        None if freezing => println!("WCS gate: no baseline, wrote the run"),
+        None => {
+            println!(
+                "WCS gate: no baseline at {LAYERED_BASELINE_FILE} \
+                 (SOLVEMYASTRO_FREEZE=1 freezes the run)"
+            );
+            problems.push(format!("no baseline at {LAYERED_BASELINE_FILE}"));
+        }
+        Some(text) => {
+            let base: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("parse {LAYERED_BASELINE_FILE}: {e}"));
+            let (n_t, more_t) = compare_to_baseline("frames", &run["frames"], &base["frames"]);
+            let (n_i, more_i) =
+                compare_to_baseline("index_frames", &run["index_frames"], &base["index_frames"]);
+            problems.extend(more_t);
+            problems.extend(more_i);
+            let moved = problems.iter().filter(|p| p.contains("moved")).count();
+            println!("WCS gate: {} solved frames, {moved} moved", n_t + n_i);
+            for p in &problems {
+                println!("WCS gate: {p}");
+            }
+        }
+    }
+
     assert!(panicked.is_empty(), "GATE FAIL: panic(s): {panicked:?}");
     assert!(m78_correct, "GATE FAIL: M78 did not solve correctly on the tier stack");
     assert!(m78_sip, "GATE FAIL: M78 solved without SIP");
     assert!(wrong.is_empty(), "GATE FAIL: false positive(s): {wrong:?}");
     assert!(missed.is_empty(), "GATE FAIL: truth frame(s) not solved: {missed:?}");
     assert!(index_ran, "GATE FAIL: the blind index pass did not run (SOLVEMYASTRO_INDEX_DIR)");
+    assert!(index_wrong.is_empty(), "GATE FAIL: wrong blind index solve(s): {index_wrong:?}");
     assert_eq!(
         index_correct,
         INDEX_PASS_FRAMES.len(),
         "GATE FAIL: blind index pass solved {index_correct} of {}",
         INDEX_PASS_FRAMES.len()
     );
-
-    // The WCS gate: both lists against the frozen baseline.
-    match std::fs::read_to_string(manifest.join(LAYERED_BASELINE_FILE)) {
-        Err(_) => println!("WCS gate: no baseline, wrote the run"),
-        Ok(text) => {
-            let base: serde_json::Value = serde_json::from_str(&text)
-                .unwrap_or_else(|e| panic!("parse {LAYERED_BASELINE_FILE}: {e}"));
-            let (n_t, mut problems) = compare_to_baseline("frames", &run["frames"], &base["frames"]);
-            let (n_i, more) =
-                compare_to_baseline("index_frames", &run["index_frames"], &base["index_frames"]);
-            problems.extend(more);
-            let moved = problems.iter().filter(|p| p.contains("moved")).count();
-            println!("WCS gate: {} solved frames, {moved} moved", n_t + n_i);
-            for p in &problems {
-                println!("WCS gate: {p}");
-            }
-            assert!(problems.is_empty(), "GATE FAIL: WCS differs from the baseline: {problems:#?}");
-        }
-    }
+    assert!(problems.is_empty(), "GATE FAIL: WCS differs from the baseline: {problems:#?}");
     println!("\nGATE: layered-tier corpus PASSED");
 }
 
@@ -1568,4 +1618,15 @@ fn wcs_compare_flags_a_moved_coefficient() {
     let mut zero = frame();
     zero["sip"]["a"][0][0] = json!(1e-30);
     assert_eq!(wcs_moved(&zero, &base).as_deref(), Some("sip.a[0][0]"));
+}
+
+#[test]
+fn only_a_missing_baseline_reads_as_no_baseline() {
+    use std::io::{Error, ErrorKind};
+    assert_eq!(read_baseline(Ok("{}".to_string())).as_deref(), Some("{}"));
+    assert_eq!(read_baseline(Err(Error::from(ErrorKind::NotFound))), None);
+    let denied = std::panic::catch_unwind(|| {
+        read_baseline(Err(Error::from(ErrorKind::PermissionDenied)))
+    });
+    assert!(denied.is_err(), "a permission error must not read as no baseline");
 }
