@@ -10,7 +10,7 @@
 //! 7. Optional SIP fit (`sip.rs`).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -74,7 +74,7 @@ use rand_xoshiro::Xoshiro256StarStar;
 
 use crate::{
     index::QuadIndex,
-    diag::{CellStop, CellTrace, KnownTruth, PassTrace, RungTrace, SeedInfo, SolveTrace, TraceOutcome, VerifyTrace, known_truth_for},
+    diag::{CellStop, CellTrace, KnownTruth, PassTrace, RungTrace, SearchPath, SeedInfo, SolveTrace, TraceOutcome, VerifyTrace, known_truth_for},
     math::great_circle_deg,
     nn::PointGrid,
     project::project_catalog,
@@ -356,8 +356,96 @@ struct TrialResult {
     /// be applied to the full-field iterative refit decision.
     quad_match_pairs: usize,
     /// The same seed re-fitted about its own frame centre (see
-    /// [`refit_seed_at`]). Verified only when `wcs` is rejected.
-    recentered: Option<WcsSolution>,
+    /// [`refit_seed_at`]), with the image stars of the re-fit's quad matches.
+    /// Verified only when `wcs` is rejected.
+    refit: Option<(WcsSolution, Vec<usize>)>,
+    /// The image stars that chose this seed (indices into the frame's
+    /// SNR-ordered star list), sorted and without repeats: spiral = every
+    /// image star of every filtered quad match; re-fit = that set plus the
+    /// re-fit's own matches; index = the hypothesis quad plus, when the
+    /// agreement rule fired, the earlier quad it agreed with.
+    own_stars: Vec<usize>,
+    /// The four image stars of the first quad match (spiral) or of the
+    /// hypothesis quad (index): the four-star variant's set, read by the
+    /// decision's comparison column.
+    #[allow(dead_code)]
+    quad4: [usize; 4],
+    path: SearchPath,
+    /// True for a recentred alternate.
+    recentered: bool,
+}
+
+/// The sorted, deduplicated union of the image stars of the image quads that
+/// appear in `matches` (`(image quad, catalog quad)` pairs).
+fn quad_match_stars(matches: &[(usize, usize)], iquads: &[Quad]) -> Vec<usize> {
+    let mut stars: Vec<usize> =
+        matches.iter().flat_map(|&(ii, _)| iquads[ii].star_idx).collect();
+    stars.sort_unstable();
+    stars.dedup();
+    stars
+}
+
+/// Sorted union of two sorted, deduplicated star lists.
+fn union_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
+    let mut u: Vec<usize> = a.iter().chain(b).copied().collect();
+    u.sort_unstable();
+    u.dedup();
+    u
+}
+
+/// Counters shared by every search pass and fallback step of one solve:
+/// hypotheses verified (H of the decision's threshold), candidates past the
+/// seed pre-filter, and every verify trace in the order it was made.
+pub(crate) struct SolveStats {
+    hypotheses: AtomicUsize,
+    prefilter_passed: AtomicUsize,
+    verifies: Mutex<Vec<VerifyTrace>>,
+}
+
+impl SolveStats {
+    pub(crate) fn new() -> Self {
+        Self {
+            hypotheses: AtomicUsize::new(0),
+            prefilter_passed: AtomicUsize::new(0),
+            verifies: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Count one more hypothesis entering verification; returns the count
+    /// including this one.
+    pub(crate) fn next_hypothesis(&self) -> usize {
+        self.hypotheses.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // read by the decision's threshold (S4)
+    pub(crate) fn hypotheses(&self) -> usize {
+        self.hypotheses.load(Ordering::Relaxed)
+    }
+
+    /// A candidate cleared the seed pre-filter (before any scoring).
+    pub(crate) fn count_prefilter_passed(&self) {
+        self.prefilter_passed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // read by the failure's counts (S4)
+    pub(crate) fn prefilter_passed(&self) -> usize {
+        self.prefilter_passed.load(Ordering::Relaxed)
+    }
+
+    /// Append every verify trace of every pass and rung of `trace`, in order.
+    pub(crate) fn absorb(&self, trace: &SolveTrace) {
+        // Diagnostics only: a poisoned lock is recovered, not propagated.
+        let mut all = self.verifies.lock().unwrap_or_else(|e| e.into_inner());
+        for pass in &trace.passes {
+            for rung in &pass.rungs {
+                all.extend(rung.verifies.iter().cloned());
+            }
+        }
+    }
+
+    pub(crate) fn take_verifies(&self) -> Vec<VerifyTrace> {
+        std::mem::take(&mut *self.verifies.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 /// Catalog stars expected inside the frame, from a cone of `n_cone` stars:
@@ -456,6 +544,8 @@ fn run_trial(
     // PROSAC entirely and remain byte-identical. The `quad_match_pairs`
     // count is threaded to the caller for its own gating decisions.
     let quad_match_pairs = matches.len();
+    let own_stars = quad_match_stars(&matches, iquads);
+    let quad4 = iquads[matches[0].0].star_idx;
     const PROSAC_WEAK_THRESHOLD: usize = 10;
     let affine = if quad_match_pairs < PROSAC_WEAK_THRESHOLD {
         // Weak-match path: PROSAC (100 trials) for a robust seed affine.
@@ -488,9 +578,9 @@ fn run_trial(
     // with the catalog projected about the seed's own centre, kept as a
     // fallback candidate so seeds that already verify are untouched.
     let seed = wcs.pixel_to_sky(image_center.0, image_center.1);
-    let recentered = if great_circle_deg(seed.0, seed.1, ra0, dec0) > RECENTER_MIN_DEG {
+    let refit = if great_circle_deg(seed.0, seed.1, ra0, dec0) > RECENTER_MIN_DEG {
         refit_seed_at(seed, iquads, cat_stars, image_center, gs, mq, cfg, ransac_seed, timing)
-            .filter(|w| {
+            .filter(|(w, _)| {
                 let s = w.pixel_scale_arcsec();
                 s.is_finite() && (0.05..=120.0).contains(&s)
             })
@@ -514,7 +604,17 @@ fn run_trial(
         dist_from_hint_deg,
     });
     ct.stop = CellStop::SeedEmitted;
-    Some(TrialResult { wcs, tangent: (ra0, dec0), scale_arcsec: scale, quad_match_pairs, recentered })
+    Some(TrialResult {
+        wcs,
+        tangent: (ra0, dec0),
+        scale_arcsec: scale,
+        quad_match_pairs,
+        refit,
+        own_stars,
+        quad4,
+        path: SearchPath::Spiral,
+        recentered: false,
+    })
 }
 
 /// Seed-to-cell offset above which [`run_trial`] re-fits the seed about its
@@ -524,7 +624,7 @@ const RECENTER_MIN_DEG: f64 = 0.01;
 /// Re-run the quad match and affine fit with the catalog projected about
 /// `tangent` (the seed's frame centre). Same match floor and PROSAC rule as
 /// the first fit; `None` when the re-fit falls short, so the caller keeps its
-/// original seed.
+/// original seed. Also returns the image stars of the re-fit's quad matches.
 #[allow(clippy::too_many_arguments)]
 fn refit_seed_at(
     tangent: (f64, f64),
@@ -536,7 +636,7 @@ fn refit_seed_at(
     cfg: &SolveConfig,
     ransac_seed: u64,
     timing: &TimingProfile,
-) -> Option<WcsSolution> {
+) -> Option<(WcsSolution, Vec<usize>)> {
     let t = Instant::now();
     let projected = project_catalog(cat_stars, tangent.0, tangent.1);
     TimingProfile::add(&timing.project_ns, t.elapsed());
@@ -554,7 +654,7 @@ fn refit_seed_at(
     } else {
         fit_affine(&matches, iquads, &cat_quads)?
     };
-    Some(affine_to_wcs(&affine, image_center, tangent))
+    Some((affine_to_wcs(&affine, image_center, tangent), quad_match_stars(&matches, iquads)))
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +696,20 @@ fn count_inliers(
         }
     }
     (count, rss, pairs)
+}
+
+/// How many of `pairs` (projected position, matched image star) have an image
+/// star that is not among `own_stars` (indices into `image_pts`).
+fn inliers_outside_own(
+    pairs: &[((f64, f64), (f64, f64))],
+    image_pts: &[(f64, f64)],
+    own_stars: &[usize],
+) -> usize {
+    let own: std::collections::HashSet<(u64, u64)> = own_stars
+        .iter()
+        .map(|&i| (image_pts[i].0.to_bits(), image_pts[i].1.to_bits()))
+        .collect();
+    pairs.iter().filter(|(_, img)| !own.contains(&(img.0.to_bits(), img.1.to_bits()))).count()
 }
 
 /// Of the catalog stars that land in the frame, take the `image_pts.len()`
@@ -1019,11 +1133,41 @@ pub fn solve(
     cfg: &SolveConfig,
     cancel: Option<&AtomicBool>,
 ) -> Result<SolveSolution> {
-    solve_inner(image, hints, caches, indexes, cfg, cancel, None)
+    solve_with_stats(image, hints, caches, indexes, cfg, cancel, &SolveStats::new())
+}
+
+/// [`solve`] counting into `stats`, which several steps of one solve share.
+pub(crate) fn solve_with_stats(
+    image: &Path,
+    hints: &SolveHints,
+    caches: &crate::Caches<'_>,
+    indexes: &[&QuadIndex],
+    cfg: &SolveConfig,
+    cancel: Option<&AtomicBool>,
+    stats: &SolveStats,
+) -> Result<SolveSolution> {
+    solve_inner(image, hints, caches, indexes, cfg, cancel, None, stats)
+}
+
+/// Solve with the pixel scale confined to `scale_bounds = (lo, hi)`
+/// arcsec/px: the bounded ladder step B2 of [`crate::solve_with_index`] uses,
+/// public for the lab's wrong-scale arm. The hints' scale and field of view
+/// are not used to build the ladder.
+pub fn solve_bounded(
+    image: &Path,
+    hints: &SolveHints,
+    caches: &crate::Caches<'_>,
+    indexes: &[&QuadIndex],
+    cfg: &SolveConfig,
+    cancel: Option<&AtomicBool>,
+    scale_bounds: (f64, f64),
+) -> Result<SolveSolution> {
+    solve_inner(image, hints, caches, indexes, cfg, cancel, Some(scale_bounds), &SolveStats::new())
 }
 
 /// Internal entry: `scale_bounds = Some((lo_arcsec, hi_arcsec))` drives a
-/// bounded FOV ladder (B2); `None` uses the hint-derived/blind ladder.
+/// bounded FOV ladder (B2); `None` uses the hint-derived/blind ladder. Every
+/// return that holds the solve's trace first hands it to `stats`.
 pub(crate) fn solve_inner(
     image: &Path,
     hints: &SolveHints,
@@ -1032,6 +1176,7 @@ pub(crate) fn solve_inner(
     cfg: &SolveConfig,
     cancel: Option<&AtomicBool>,
     scale_bounds: Option<(f64, f64)>,
+    stats: &SolveStats,
 ) -> Result<SolveSolution> {
     // A representative cache for the incidental catalog-epoch read below; the
     // real cone queries go through `cones` (built later, per `Caches` variant).
@@ -1284,6 +1429,7 @@ pub(crate) fn solve_inner(
         frame_name: &frame_name,
         star_sigmas: star_sigmas_storage.as_deref(),
         image_pts_raw: image_pts_raw_storage.as_deref(),
+        stats,
     };
     // Quad-index search first when the hints leave position or scale open:
     // it costs the same anywhere on the sky, where the spiral's cost grows
@@ -1298,7 +1444,10 @@ pub(crate) fn solve_inner(
         let found = run_index_search(&ctx, indexes, hints, scale_bounds, &mut index_pass);
         trace.passes.push(index_pass);
         match found {
-            Err(e) => return Err(e),
+            Err(e) => {
+                stats.absorb(&trace);
+                return Err(e);
+            }
             Ok(Some(mut sol)) => {
                 sol.psf_fwhm_px = psf_fwhm_px;
                 trace.outcome = TraceOutcome::Solved {
@@ -1306,6 +1455,7 @@ pub(crate) fn solve_inner(
                     inliers: sol.matched_stars, rms_px: sol.rms_residual_px,
                 };
                 trace.total_ms = t0.elapsed().as_millis() as u64;
+                stats.absorb(&trace);
                 tracing::info!(
                     frame = %frame_name,
                     total_ms = trace.total_ms,
@@ -1351,6 +1501,7 @@ pub(crate) fn solve_inner(
         Err(e) => {
             trace.outcome = TraceOutcome::Failed(e.to_string());
             trace.total_ms = t0.elapsed().as_millis() as u64;
+            stats.absorb(&trace);
             tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %e, outcome = "failed", funnel = %trace, "solve failed");
             return Err(e);
         }
@@ -1361,6 +1512,7 @@ pub(crate) fn solve_inner(
                 inliers: sol.matched_stars, rms_px: sol.rms_residual_px,
             };
             trace.total_ms = t0.elapsed().as_millis() as u64;
+            stats.absorb(&trace);
             if cfg.print_timing {
                 timing.log_stage_timings(t0.elapsed(), &frame_name);
             }
@@ -1379,6 +1531,7 @@ pub(crate) fn solve_inner(
         Ok(None) => {}
     }
     if is_cancelled() {
+        stats.absorb(&trace);
         anyhow::bail!("cancelled");
     }
     tracing::warn!(
@@ -1392,6 +1545,7 @@ pub(crate) fn solve_inner(
         Err(e) => {
             trace.outcome = TraceOutcome::Failed(e.to_string());
             trace.total_ms = t0.elapsed().as_millis() as u64;
+            stats.absorb(&trace);
             tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %e, outcome = "failed", funnel = %trace, "solve failed");
             return Err(e);
         }
@@ -1402,6 +1556,7 @@ pub(crate) fn solve_inner(
                 inliers: sol.matched_stars, rms_px: sol.rms_residual_px,
             };
             trace.total_ms = t0.elapsed().as_millis() as u64;
+            stats.absorb(&trace);
             if cfg.print_timing {
                 timing.log_stage_timings(t0.elapsed(), &frame_name);
             }
@@ -1428,6 +1583,7 @@ pub(crate) fn solve_inner(
     );
     trace.outcome = TraceOutcome::Failed(msg.clone());
     trace.total_ms = t0.elapsed().as_millis() as u64;
+    stats.absorb(&trace);
     tracing::error!(frame = %frame_name, total_ms = trace.total_ms, error = %msg, outcome = "failed", funnel = %trace, "solve failed");
     // Return the structured failure so callers can render a precise reason
     // (the full funnel trace is carried in the `funnel` field of the error! event above).
@@ -1542,6 +1698,8 @@ struct SearchCtx<'a> {
     /// also compute a pass-1 SIP fit and keep whichever has the lower RMS.
     /// `None` in the fast profile — that path is completely untouched.
     image_pts_raw: Option<&'a [(f64, f64)]>,
+    /// Hypothesis count and verify traces shared by every step of the solve.
+    stats: &'a SolveStats,
 }
 
 /// One search pass over the autoFOV ladder × square spiral.
@@ -1720,13 +1878,17 @@ fn run_search(
             let alts: Vec<TrialResult> = results
                 .iter_mut()
                 .filter_map(|t| {
-                    let w = t.recentered.take()?;
+                    let (w, refit_stars) = t.refit.take()?;
                     Some(TrialResult {
                         scale_arcsec: w.pixel_scale_arcsec(),
                         wcs: w,
                         tangent: t.tangent,
                         quad_match_pairs: t.quad_match_pairs,
-                        recentered: None,
+                        refit: None,
+                        own_stars: union_sorted(&t.own_stars, &refit_stars),
+                        quad4: t.quad4,
+                        path: SearchPath::Spiral,
+                        recentered: true,
                     })
                 })
                 .collect();
@@ -1790,8 +1952,8 @@ fn run_index_search(
     let mut rt = RungTrace::new(0, 0, 0.0, 0);
     let mut rejected: Vec<((f64, f64), f64)> = Vec::new();
     // Unverified hypotheses waiting for a second, agreeing match:
-    // (crval, scale, rotation, mirrored).
-    let mut pending: Vec<((f64, f64), f64, f64, bool)> = Vec::new();
+    // (crval, scale, rotation, mirrored, image quad).
+    let mut pending: Vec<((f64, f64), f64, f64, bool, [usize; 4])> = Vec::new();
     let mut outcome: Result<Option<SolveSolution>> = Ok(None);
     let mut n_hypotheses = 0usize;
     let mut last_queries = 0usize;
@@ -1817,18 +1979,26 @@ fn run_index_search(
         // independent match agrees with it: chance code matches scatter over
         // the sky, a true field yields many matches with one WCS, and each
         // verification reads catalog cones.
+        let mut own_stars = {
+            let mut q = h.star_idx.to_vec();
+            q.sort_unstable();
+            q
+        };
         if n_hypotheses >= INDEX_FREE_VERIFIES {
             let rot = h.wcs.field_rotation_deg();
             let flip = h.wcs.cd[0][0] * h.wcs.cd[1][1] - h.wcs.cd[0][1] * h.wcs.cd[1][0] < 0.0;
-            let agrees = |&(p, s, r, f): &((f64, f64), f64, f64, bool)| {
+            let agrees = |&(p, s, r, f, _): &((f64, f64), f64, f64, bool, [usize; 4])| {
                 f == flip && same(p, s) && ((rot - r + 540.0) % 360.0 - 180.0).abs() < 1.0
             };
             match pending.iter().position(agrees) {
                 Some(i) => {
-                    pending.swap_remove(i);
+                    let earlier = pending.swap_remove(i).4;
+                    let mut e = earlier.to_vec();
+                    e.sort_unstable();
+                    own_stars = union_sorted(&own_stars, &e);
                 }
                 None => {
-                    pending.push((c, scale, rot, flip));
+                    pending.push((c, scale, rot, flip, h.star_idx));
                     return false;
                 }
             }
@@ -1839,7 +2009,11 @@ fn run_index_search(
             tangent: c,
             wcs: h.wcs,
             quad_match_pairs: 4,
-            recentered: None,
+            refit: None,
+            own_stars,
+            quad4: h.star_idx,
+            path: SearchPath::Index,
+            recentered: false,
         };
         let t_v = Instant::now();
         let verified = verify_trials(ctx, vec![trial], &mut rt);
@@ -1910,6 +2084,7 @@ fn verify_trials(
         frame_name,
         star_sigmas,
         image_pts_raw,
+        stats,
         ..
     } = ctx;
     let is_cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
@@ -1917,6 +2092,9 @@ fn verify_trials(
             if is_cancelled() {
                 anyhow::bail!("cancelled");
             }
+            // One count for every candidate of every pass and step of the solve.
+            let hypotheses_so_far = stats.next_hypothesis();
+            debug_assert!(trial.own_stars.iter().all(|&i| i < image_pts.len()));
 
         // 6. Verification: cone at seed centre, count inliers.
             let seed_scale = trial.scale_arcsec;
@@ -1933,6 +2111,12 @@ fn verify_trials(
                     dist_from_truth_deg: None, scale_ratio_to_truth: None,
                     accepted: false,
                     reject_reason: Some("verify_radius_invalid".into()),
+                    path: trial.path,
+                    recentered: trial.recentered,
+                    hypotheses_so_far,
+                    own_star_count: trial.own_stars.len(),
+                    image_star_count: image_pts.len(),
+                    inliers_outside_own: 0,
                 });
                 continue 'candidates;
             }
@@ -1948,6 +2132,12 @@ fn verify_trials(
                     dist_from_truth_deg: None, scale_ratio_to_truth: None,
                     accepted: false,
                     reject_reason: Some("seed_ra_dec_nonfinite".into()),
+                    path: trial.path,
+                    recentered: trial.recentered,
+                    hypotheses_so_far,
+                    own_star_count: trial.own_stars.len(),
+                    image_star_count: image_pts.len(),
+                    inliers_outside_own: 0,
                 });
                 continue 'candidates;
             }
@@ -1970,6 +2160,12 @@ fn verify_trials(
                 final_inliers: 0, final_rms_px: 0.0,
                 dist_from_truth_deg, scale_ratio_to_truth,
                 accepted: false, reject_reason: None,
+                path: trial.path,
+                recentered: trial.recentered,
+                hypotheses_so_far,
+                own_star_count: trial.own_stars.len(),
+                image_star_count: image_pts.len(),
+                inliers_outside_own: 0,
             };
 
             // Verification uses bright stars to keep the expected-count denominator sensible.
@@ -2030,6 +2226,7 @@ fn verify_trials(
             timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
 
             v.seed_inliers = seed_inliers;
+            v.inliers_outside_own = inliers_outside_own(&seed_pairs, image_pts, &trial.own_stars);
             v.seed_rms_px = if seed_inliers > 0 {
                 (seed_rss / seed_inliers as f64).sqrt()
             } else {
@@ -2083,6 +2280,8 @@ fn verify_trials(
                 rt.verifies.push(v);
                 continue 'candidates;
             }
+
+            stats.count_prefilter_passed();
 
             // 7. Second solve — full-field affine refit over inlier pairs.
             //
@@ -2555,6 +2754,46 @@ mod orchestrate_unit_tests {
         let flat: Vec<usize> = spiral_chunks(&cells).flatten().copied().collect();
         assert_eq!(flat, cells);
         assert_eq!(spiral_chunks::<usize>(&[]).count(), 0);
+    }
+
+    #[test]
+    fn quad_match_stars_is_the_sorted_union_of_image_quad_stars() {
+        let quad = |star_idx: [usize; 4]| Quad {
+            star_idx,
+            ratios: [0.0; 5],
+            longest: 1.0,
+            center: (0.0, 0.0),
+        };
+        let iquads = [quad([0, 1, 2, 3]), quad([2, 3, 4, 5]), quad([7, 8, 9, 10])];
+        let matches = [(0, 9), (1, 4), (0, 2)];
+        assert_eq!(quad_match_stars(&matches, &iquads), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(union_sorted(&[0, 2, 4], &[1, 2, 5]), vec![0, 1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn solve_stats_count_every_hypothesis_once() {
+        let stats = SolveStats::new();
+        assert_eq!(stats.next_hypothesis(), 1);
+        assert_eq!(stats.next_hypothesis(), 2);
+        assert_eq!(stats.next_hypothesis(), 3);
+        assert_eq!(stats.hypotheses(), 3);
+        stats.count_prefilter_passed();
+        stats.count_prefilter_passed();
+        assert_eq!(stats.prefilter_passed(), 2);
+        assert!(stats.take_verifies().is_empty());
+    }
+
+    #[test]
+    fn inliers_outside_own_counts_matched_stars_not_in_the_own_set() {
+        let image_pts = [(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)];
+        let pairs = [
+            ((1.1, 2.1), image_pts[0]),
+            ((3.1, 4.1), image_pts[1]),
+            ((5.1, 6.1), image_pts[2]),
+        ];
+        assert_eq!(inliers_outside_own(&pairs, &image_pts, &[0, 2]), 1);
+        assert_eq!(inliers_outside_own(&pairs, &image_pts, &[]), 3);
+        assert_eq!(inliers_outside_own(&pairs, &image_pts, &[0, 1, 2]), 0);
     }
 
     #[test]

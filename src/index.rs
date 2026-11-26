@@ -769,6 +769,9 @@ pub struct Hypothesis {
     pub star_n: usize,
     /// Code lookups made so far.
     pub queries: usize,
+    /// The four image stars of the matching quad: indices into the `pts`
+    /// given to [`search`] (a prefix of the caller's SNR-ordered list).
+    pub star_idx: [usize; 4],
 }
 
 /// Similarity (with optional reflection) mapping image points to tangent-plane
@@ -891,7 +894,7 @@ pub fn search(
                     if !(params.scale_lo..=params.scale_hi).contains(&scale) {
                         continue;
                     }
-                    if emit(Hypothesis { wcs, star_n: n, queries: *queries }) {
+                    if emit(Hypothesis { wcs, star_n: n, queries: *queries, star_idx: quad }) {
                         return true;
                     }
                 }
@@ -1039,6 +1042,66 @@ mod tests {
                 (0..all.len()).filter(|&i| (0..4).all(|k| (all[i][k] - q[k]).abs() <= tol)).collect();
             assert_eq!(got, want);
         }
+    }
+
+    /// A hypothesis names the four image stars of the quad that produced it.
+    #[test]
+    fn a_hypothesis_names_its_image_quad() {
+        let mut s = 7u64;
+        let mut rnd = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let stars: Vec<crate::cache::StarRecord> = (0..40_000)
+            .map(|_| crate::cache::StarRecord {
+                ra: rnd() * 360.0,
+                dec: (rnd() * 2.0 - 1.0).asin().to_degrees(),
+                mag: (4.0 + rnd() * 10.0) as f32,
+                pmra_mas_yr: 0.0,
+                pmdec_mas_yr: 0.0,
+            })
+            .collect();
+        let cat_dir = tempfile::tempdir().expect("tmp");
+        crate::cache::build_cache(stars, cat_dir.path(), 2016.0, |_| {}).expect("cache");
+        let cache = StarCache::open(cat_dir.path()).expect("open cache");
+        let idx_dir = tempfile::tempdir().expect("tmp");
+        let params = BuildParams { min_depth: 2, max_depth: 2, stars_per_cell: 10, quads_per_cell: 8 };
+        build_index(&[&cache], idx_dir.path(), &params, |_| {}).expect("build");
+        let idx = QuadIndex::open(idx_dir.path()).expect("open index");
+        let band = idx.bands()[0];
+
+        // Band quad 0's four stars at 20"/px about their AB midpoint, in a
+        // 3000 x 3000 frame, then 40 random points after them.
+        let v = idx.quad_stars(&band, 0);
+        let (mra, mdec) = radec(midpoint(v[0], v[1]));
+        let mut pts: Vec<(f64, f64)> = v
+            .iter()
+            .map(|&x| {
+                let (ra, dec) = radec(x);
+                let (xi, eta) = tan::sky_to_tangent(ra, dec, mra, mdec);
+                (1500.0 + xi * 3600.0 / 20.0, 1500.0 + eta * 3600.0 / 20.0)
+            })
+            .collect();
+        for _ in 0..40 {
+            pts.push((rnd() * 3000.0, rnd() * 3000.0));
+        }
+
+        let mut first: Option<Hypothesis> = None;
+        search(
+            &[&idx],
+            &pts,
+            (1500.0, 1500.0),
+            &SearchParams::default(),
+            || false,
+            |h| {
+                first = Some(h);
+                true
+            },
+        );
+        let h = first.expect("the quad's own stars produce a hypothesis");
+        let mut got = h.star_idx;
+        got.sort_unstable();
+        assert_eq!(got, [0, 1, 2, 3]);
     }
 
     #[test]

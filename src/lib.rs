@@ -378,8 +378,40 @@ pub fn solve_with_index(
     cfg: &SolveConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SolveSolution> {
+    solve_with_index_stats(image, hints, caches, indexes, cfg, cancel, &orchestrate::SolveStats::new())
+}
+
+/// [`solve_with_index`] that also returns the verify trace of every candidate
+/// of every step, in the order they were verified; on a success the last one
+/// is the accepted candidate's. For the corpus recorder and the lab, not a
+/// stable API.
+#[doc(hidden)]
+pub fn solve_traced(
+    image: &Path,
+    hints: &SolveHints,
+    caches: &Caches<'_>,
+    indexes: &[&QuadIndex],
+    cfg: &SolveConfig,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> (Result<SolveSolution>, Vec<diag::VerifyTrace>) {
+    let stats = orchestrate::SolveStats::new();
+    let result = solve_with_index_stats(image, hints, caches, indexes, cfg, cancel, &stats);
+    (result, stats.take_verifies())
+}
+
+/// The steps of [`solve_with_index`], counting every hypothesis once into
+/// `stats` (one count for steps A, B1, B2 and C).
+fn solve_with_index_stats(
+    image: &Path,
+    hints: &SolveHints,
+    caches: &Caches<'_>,
+    indexes: &[&QuadIndex],
+    cfg: &SolveConfig,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    stats: &orchestrate::SolveStats,
+) -> Result<SolveSolution> {
     // Step A — hinted (or blind) solve.
-    let result = orchestrate::solve(image, hints, caches, indexes, cfg, cancel);
+    let result = orchestrate::solve_with_stats(image, hints, caches, indexes, cfg, cancel, stats);
     if result.is_ok() {
         return result;
     }
@@ -409,7 +441,9 @@ pub fn solve_with_index(
                 fov_deg: None,
                 ..*hints
             };
-            if let Ok(sol) = orchestrate::solve(image, &b1_hints, caches, indexes, cfg, cancel) {
+            if let Ok(sol) =
+                orchestrate::solve_with_stats(image, &b1_hints, caches, indexes, cfg, cancel, stats)
+            {
                 return Ok(sol);
             }
         }
@@ -428,7 +462,7 @@ pub fn solve_with_index(
                     ..*hints
                 };
                 if let Ok(sol) =
-                    orchestrate::solve_inner(image, &sweep_hints, caches, indexes, cfg, cancel, Some((lo, hi)))
+                    orchestrate::solve_inner(image, &sweep_hints, caches, indexes, cfg, cancel, Some((lo, hi)), stats)
                 {
                     return Ok(sol);
                 }
@@ -442,7 +476,9 @@ pub fn solve_with_index(
             "hinted solve failed — retrying with the position prior cleared (blind position, scale kept)"
         );
         let blind_hints = SolveHints { ra: None, dec: None, ..*hints };
-        if let Ok(sol) = orchestrate::solve(image, &blind_hints, caches, indexes, cfg, cancel) {
+        if let Ok(sol) =
+            orchestrate::solve_with_stats(image, &blind_hints, caches, indexes, cfg, cancel, stats)
+        {
             return Ok(sol);
         }
     }

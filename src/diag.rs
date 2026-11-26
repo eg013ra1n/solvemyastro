@@ -198,7 +198,38 @@ pub struct VerifyTrace {
     pub scale_ratio_to_truth: Option<f64>,
     pub accepted: bool,
     pub reject_reason: Option<String>,
+    /// The search that produced this candidate.
+    pub path: SearchPath,
+    /// True for a recentred re-fit of a spiral seed.
+    pub recentered: bool,
+    /// Hypotheses entering verification so far in this solve, this one
+    /// included, across every pass and fallback step.
+    pub hypotheses_so_far: usize,
+    /// Image stars that chose this candidate (`own_stars.len()`).
+    pub own_star_count: usize,
+    /// Image stars of the frame the candidate was verified against.
+    pub image_star_count: usize,
+    /// Of the seed pre-filter's inliers (`seed_inliers`), those whose image
+    /// star is not one of the candidate's own stars.
+    pub inliers_outside_own: usize,
 }
+
+/// Which search produced a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchPath {
+    Spiral,
+    Index,
+}
+
+impl SearchPath {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Spiral => "spiral",
+            Self::Index => "index",
+        }
+    }
+}
+
 
 /// A known-correct WCS for a specific frame, used to ground-truth-check the
 /// solver's intermediate trial seeds. Populated by `known_truth_for` from
@@ -521,4 +552,15 @@ impl fmt::Display for SolveTrace {
 fn avg<I: IntoIterator<Item = usize>>(iter: I) -> usize {
     let v: Vec<usize> = iter.into_iter().collect();
     if v.is_empty() { 0 } else { v.iter().sum::<usize>() / v.len() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_path_names_are_stable() {
+        assert_eq!(SearchPath::Spiral.as_str(), "spiral");
+        assert_eq!(SearchPath::Index.as_str(), "index");
+    }
 }

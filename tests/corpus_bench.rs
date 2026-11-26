@@ -1111,6 +1111,40 @@ fn frame_json(name: &str, res: &anyhow::Result<solvemyastro::SolveSolution>) -> 
     })
 }
 
+/// The own-set keys of an accepted candidate, from `solve_traced`'s last
+/// trace: `path`, `recentered`, `hypotheses`, `own` (image stars that chose
+/// the seed), `image_pts`, `linear_inliers` (the seed pre-filter's inliers),
+/// `inliers_outside_own` (of those, the ones not in the own set) and
+/// `final_inliers`. Recorded, not compared with the baseline (`wcs_moved`
+/// reads only the WCS keys).
+fn own_set_json(traces: &[solvemyastro::diag::VerifyTrace]) -> serde_json::Value {
+    let t = traces.last().expect("a solved frame has a verify trace");
+    assert!(t.accepted, "the last verify trace of a solved frame is the accepted candidate's");
+    serde_json::json!({
+        "path": t.path.as_str(),
+        "recentered": t.recentered,
+        "hypotheses": t.hypotheses_so_far,
+        "own": t.own_star_count,
+        "image_pts": t.image_star_count,
+        "linear_inliers": t.seed_inliers,
+        "inliers_outside_own": t.inliers_outside_own,
+        "final_inliers": t.final_inliers,
+    })
+}
+
+/// `frame_json` plus `own_set` for a solved frame.
+fn traced_frame_json(
+    name: &str,
+    res: &anyhow::Result<solvemyastro::SolveSolution>,
+    traces: &[solvemyastro::diag::VerifyTrace],
+) -> serde_json::Value {
+    let mut rec = frame_json(name, res);
+    if res.is_ok() {
+        rec["own_set"] = own_set_json(traces);
+    }
+    rec
+}
+
 /// The first key path at which two values differ, or `None`. Numbers are equal
 /// when `|x - y| <= 1e-9 * max(|x|, |y|)` (exactly equal when both are 0);
 /// arrays must have equal length.
@@ -1301,6 +1335,7 @@ fn corpus_layered_tiers() {
     let mut m78_correct = false;
     let mut m78_sip = false;
     let mut tier_frames: Vec<serde_json::Value> = Vec::new();
+    let mut bounded_pick: Option<(PathBuf, SolveHints, f64, usize, u128)> = None;
 
     for path in &files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -1326,14 +1361,27 @@ fn corpus_layered_tiers() {
         let hints = hints_from_fits(&hdr, n1.max(n2));
 
         let t0 = Instant::now();
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            solve(path, &hints, &caches, &cfg, None)
+        let traced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            solvemyastro::solve_traced(path, &hints, &caches, &[], &cfg, None)
         }));
         let elapsed_ms = t0.elapsed().as_millis();
+        let (res, traces) = match traced {
+            Ok((r, t)) => (Ok(r), t),
+            Err(e) => (Err(e), Vec::new()),
+        };
         tier_frames.push(match &res {
-            Ok(r) => frame_json(&name, r),
+            Ok(r) => traced_frame_json(&name, r, &traces),
             Err(_) => frame_json(&name, &Err(anyhow::anyhow!("panicked"))),
         });
+        // The quickest correct truth frame feeds the `solve_bounded` check.
+        if let (Ok(Ok(s)), true) = (&res, truth_solved) {
+            let near = sep_arcsec(tra, tdec, s.wcs.crval.0, s.wcs.crval.1) < 30.0
+                && (s.pixel_scale_arcsec - tscale).abs() / tscale * 100.0 < 2.0;
+            if near && bounded_pick.as_ref().is_none_or(|b| elapsed_ms < b.4) {
+                bounded_pick =
+                    Some((path.clone(), hints, tscale, tier_frames.len() - 1, elapsed_ms));
+            }
+        }
         let (solved, ra, dec, scale, has_sip) = match res {
             Ok(Ok(s)) => (
                 true,
@@ -1450,11 +1498,12 @@ fn corpus_layered_tiers() {
                     epoch: hints_from_fits(&hdr, n1.max(n2)).epoch,
                     ..SolveHints::default()
                 };
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    solvemyastro::solve_with_index(path, &hints, &caches, &[&index], &cfg, None)
+                let traced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    solvemyastro::solve_traced(path, &hints, &caches, &[&index], &cfg, None)
                 }));
-                let did_panic = res.is_err();
-                let res = res.unwrap_or_else(|_| Err(anyhow::anyhow!("panicked")));
+                let did_panic = traced.is_err();
+                let (res, traces) = traced
+                    .unwrap_or_else(|_| (Err(anyhow::anyhow!("panicked")), Vec::new()));
                 // A solve outside the truth's 30" / 2 % is WRONG: reported with
                 // its position and scale, kept under "wrong" (a key `wcs_moved`
                 // ignores), never recorded as a solve.
@@ -1487,7 +1536,7 @@ fn corpus_layered_tiers() {
                 };
                 println!("index pass: {:50} {tag}", &name[..name.len().min(50)]);
                 let mut rec = if correct {
-                    frame_json(&name, &res)
+                    traced_frame_json(&name, &res, &traces)
                 } else {
                     frame_json(&name, &Err(anyhow::anyhow!("not a truth solve")))
                 };
@@ -1504,6 +1553,44 @@ fn corpus_layered_tiers() {
     }
     println!("index pass: {index_correct} solved of {}", INDEX_PASS_FRAMES.len());
     panicked.extend(index_panicked);
+
+    // `solve_bounded`: a window around a frame's true scale solves the frame
+    // to the same field as `solve`. The bounded ladder is B2's, a different
+    // ladder from the hinted one, so it may seed in another cell and end on a
+    // slightly different WCS: the check is the same field (10" in position,
+    // 1 % in scale), not the same bits.
+    let (bpath, bhints, bscale, bidx, _) =
+        bounded_pick.expect("a correct truth frame to check solve_bounded on");
+    let bname = bpath.file_name().unwrap().to_string_lossy().to_string();
+    let bounded = solvemyastro::orchestrate::solve_bounded(
+        &bpath,
+        &bhints,
+        &caches,
+        &[],
+        &cfg,
+        None,
+        (bscale * 0.9, bscale * 1.1),
+    );
+    let bounded_problem: Option<String> = match &bounded {
+        Ok(b) => {
+            let r = &tier_frames[bidx];
+            let sep = sep_arcsec(
+                b.wcs.crval.0,
+                b.wcs.crval.1,
+                r["crval"][0].as_f64().unwrap(),
+                r["crval"][1].as_f64().unwrap(),
+            );
+            let dscale = (b.pixel_scale_arcsec / bscale - 1.0).abs() * 100.0;
+            println!(
+                "solve_bounded: {bname} {sep:.2} arcsec from solve's centre, scale {dscale:.3} % \
+                 from the truth's, matched {} vs {}",
+                b.matched_stars, r["matched_stars"]
+            );
+            (sep >= 10.0 || dscale >= 1.0)
+                .then(|| format!("{bname}: {sep:.2} arcsec, scale {dscale:.3} % off"))
+        }
+        Err(e) => Some(format!("{bname}: solve_bounded failed: {e}")),
+    };
 
     let run = serde_json::json!({
         "schema_version": 1,
@@ -1552,6 +1639,7 @@ fn corpus_layered_tiers() {
     assert!(wrong.is_empty(), "GATE FAIL: false positive(s): {wrong:?}");
     assert!(missed.is_empty(), "GATE FAIL: truth frame(s) not solved: {missed:?}");
     assert!(index_ran, "GATE FAIL: the blind index pass did not run (SOLVEMYASTRO_INDEX_DIR)");
+    assert!(bounded_problem.is_none(), "GATE FAIL: solve_bounded: {bounded_problem:?}");
     assert!(index_wrong.is_empty(), "GATE FAIL: wrong blind index solve(s): {index_wrong:?}");
     assert_eq!(
         index_correct,
