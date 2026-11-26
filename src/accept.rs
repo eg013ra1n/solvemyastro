@@ -395,17 +395,27 @@ mod tests {
     }
 
     /// The decision's references are the catalogue stars to the verification
-    /// magnitude limit ([`crate::orchestrate::VERIFY_MAG_LIMIT`], the first
-    /// level of the decision's list): moving it moves `N_R`, the odds and so
-    /// every embedding app's verdicts.
+    /// levels ([`crate::orchestrate::VERIFY_MAG_LIMIT`] and the middle level,
+    /// the first two of the decision's list) until the frame holds the density
+    /// floor: moving any of them moves `N_R`, the odds and so every embedding
+    /// app's verdicts.
     #[test]
-    fn the_verify_magnitude_limit_is_pinned() {
+    fn the_verify_levels_and_density_floor_are_pinned() {
+        use crate::orchestrate::{
+            VERIFY_DENSITY_DIV, VERIFY_DENSITY_MAX, VERIFY_DENSITY_MIN, VERIFY_MAG_LIMIT,
+            VERIFY_MID_MAG_LIMIT,
+        };
+        let recipe = "moving it moves N_R, the odds and embedding apps' verdicts: bump their \
+                      solve-recipe version (Athenaeum's config::SOLVE_RECIPE_VERSION)";
+        assert_eq!(VERIFY_MAG_LIMIT, 12.0, "VERIFY_MAG_LIMIT is the first reference level: {recipe}");
         assert_eq!(
-            crate::orchestrate::VERIFY_MAG_LIMIT,
-            12.0,
-            "VERIFY_MAG_LIMIT is the decision's first reference level: moving it moves N_R, the \
-             odds and embedding apps' verdicts: bump their solve-recipe version (Athenaeum's \
-             config::SOLVE_RECIPE_VERSION)"
+            VERIFY_MID_MAG_LIMIT, 14.0,
+            "VERIFY_MID_MAG_LIMIT is the middle reference level: {recipe}"
+        );
+        assert_eq!(
+            (VERIFY_DENSITY_DIV, VERIFY_DENSITY_MIN, VERIFY_DENSITY_MAX),
+            (4, 8, 100),
+            "the density floor clamp(n / DIV, MIN, MAX) stops the ladder: {recipe}"
         );
     }
 }

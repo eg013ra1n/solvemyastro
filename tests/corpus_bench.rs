@@ -1062,7 +1062,7 @@ const INDEX_PASS_FRAMES: &[&str] = &[
 /// The WCS gate's run file: every solved frame's WCS, written by
 /// `corpus_layered_tiers` (not committed; regenerated on each run).
 const LAYERED_RUN_FILE: &str = "tests/corpus_layered_run.json";
-/// The frozen baseline the run is compared against (frozen at 0.3.0).
+/// The frozen baseline the run is compared against (frozen at 0.4.0).
 const LAYERED_BASELINE_FILE: &str = "tests/corpus_layered_baseline.json";
 
 fn sip_table_json(c: &solvemyastro::SipCoefficients) -> serde_json::Value {

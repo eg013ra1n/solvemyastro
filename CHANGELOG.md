@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so is the 0.3.0 known issue (the in-field count read far too low) with the
   function that had it. The seed pre-filter at ln 10⁶ and every search stage are
   unchanged.
+- The decision also refuses a candidate whose final WCS matches fewer than
+  `min_final_inliers` image stars (one detection per reference, the acceptance
+  gate's floor), so the search goes on instead of returning a solution the gate
+  would refuse.
+- A solve whose best candidate scored below the bar fails with "the best match
+  could be a chance alignment (odds 10^x to 1, 10^y needed)".
 - `diag::best_finite_log10_odds` (crate-internal) folds the candidates' scores
   into `FailureClass::NotConfident`.
 

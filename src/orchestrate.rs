@@ -148,6 +148,13 @@ const MAX_MATCH_PX: f64 = 20.0;
 /// matching, but only bright stars for inlier acceptance to avoid the
 /// `expected / 15%` floor being inflated by thousands of faint Gaia stars.
 pub(crate) const VERIFY_MAG_LIMIT: f32 = 12.0;
+/// The verification ladder's middle level (the decision's second reference level).
+pub(crate) const VERIFY_MID_MAG_LIMIT: f32 = 14.0;
+/// The ladder's density floor is `clamp(|image stars| / DIV, MIN, MAX)` verification
+/// stars; it stops the ladder and sets the decision's reference count `N_R`.
+pub(crate) const VERIFY_DENSITY_DIV: usize = 4;
+pub(crate) const VERIFY_DENSITY_MIN: usize = 8;
+pub(crate) const VERIFY_DENSITY_MAX: usize = 100;
 
 // ---------------------------------------------------------------------------
 // FOV ladder
@@ -368,7 +375,6 @@ struct TrialResult {
     /// The four image stars of the first quad match (spiral) or of the
     /// hypothesis quad (index): the four-star variant's set, read by the
     /// decision's comparison column.
-    #[allow(dead_code)]
     quad4: [usize; 4],
     path: SearchPath,
     /// True for a recentred alternate.
@@ -735,11 +741,37 @@ fn references_in_frame(
         .collect()
 }
 
+/// The decision's accept rule on the final WCS: the score must be finite and
+/// reach the bar, and the final WCS must match at least `floor` image stars
+/// (one detection per reference, the acceptance gate's own floor), so a
+/// solution the gate would refuse is never returned and the search goes on to
+/// the next candidate. `Err` carries the trace's reject reason.
+fn decision_accepts(
+    log10_odds: f64,
+    required: f64,
+    matched: usize,
+    floor: usize,
+) -> Result<(), String> {
+    if !log10_odds.is_finite() {
+        return Err(format!("not confident: log10 odds {log10_odds} is not finite"));
+    }
+    if !(log10_odds >= required) {
+        return Err(format!("not confident: log10 odds {log10_odds:.1} < {required:.1}"));
+    }
+    if matched < floor {
+        return Err(format!("too few matched on the final WCS: {matched} < {floor}"));
+    }
+    Ok(())
+}
+
 /// The decision's reference list: `start` (the frame's share of the ladder's
 /// cone) deepened over `levels` beyond `start_level` while it holds fewer than
 /// `floor` stars. `fetch(level)` queries the cone at that magnitude limit and
 /// projects it in the frame; an empty answer (a failed query) leaves the list
-/// as it was. Returns the list and the magnitude limit it came from.
+/// as it was, a level that is not deeper than the one in use is skipped, and a
+/// deeper answer that is shorter than the list in hand is not taken (a
+/// `catalog_mag_limit` under the middle level must not shrink `N_R`). Returns
+/// the list and the magnitude limit it came from.
 fn decision_references(
     start: Vec<(f64, f64)>,
     start_level: usize,
@@ -751,10 +783,12 @@ fn decision_references(
     let mut used = start_level;
     let mut next = start_level + 1;
     while refs.len() < floor && next < levels.len() {
-        let got = fetch(levels[next]);
-        if !got.is_empty() {
-            refs = got;
-            used = next;
+        if levels[next] > levels[used] {
+            let got = fetch(levels[next]);
+            if !got.is_empty() && got.len() >= refs.len() {
+                refs = got;
+                used = next;
+            }
         }
         next += 1;
     }
@@ -1586,10 +1620,19 @@ pub(crate) fn solve_inner(
     if cfg.print_timing {
         timing.log_stage_timings(t0.elapsed(), &frame_name);
     }
-    let msg = format!(
-        "no trial passed verification across {} FOV rung(s) (incl. density-balanced retry)",
-        rungs.len()
-    );
+    let class = trace.classify();
+    let msg = match class {
+        crate::diag::FailureClass::NotConfident { best_log10_odds } => {
+            crate::diag::chance_alignment_message(
+                best_log10_odds,
+                crate::diag::best_decision_bar(trace.all_verifies(), cfg.accept_log10_odds),
+            )
+        }
+        _ => format!(
+            "no trial passed verification across {} FOV rung(s) (incl. density-balanced retry)",
+            rungs.len()
+        ),
+    };
     trace.outcome = TraceOutcome::Failed(msg.clone());
     trace.total_ms = t0.elapsed().as_millis() as u64;
     stats.absorb(&trace);
@@ -1597,7 +1640,7 @@ pub(crate) fn solve_inner(
     // Return the structured failure so callers can render a precise reason
     // (the full funnel trace is carried in the `funnel` field of the error! event above).
     Err(anyhow::Error::new(crate::diag::SolveFailure {
-        class: trace.classify(),
+        class,
         best_attempt: trace.best_attempt(),
         message: msg,
         hypotheses_verified: stats.hypotheses(),
@@ -2223,8 +2266,9 @@ fn verify_trials(
             // floored at 8) so a healthy density forces continue-to-next-tier.
             // We *always* keep the deepest non-empty result so even if no tier hits
             // the floor we still try verification rather than silently dropping.
-            let density_floor = (image_pts.len() / 4).clamp(8, 100);
-            let verify_levels = [VERIFY_MAG_LIMIT, 14.0_f32, cfg.catalog_mag_limit];
+            let density_floor =
+                (image_pts.len() / VERIFY_DENSITY_DIV).clamp(VERIFY_DENSITY_MIN, VERIFY_DENSITY_MAX);
+            let verify_levels = [VERIFY_MAG_LIMIT, VERIFY_MID_MAG_LIMIT, cfg.catalog_mag_limit];
             // The ladder level `verify_stars` stopped at (the decision's list starts there).
             let mut verify_level = 0usize;
             let verify_stars = {
@@ -2702,13 +2746,15 @@ fn verify_trials(
                 required_log10_odds = required_odds,
                 "solve decision"
             );
-            if !(scan.log10_odds >= required_odds) {
+            if let Err(reason) = decision_accepts(
+                scan.log10_odds,
+                required_odds,
+                scan.matched_stars,
+                cfg.min_final_inliers,
+            ) {
                 if let Some(last) = rt.verifies.last_mut() {
                     last.accepted = false;
-                    last.reject_reason = Some(format!(
-                        "not confident: log10 odds {:.1} < {:.1}",
-                        scan.log10_odds, required_odds
-                    ));
+                    last.reject_reason = Some(reason);
                 }
                 continue 'candidates;
             }
@@ -2838,6 +2884,47 @@ mod orchestrate_unit_tests {
         assert_eq!((r.len(), lvl), (70, 17.0));
         let (r, lvl) = decision_references(list(12), 0, &levels, 100, |_| Vec::new());
         assert_eq!((r.len(), lvl), (12, 12.0));
+    }
+
+    #[test]
+    fn decision_references_never_shrink_and_never_go_back() {
+        let list = |n: usize| -> Vec<(f64, f64)> { (0..n).map(|i| (i as f64, 0.0)).collect() };
+        // Levels 12, 14, 13 (a catalogue limit under the middle level): 13 is not deeper
+        // than 14, so it is not asked, and the G <= 14 list stays.
+        let mut asked = Vec::new();
+        let (r, lvl) = decision_references(list(12), 0, &[12.0, 14.0, 13.0], 100, |m| {
+            asked.push(m);
+            list(if m == 14.0 { 40 } else { 25 })
+        });
+        assert_eq!((r.len(), lvl), (40, 14.0));
+        assert_eq!(asked, vec![14.0]);
+        // A deeper level that answers with a shorter list does not replace the longer one.
+        let (r, lvl) = decision_references(list(12), 0, &[12.0, 14.0, 17.0], 100, |m| {
+            list(if m == 14.0 { 40 } else { 30 })
+        });
+        assert_eq!((r.len(), lvl), (40, 14.0));
+    }
+
+    #[test]
+    fn the_decision_floors_the_matches_on_the_final_wcs() {
+        // Odds far above the bar, but 5 matched at a floor of 6: refused with that reason.
+        assert_eq!(
+            decision_accepts(20.0, 9.0, 5, 6),
+            Err("too few matched on the final WCS: 5 < 6".to_string())
+        );
+        assert_eq!(decision_accepts(20.0, 9.0, 6, 6), Ok(()));
+        // Odds under the bar: refused on the odds, however many matched.
+        let e = decision_accepts(8.0, 9.0, 40, 6).unwrap_err();
+        assert_eq!(e, "not confident: log10 odds 8.0 < 9.0");
+    }
+
+    #[test]
+    fn a_non_finite_score_is_never_accepted() {
+        // A caller's "accept all" bar with no references: -inf >= -inf must not pass.
+        let e = decision_accepts(f64::NEG_INFINITY, f64::NEG_INFINITY, 0, 0).unwrap_err();
+        assert!(e.contains("not finite"), "{e}");
+        assert!(decision_accepts(f64::NAN, 9.0, 40, 6).is_err());
+        assert!(decision_accepts(f64::INFINITY, f64::INFINITY, 40, 6).is_err());
     }
 
     #[test]

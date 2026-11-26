@@ -261,7 +261,7 @@ Measured blind, i.e. no hints, with both packs:
 | Level | Event | Fields |
 |-------|-------|--------|
 | `debug` | `quad-index search` | `hypotheses`, `rejected`, `queries_at_last_hypothesis`, `search_ms`, `verify_ms`, `solved` |
-| `debug` | `solve decision` | Per verified candidate: `log10_odds`, `reference_stars`, `test_stars`, `peak_rank`, `required_log10_odds`. |
+| `debug` | `solve decision` | Per verified candidate: `log10_odds`, `reference_stars`, `reference_mag_limit`, `test_stars`, `peak_rank`, `scan_matched`, `hypotheses`, `required_log10_odds`. |
 | `info` | `solve succeeded` | Carries `path = "index"` when the index found the solution. |
 | `warn` | (fallback) | When the index found nothing and the spiral takes over. |
 

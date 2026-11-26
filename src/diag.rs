@@ -213,7 +213,8 @@ pub struct VerifyTrace {
     /// star is not one of the candidate's own stars.
     pub inliers_outside_own: usize,
     /// The decision's σ in pixels (the matching tolerance of this candidate's
-    /// scale); `0.0` when the decision was not reached.
+    /// scale); `0.0` when the verification cone was too sparse (set before the
+    /// seed pre-filter, so every candidate past the cone carries it).
     pub tol_px: f64,
     /// `N_R`: verification stars that project into the frame on the final WCS.
     pub reference_stars: usize,
@@ -385,7 +386,37 @@ pub(crate) fn best_finite_log10_odds<'a>(
         .fold(None, |acc: Option<f64>, o| Some(acc.map_or(o, |a| a.max(o))))
 }
 
+/// The failure message of a solve whose best candidate reached the decision and
+/// scored below the bar (`FailureClass::NotConfident`).
+pub(crate) fn chance_alignment_message(best_log10_odds: f64, required_log10_odds: f64) -> String {
+    format!(
+        "the best match could be a chance alignment (odds 10^{best_log10_odds:.1} to 1, \
+         10^{required_log10_odds:.1} needed)"
+    )
+}
+
+/// The bar the best-scoring candidate of `verifies` faced; `base` when none
+/// reached the decision with a finite score.
+pub(crate) fn best_decision_bar<'a>(
+    verifies: impl IntoIterator<Item = &'a VerifyTrace>,
+    base: f64,
+) -> f64 {
+    verifies
+        .into_iter()
+        .filter(|v| v.log10_odds.is_some_and(f64::is_finite))
+        .fold(None, |acc: Option<&VerifyTrace>, v| match acc {
+            Some(a) if a.log10_odds >= v.log10_odds => Some(a),
+            _ => Some(v),
+        })
+        .map_or(base, |v| v.required_log10_odds)
+}
+
 impl SolveTrace {
+    /// Every verify trace of the solve, in verification order.
+    pub(crate) fn all_verifies(&self) -> Vec<&VerifyTrace> {
+        self.passes.iter().flat_map(|p| p.rungs.iter()).flat_map(|r| r.verifies.iter()).collect()
+    }
+
     pub fn classify(&self) -> FailureClass {
         if matches!(self.outcome, TraceOutcome::Solved { .. }) {
             return FailureClass::Solved;
@@ -694,6 +725,23 @@ mod tests {
             verify(35, 10, Some(7.0)),
         ]);
         assert_eq!(t.classify(), FailureClass::NotConfident { best_log10_odds: 7.5 });
+    }
+
+    #[test]
+    fn a_not_confident_failure_says_it_could_be_a_chance_alignment() {
+        assert_eq!(
+            chance_alignment_message(7.5, 9.0),
+            "the best match could be a chance alignment (odds 10^7.5 to 1, 10^9.0 needed)"
+        );
+        // The bar is the one the best-scoring candidate faced; the base bar when none scored.
+        let mut hi = verify(30, 10, Some(7.5));
+        hi.required_log10_odds = 9.4;
+        let lo = verify(40, 10, Some(6.2));
+        assert_eq!(best_decision_bar([&lo, &hi], 9.0), 9.4);
+        let none = verify(5, 10, Some(f64::NEG_INFINITY));
+        assert_eq!(best_decision_bar([&none], 9.0), 9.0);
+        let t = trace_with(vec![lo, hi]);
+        assert_eq!(t.all_verifies().len(), 2);
     }
 
     #[test]

@@ -530,6 +530,10 @@ fn solve_with_index_stats(
             f.verifies = stats.verifies_snapshot();
             if let Some(best_log10_odds) = diag::best_finite_log10_odds(&f.verifies) {
                 f.class = FailureClass::NotConfident { best_log10_odds };
+                f.message = diag::chance_alignment_message(
+                    best_log10_odds,
+                    diag::best_decision_bar(&f.verifies, cfg.accept_log10_odds),
+                );
             }
         }
     }
