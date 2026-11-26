@@ -217,6 +217,10 @@ pub struct VerifyTrace {
     pub tol_px: f64,
     /// `N_R`: verification stars that project into the frame on the final WCS.
     pub reference_stars: usize,
+    /// The magnitude limit of the cone `reference_stars` came from (the ladder's level
+    /// the frame's share reached the floor at, or the deepest); `0.0` when the
+    /// decision was not reached.
+    pub reference_mag_limit: f32,
     /// `|T|`: image stars minus the candidate's own stars.
     pub test_stars: usize,
     /// Scanned stars matched within 1σ of their claimed reference.
@@ -643,6 +647,7 @@ mod tests {
             inliers_outside_own: 0,
             tol_px: 1.5,
             reference_stars: 50,
+            reference_mag_limit: 0.0,
             test_stars: 296,
             scan_matched: 0,
             matched_stars: 0,

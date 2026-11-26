@@ -1137,7 +1137,7 @@ fn frame_json(name: &str, res: &anyhow::Result<solvemyastro::SolveSolution>) -> 
 /// trace: `path`, `recentered`, `hypotheses`, `own` (image stars that chose
 /// the seed), `image_pts`, `linear_inliers` (the seed pre-filter's inliers),
 /// `inliers_outside_own` (of those, the ones not in the own set) and
-/// `final_inliers`. Recorded, not compared with the baseline (`wcs_moved`
+/// `final_inliers`, `reference_mag_limit` (the cone level the reference list came from). Recorded, not compared with the baseline (`wcs_moved`
 /// reads only the WCS keys).
 fn own_set_json(traces: &[solvemyastro::diag::VerifyTrace]) -> serde_json::Value {
     let t = traces.last().expect("a solved frame has a verify trace");
@@ -1151,6 +1151,7 @@ fn own_set_json(traces: &[solvemyastro::diag::VerifyTrace]) -> serde_json::Value
         "linear_inliers": t.seed_inliers,
         "inliers_outside_own": t.inliers_outside_own,
         "final_inliers": t.final_inliers,
+        "reference_mag_limit": t.reference_mag_limit,
     })
 }
 

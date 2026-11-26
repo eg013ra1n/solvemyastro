@@ -733,6 +733,32 @@ fn references_in_frame(
         .collect()
 }
 
+/// The decision's reference list: `start` (the frame's share of the ladder's
+/// cone) deepened over `levels` beyond `start_level` while it holds fewer than
+/// `floor` stars. `fetch(level)` queries the cone at that magnitude limit and
+/// projects it in the frame; an empty answer (a failed query) leaves the list
+/// as it was. Returns the list and the magnitude limit it came from.
+fn decision_references(
+    start: Vec<(f64, f64)>,
+    start_level: usize,
+    levels: &[f32],
+    floor: usize,
+    mut fetch: impl FnMut(f32) -> Vec<(f64, f64)>,
+) -> (Vec<(f64, f64)>, f32) {
+    let mut refs = start;
+    let mut used = start_level;
+    let mut next = start_level + 1;
+    while refs.len() < floor && next < levels.len() {
+        let got = fetch(levels[next]);
+        if !got.is_empty() {
+            refs = got;
+            used = next;
+        }
+        next += 1;
+    }
+    (refs, levels[used])
+}
+
 /// Full-field affine refit over inlier pairs (catalog-predicted pixel → detected pixel).
 /// Returns None if too few pairs.
 fn refit_affine(
@@ -2103,6 +2129,7 @@ fn verify_trials(
                     inliers_outside_own: 0,
                     tol_px: 0.0,
                     reference_stars: 0,
+                    reference_mag_limit: 0.0,
                     test_stars: 0,
                     scan_matched: 0,
                     matched_stars: 0,
@@ -2134,6 +2161,7 @@ fn verify_trials(
                     inliers_outside_own: 0,
                     tol_px: 0.0,
                     reference_stars: 0,
+                    reference_mag_limit: 0.0,
                     test_stars: 0,
                     scan_matched: 0,
                     matched_stars: 0,
@@ -2172,6 +2200,7 @@ fn verify_trials(
                 inliers_outside_own: 0,
                 tol_px: 0.0,
                 reference_stars: 0,
+                reference_mag_limit: 0.0,
                 test_stars: 0,
                 scan_matched: 0,
                 matched_stars: 0,
@@ -2193,10 +2222,13 @@ fn verify_trials(
             // We *always* keep the deepest non-empty result so even if no tier hits
             // the floor we still try verification rather than silently dropping.
             let density_floor = (image_pts.len() / 4).clamp(8, 100);
+            let verify_levels = [VERIFY_MAG_LIMIT, 14.0_f32, cfg.catalog_mag_limit];
+            // The ladder level `verify_stars` stopped at (the decision's list starts there).
+            let mut verify_level = 0usize;
             let verify_stars = {
                 let mut stars = Vec::new();
                 let mut hit_floor = false;
-                for &mag_lim in &[VERIFY_MAG_LIMIT, 14.0_f32, cfg.catalog_mag_limit] {
+                for (level, &mag_lim) in verify_levels.iter().enumerate() {
                     let t = Instant::now();
                     let res =
                         cones.verify_cone(seed_ra, seed_dec, verify_radius, mag_lim, obs_epoch);
@@ -2205,6 +2237,7 @@ fn verify_trials(
                     if let Ok(s) = res {
                         if !s.is_empty() {
                             stars = s;
+                            verify_level = level;
                             if stars.len() >= density_floor {
                                 hit_floor = true;
                                 break;
@@ -2591,7 +2624,44 @@ fn verify_trials(
             // and scores low; a real solve explains a large share of them. The
             // candidate's own stars claim their references first and add no term;
             // the bar rises with the hypotheses verified in the solve.
-            let refs = references_in_frame(&sip_wcs, &verify_stars, width, height);
+            // The ladder above stops on the cone's count (about 2.6 times the frame's
+            // area), so the frame's own share of it can be a fraction of the floor;
+            // the list deepens over the same levels until the frame holds the floor,
+            // from the cone centred on the frame of the final WCS. The inliers, the
+            // SIP fit and the WCS stay as the ladder's list made them.
+            let (refs, reference_mag_limit) = {
+                let (centre_ra, centre_dec) = sip_wcs.pixel_to_sky(width / 2.0, height / 2.0);
+                decision_references(
+                    references_in_frame(&sip_wcs, &verify_stars, width, height),
+                    verify_level,
+                    &verify_levels,
+                    density_floor,
+                    |mag_lim| {
+                        let t = Instant::now();
+                        let res = cones.verify_cone(
+                            centre_ra,
+                            centre_dec,
+                            verify_radius,
+                            mag_lim,
+                            obs_epoch,
+                        );
+                        TimingProfile::add(&timing.cone_ns, t.elapsed());
+                        timing.cone_calls.fetch_add(1, Ordering::Relaxed);
+                        match res {
+                            Ok(cone) => references_in_frame(&sip_wcs, &cone, width, height),
+                            Err(e) => {
+                                tracing::warn!(
+                                    frame = %frame_name,
+                                    mag_limit = mag_lim,
+                                    error = %e,
+                                    "decision reference cone failed"
+                                );
+                                Vec::new()
+                            }
+                        }
+                    },
+                )
+            };
             let scan_with = |own: &[usize]| {
                 crate::verify::scan_log10_odds(&crate::verify::ScanInput {
                     image_stars: image_pts,
@@ -2608,6 +2678,7 @@ fn verify_trials(
                 crate::verify::required_log10_odds(cfg.accept_log10_odds, hypotheses_so_far);
             if let Some(last) = rt.verifies.last_mut() {
                 last.reference_stars = refs.len();
+                last.reference_mag_limit = reference_mag_limit;
                 last.test_stars = scan.test_stars;
                 last.scan_matched = scan.scan_matched;
                 last.matched_stars = scan.matched_stars;
@@ -2621,6 +2692,7 @@ fn verify_trials(
                 frame = %frame_name,
                 log10_odds = scan.log10_odds,
                 reference_stars = refs.len(),
+                reference_mag_limit,
                 test_stars = scan.test_stars,
                 peak_rank = scan.peak_rank,
                 scan_matched = scan.scan_matched,
@@ -2714,6 +2786,57 @@ mod bounded_ladder_tests {
 mod orchestrate_unit_tests {
     use super::*;
     use crate::SolveHints;
+
+    #[test]
+    fn decision_references_deepen_until_the_frame_holds_the_floor() {
+        let levels = [12.0_f32, 14.0, 17.0];
+        let start: Vec<(f64, f64)> = (0..12).map(|i| (i as f64, 0.0)).collect();
+        let mut asked = Vec::new();
+        let (r, lvl) = decision_references(start, 0, &levels, 32, |m| {
+            asked.push(m);
+            (0..56).map(|i| (i as f64, 1.0)).collect()
+        });
+        assert_eq!(r.len(), 56);
+        assert_eq!(lvl, 14.0);
+        assert_eq!(asked, vec![14.0], "one query, at the next level");
+    }
+
+    #[test]
+    fn decision_references_stop_at_the_last_level() {
+        let levels = [12.0_f32, 14.0, 17.0];
+        let list = |n: usize| -> Vec<(f64, f64)> { (0..n).map(|i| (i as f64, 0.0)).collect() };
+        let mut asked = Vec::new();
+        let (r, lvl) = decision_references(list(12), 0, &levels, 100, |m| {
+            asked.push(m);
+            list(if m == 14.0 { 40 } else { 70 })
+        });
+        assert_eq!(r.len(), 70, "the deepest level's list");
+        assert_eq!(lvl, 17.0);
+        assert_eq!(asked, vec![14.0, 17.0], "no level is queried twice");
+
+        // A start already at the floor never queries.
+        let mut calls = 0;
+        let (r, lvl) = decision_references(list(32), 0, &levels, 32, |_| {
+            calls += 1;
+            Vec::new()
+        });
+        assert_eq!((r.len(), lvl, calls), (32, 12.0, 0));
+
+        // A start that stopped at the last level has nowhere to go.
+        let (r, lvl) = decision_references(list(5), 2, &levels, 100, |_| {
+            calls += 1;
+            Vec::new()
+        });
+        assert_eq!((r.len(), lvl, calls), (5, 17.0, 0));
+
+        // A failed (empty) query keeps the list and its level.
+        let (r, lvl) = decision_references(list(12), 0, &levels, 100, |m| {
+            if m == 14.0 { Vec::new() } else { list(70) }
+        });
+        assert_eq!((r.len(), lvl), (70, 17.0));
+        let (r, lvl) = decision_references(list(12), 0, &levels, 100, |_| Vec::new());
+        assert_eq!((r.len(), lvl), (12, 12.0));
+    }
 
     #[test]
     fn references_in_frame_keeps_finite_in_frame_projections() {
