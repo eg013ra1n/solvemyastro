@@ -39,9 +39,9 @@
 /// in favour of the WCS being correct ([1], §2.4).
 pub const DEFAULT_LOG_ODDS_MIN: f64 = 13.815_510_557_964_274; // log(1e6)
 
-/// Default distractor fraction. 0.25 means we expect ~25% of catalog stars in
-/// FOV to have no matching detection (below detection threshold, masked,
-/// near edge, etc.). The distractor fraction of [1], §2.4's mixture.
+/// Default distractor fraction `d` of [1], §2.4's mixture: the share of image
+/// stars with no catalog counterpart (hot pixels, faint stars below the
+/// catalog, artefacts). A catalog star with no detection costs nothing.
 pub const DEFAULT_DISTRACTOR_FRACTION: f64 = 0.25;
 
 /// Safety floor: a candidate must have at least this many inliers regardless
@@ -737,6 +737,117 @@ mod tests {
         assert_eq!(r.matched_stars, 1);
         assert_eq!(r.peak_rank, 1);
         assert!((r.log10_odds - D.log10()).abs() < 1e-12, "the scanned star finds its reference taken");
+    }
+
+    #[test]
+    fn an_own_star_claims_before_any_scanned_star_whatever_its_place() {
+        // The own star is behind the scanned one in the SNR order and still claims first.
+        let refs = lattice_refs();
+        let r = scan(&[refs[0], refs[0]], &[1], &refs, 1.5, 6e6);
+        assert_eq!(r.test_stars, 1);
+        assert_eq!(r.scan_matched, 0);
+        assert_eq!(r.matched_stars, 1);
+        assert!((r.log10_odds - D.log10()).abs() < 1e-12, "the scanned star finds its reference taken");
+    }
+
+    #[test]
+    fn own_stars_claim_in_ascending_index_order() {
+        // Star 0 (2 sigma off the reference) claims it before star 2 (on it) does.
+        let (sigma, refs) = (1.5, lattice_refs());
+        let stars = [(refs[0].0 + 2.0 * sigma, refs[0].1), (5000.0, 3000.0), refs[0]];
+        let r = scan(&stars, &[2, 0], &refs, sigma, 6e6);
+        assert_eq!(r.matched_stars, 0, "star 0 claims at 2 sigma, star 2 finds nothing");
+        assert_eq!(r.scan_matched, 0);
+        assert_eq!(r.test_stars, 1);
+    }
+
+    /// The decision's scan the plain way: every reference against every star.
+    fn plain_scan(stars: &[(f64, f64)], own: &[usize], refs: &[(f64, f64)], sigma: f64, area: f64) -> ScanResult {
+        let cut2 = (3.0 * sigma) * (3.0 * sigma);
+        let c = c_of(sigma, area, refs.len());
+        let mut claimed = vec![false; refs.len()];
+        let mut nearest = |p: (f64, f64)| -> Option<f64> {
+            let mut best: Option<(f64, usize)> = None;
+            for (i, r) in refs.iter().enumerate() {
+                let r2 = (r.0 - p.0) * (r.0 - p.0) + (r.1 - p.1) * (r.1 - p.1);
+                if !claimed[i] && r2 <= cut2 && best.is_none_or(|b| (r2, i) < b) {
+                    best = Some((r2, i));
+                }
+            }
+            let (r2, i) = best?;
+            claimed[i] = true;
+            Some(r2)
+        };
+        let mut own_sorted: Vec<usize> = own.to_vec();
+        own_sorted.sort_unstable();
+        own_sorted.dedup();
+        let mut own_matched = 0;
+        for &i in &own_sorted {
+            if nearest(stars[i]).is_some_and(|r2| r2 <= sigma * sigma) {
+                own_matched += 1;
+            }
+        }
+        let (mut sum, mut best, mut peak, mut n, mut scan_matched) = (0.0f64, f64::NEG_INFINITY, 0, 0, 0);
+        for (i, &p) in stars.iter().enumerate() {
+            if own_sorted.contains(&i) {
+                continue;
+            }
+            n += 1;
+            sum += match nearest(p) {
+                Some(r2) => {
+                    scan_matched += usize::from(r2 <= sigma * sigma);
+                    (D + c * (-r2 / (2.0 * sigma * sigma)).exp()).ln()
+                }
+                None => D.ln(),
+            };
+            if sum / std::f64::consts::LN_10 > best {
+                best = sum / std::f64::consts::LN_10;
+                peak = n;
+            }
+        }
+        ScanResult {
+            log10_odds: best,
+            peak_rank: peak,
+            test_stars: stars.len() - own_sorted.len(),
+            scan_matched,
+            matched_stars: own_matched + scan_matched,
+        }
+    }
+
+    #[test]
+    fn the_grid_agrees_with_a_plain_nearest_unclaimed_scan() {
+        // Negative coordinates, points on multiples of 6 sigma (the cell edges), and stars
+        // within a hair of a reference; every output equal, not merely close.
+        let sigma = 1.5;
+        let cell = 6.0 * sigma;
+        for seed in 0..40u64 {
+            let mut rng = Xoshiro256StarStar::seed_from_u64(seed);
+            let n_ref = 30 + 10 * (seed as usize % 6);
+            let mut refs: Vec<(f64, f64)> = (0..n_ref)
+                .map(|_| (rng.random_range(-60.0..60.0), rng.random_range(-60.0..60.0)))
+                .collect();
+            for k in 0..8 {
+                // References and stars on the cell edges, negative ones included.
+                refs.push((cell * (k as f64 - 4.0), cell * ((k * 3 % 8) as f64 - 4.0)));
+            }
+            let mut stars: Vec<(f64, f64)> = Vec::new();
+            for r in &refs {
+                stars.push((r.0 + rng.random_range(-4.0..4.0) * sigma, r.1 + rng.random_range(-4.0..4.0) * sigma));
+            }
+            for k in 0..30 {
+                stars.push((cell * (k % 11) as f64 - 5.0 * cell, cell * (k % 7) as f64 - 3.0 * cell));
+                stars.push((rng.random_range(-70.0..70.0), rng.random_range(-70.0..70.0)));
+            }
+            let n = stars.len();
+            for k in (0..n).rev().step_by(5) {
+                let j = rng.random_range(0..=k);
+                stars.swap(k, j);
+            }
+            let own: Vec<usize> = (0..6).map(|_| rng.random_range(0..n)).collect();
+            let want = plain_scan(&stars, &own, &refs, sigma, 14400.0);
+            let got = scan(&stars, &own, &refs, sigma, 14400.0);
+            assert_eq!(got, want, "seed {seed}");
+        }
     }
 
     #[test]
