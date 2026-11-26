@@ -238,6 +238,9 @@ pub struct VerifyTrace {
     /// The bar the candidate faced: `required_log10_odds(accept, hypotheses_so_far)`;
     /// `0.0` when the decision was not reached.
     pub required_log10_odds: f64,
+    /// The matched-star floor the decision applied (`min_final_inliers`);
+    /// `0` when the decision was not reached.
+    pub matched_floor: usize,
     /// The final (SIP) WCS the decision scored; `None` when it was not reached.
     pub final_wcs: Option<crate::wcs::WcsSolution>,
 }
@@ -326,6 +329,9 @@ pub enum FailureClass {
     /// A candidate reached the decision on its final WCS and scored below the
     /// bar; `best_log10_odds` is the highest finite score of the solve.
     NotConfident { best_log10_odds: f64 },
+    /// The strongest candidate's odds met the bar but it matched fewer stars on
+    /// the final WCS than the floor.
+    TooFewMatched { best_matched: usize, floor: usize },
     /// Catch-all when nothing of the above fits.
     Unclassified,
 }
@@ -342,6 +348,7 @@ impl FailureClass {
             Self::VerifyZeroInliers => "VERIFY_ZERO_INLIERS",
             Self::VerifyGap { .. } => "VERIFY_GAP",
             Self::NotConfident { .. } => "NOT_CONFIDENT",
+            Self::TooFewMatched { .. } => "TOO_FEW_MATCHED",
             Self::Unclassified => "UNCLASSIFIED",
         }
     }
@@ -373,42 +380,36 @@ impl fmt::Display for SolveFailure {
 
 impl std::error::Error for SolveFailure {}
 
-/// The largest finite decision score among `verifies`, `None` when no
-/// candidate reached the decision with a finite score. The one fold behind
-/// [`FailureClass::NotConfident`] for a single trace and for a whole solve.
-pub(crate) fn best_finite_log10_odds<'a>(
+/// The refusal of the candidate with the highest finite decision score among
+/// `verifies` (the first of equals), as the failure's class and message;
+/// `None` when no candidate reached the decision with a finite score. Below its
+/// own bar the class is [`FailureClass::NotConfident`]; at or above it the
+/// candidate was refused on the matched-star floor
+/// ([`FailureClass::TooFewMatched`], the gate's wording). The one choice behind
+/// `SolveTrace::classify` and both places a failure's class and message are set.
+pub(crate) fn strongest_refusal<'a>(
     verifies: impl IntoIterator<Item = &'a VerifyTrace>,
-) -> Option<f64> {
-    verifies
-        .into_iter()
-        .filter_map(|v| v.log10_odds)
-        .filter(|o| o.is_finite())
-        .fold(None, |acc: Option<f64>, o| Some(acc.map_or(o, |a| a.max(o))))
-}
-
-/// The failure message of a solve whose best candidate reached the decision and
-/// scored below the bar (`FailureClass::NotConfident`).
-pub(crate) fn chance_alignment_message(best_log10_odds: f64, required_log10_odds: f64) -> String {
-    format!(
-        "the best match could be a chance alignment (odds 10^{best_log10_odds:.1} to 1, \
-         10^{required_log10_odds:.1} needed)"
-    )
-}
-
-/// The bar the best-scoring candidate of `verifies` faced; `base` when none
-/// reached the decision with a finite score.
-pub(crate) fn best_decision_bar<'a>(
-    verifies: impl IntoIterator<Item = &'a VerifyTrace>,
-    base: f64,
-) -> f64 {
-    verifies
+) -> Option<(FailureClass, String)> {
+    let best = verifies
         .into_iter()
         .filter(|v| v.log10_odds.is_some_and(f64::is_finite))
         .fold(None, |acc: Option<&VerifyTrace>, v| match acc {
             Some(a) if a.log10_odds >= v.log10_odds => Some(a),
             _ => Some(v),
-        })
-        .map_or(base, |v| v.required_log10_odds)
+        })?;
+    let odds = best.log10_odds?;
+    if odds >= best.required_log10_odds {
+        let (best_matched, floor) = (best.matched_stars, best.matched_floor);
+        let message = format!("only {best_matched} stars matched ({floor} needed)");
+        Some((FailureClass::TooFewMatched { best_matched, floor }, message))
+    } else {
+        let message = format!(
+            "the best match could be a chance alignment (odds 10^{odds:.1} to 1, \
+             10^{:.1} needed)",
+            best.required_log10_odds
+        );
+        Some((FailureClass::NotConfident { best_log10_odds: odds }, message))
+    }
 }
 
 impl SolveTrace {
@@ -444,9 +445,9 @@ impl SolveTrace {
             if any_match { return FailureClass::AffineNeverFit; }
             return FailureClass::MatchStarved;
         }
-        // A candidate that reached the decision and scored below the bar.
-        if let Some(best_log10_odds) = best_finite_log10_odds(all_verifies.iter().copied()) {
-            return FailureClass::NotConfident { best_log10_odds };
+        // The strongest candidate that reached the decision names the refusal.
+        if let Some((class, _)) = strongest_refusal(all_verifies.iter().copied()) {
+            return class;
         }
         let (best_inl, best_req) = all_verifies.iter().fold((0usize, 0usize), |acc, v| {
             if v.seed_inliers > acc.0 { (v.seed_inliers, v.required) } else { acc }
@@ -630,6 +631,9 @@ impl fmt::Display for SolveTrace {
             if let FailureClass::NotConfident { best_log10_odds } = class {
                 writeln!(f, "  decision: best log10_odds={best_log10_odds:.1} below the bar")?;
             }
+            if let FailureClass::TooFewMatched { best_matched, floor } = class {
+                writeln!(f, "  decision: best candidate met the bar with {best_matched} matched (floor {floor})")?;
+            }
             // If a known truth was registered and ANY trial seed landed near
             // it, surface that explicitly — it's the strongest signal that the
             // verify gate (not matching) is what failed us.
@@ -694,6 +698,7 @@ mod tests {
             log10_odds,
             log10_odds_quad4: None,
             required_log10_odds: 9.0,
+            matched_floor: 0,
             final_wcs: None,
         }
     }
@@ -727,21 +732,51 @@ mod tests {
         assert_eq!(t.classify(), FailureClass::NotConfident { best_log10_odds: 7.5 });
     }
 
+    fn decided(odds: f64, required: f64, matched: usize, floor: usize) -> VerifyTrace {
+        let mut v = verify(30, 10, Some(odds));
+        v.required_log10_odds = required;
+        v.matched_stars = matched;
+        v.matched_floor = floor;
+        v
+    }
+
     #[test]
     fn a_not_confident_failure_says_it_could_be_a_chance_alignment() {
-        assert_eq!(
-            chance_alignment_message(7.5, 9.0),
-            "the best match could be a chance alignment (odds 10^7.5 to 1, 10^9.0 needed)"
-        );
-        // The bar is the one the best-scoring candidate faced; the base bar when none scored.
+        // The message carries the bar the best-scoring candidate faced.
         let mut hi = verify(30, 10, Some(7.5));
         hi.required_log10_odds = 9.4;
         let lo = verify(40, 10, Some(6.2));
-        assert_eq!(best_decision_bar([&lo, &hi], 9.0), 9.4);
+        let (class, message) = strongest_refusal([&lo, &hi]).unwrap();
+        assert_eq!(class, FailureClass::NotConfident { best_log10_odds: 7.5 });
+        assert_eq!(
+            message,
+            "the best match could be a chance alignment (odds 10^7.5 to 1, 10^9.4 needed)"
+        );
         let none = verify(5, 10, Some(f64::NEG_INFINITY));
-        assert_eq!(best_decision_bar([&none], 9.0), 9.0);
+        assert!(strongest_refusal([&none]).is_none());
         let t = trace_with(vec![lo, hi]);
         assert_eq!(t.all_verifies().len(), 2);
+    }
+
+    #[test]
+    fn the_strongest_candidate_names_the_failure() {
+        // Refused on the floor: odds above the bar, too few matched.
+        let t = trace_with(vec![decided(20.0, 9.0, 5, 6), decided(2.0, 9.0, 30, 6)]);
+        assert_eq!(t.classify(), FailureClass::TooFewMatched { best_matched: 5, floor: 6 });
+        let (class, message) = strongest_refusal(t.all_verifies()).unwrap();
+        assert_eq!(class, FailureClass::TooFewMatched { best_matched: 5, floor: 6 });
+        assert_eq!(message, "only 5 stars matched (6 needed)");
+        // Both below the bar: the strongest names the odds.
+        let t = trace_with(vec![decided(7.5, 9.0, 12, 6), decided(6.2, 9.0, 12, 6)]);
+        assert_eq!(t.classify(), FailureClass::NotConfident { best_log10_odds: 7.5 });
+        // The order of verification does not matter.
+        let t = trace_with(vec![decided(6.2, 9.0, 12, 6), decided(7.5, 9.0, 12, 6)]);
+        assert_eq!(t.classify(), FailureClass::NotConfident { best_log10_odds: 7.5 });
+        // No finite score: the old classes.
+        let mut gap = decided(f64::NEG_INFINITY, 9.0, 0, 6);
+        gap.seed_inliers = 5;
+        let t = trace_with(vec![gap]);
+        assert_eq!(t.classify(), FailureClass::VerifyGap { best: 5, required: 10 });
     }
 
     #[test]
@@ -753,6 +788,10 @@ mod tests {
     #[test]
     fn failure_codes_are_stable() {
         assert_eq!(FailureClass::NotConfident { best_log10_odds: 7.5 }.as_str(), "NOT_CONFIDENT");
+        assert_eq!(
+            FailureClass::TooFewMatched { best_matched: 5, floor: 6 }.as_str(),
+            "TOO_FEW_MATCHED"
+        );
         assert_eq!(FailureClass::Solved.as_str(), "SOLVED");
         assert_eq!(FailureClass::DetectTooFew.as_str(), "DETECT_TOO_FEW");
         assert_eq!(FailureClass::ImgQuadsEmpty.as_str(), "IMG_QUADS_EMPTY");

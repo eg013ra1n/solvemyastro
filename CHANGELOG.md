@@ -59,13 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `refusal().is_none()`. Raising the odds bar changes cached verdicts: an
   embedding app bumps its solve-recipe version.
 - `diag`: `FailureClass::NotConfident { best_log10_odds }` (code
-  `NOT_CONFIDENT`), so `FailureClass` is no longer `Eq`; `SolveFailure` gains
+  `NOT_CONFIDENT`) and `FailureClass::TooFewMatched { best_matched, floor }`
+  (code `TOO_FEW_MATCHED`, the strongest candidate met the bar but matched too few
+  stars), so `FailureClass` is no longer `Eq`; a failure's class and message are
+  the refusal of the candidate with the highest finite score; `SolveFailure` gains
   `hypotheses_verified`, `prefilter_passed` and `verifies`; `VerifyTrace` gains
   the decision's numbers (`path`, `recentered`, `hypotheses_so_far`,
   `own_star_count`, `image_star_count`, `inliers_outside_own`, `tol_px`,
   `reference_stars`, `reference_mag_limit`, `test_stars`, `scan_matched`,
   `matched_stars`, `peak_rank`, `log10_odds`, `log10_odds_quad4`,
-  `required_log10_odds`, `final_wcs`); `SearchPath` is new.
+  `required_log10_odds`, `matched_floor`, `final_wcs`); `SearchPath` is new.
 - `index::Hypothesis::star_idx`: the image stars of the hypothesis's quad.
 - `verify`: `BRIGHT_MATCH_PROB`, `BRIGHT_LOG_ODDS_MIN` and
   `bright_star_log_odds` are removed; `ACCEPT_LOG10_ODDS`, `SCAN_CUTOFF_SIGMA`,

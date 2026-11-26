@@ -1621,14 +1621,9 @@ pub(crate) fn solve_inner(
         timing.log_stage_timings(t0.elapsed(), &frame_name);
     }
     let class = trace.classify();
-    let msg = match class {
-        crate::diag::FailureClass::NotConfident { best_log10_odds } => {
-            crate::diag::chance_alignment_message(
-                best_log10_odds,
-                crate::diag::best_decision_bar(trace.all_verifies(), cfg.accept_log10_odds),
-            )
-        }
-        _ => format!(
+    let msg = match crate::diag::strongest_refusal(trace.all_verifies()) {
+        Some((_, message)) => message,
+        None => format!(
             "no trial passed verification across {} FOV rung(s) (incl. density-balanced retry)",
             rungs.len()
         ),
@@ -2182,6 +2177,7 @@ fn verify_trials(
                     log10_odds: None,
                     log10_odds_quad4: None,
                     required_log10_odds: 0.0,
+                    matched_floor: 0,
                     final_wcs: None,
                 });
                 continue 'candidates;
@@ -2214,6 +2210,7 @@ fn verify_trials(
                     log10_odds: None,
                     log10_odds_quad4: None,
                     required_log10_odds: 0.0,
+                    matched_floor: 0,
                     final_wcs: None,
                 });
                 continue 'candidates;
@@ -2253,6 +2250,7 @@ fn verify_trials(
                 log10_odds: None,
                 log10_odds_quad4: None,
                 required_log10_odds: 0.0,
+                matched_floor: 0,
                 final_wcs: None,
             };
 
@@ -2732,6 +2730,7 @@ fn verify_trials(
                 last.log10_odds = Some(scan.log10_odds);
                 last.log10_odds_quad4 = Some(scan_quad4.log10_odds);
                 last.required_log10_odds = required_odds;
+                last.matched_floor = cfg.min_final_inliers;
                 last.final_wcs = Some(sip_wcs.clone());
             }
             tracing::debug!(

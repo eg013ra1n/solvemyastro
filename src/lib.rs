@@ -519,21 +519,17 @@ fn solve_with_index_stats(
     }
 
     // All rungs failed — surface step A's original (richest) error, carrying the
-    // counts and the verify traces of every step. The class is `NotConfident`
-    // when any candidate of any step reached the decision with a finite score
-    // (the best of them), whichever step it came from.
+    // counts and the verify traces of every step. The class and message are the
+    // refusal of the strongest candidate (the highest finite score) of any step.
     let mut result = result;
     if let Err(e) = result.as_mut() {
         if let Some(f) = e.downcast_mut::<SolveFailure>() {
             f.hypotheses_verified = stats.hypotheses();
             f.prefilter_passed = stats.prefilter_passed();
             f.verifies = stats.verifies_snapshot();
-            if let Some(best_log10_odds) = diag::best_finite_log10_odds(&f.verifies) {
-                f.class = FailureClass::NotConfident { best_log10_odds };
-                f.message = diag::chance_alignment_message(
-                    best_log10_odds,
-                    diag::best_decision_bar(&f.verifies, cfg.accept_log10_odds),
-                );
+            if let Some((class, message)) = diag::strongest_refusal(&f.verifies) {
+                f.class = class;
+                f.message = message;
             }
         }
     }
