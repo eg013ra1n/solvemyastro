@@ -44,6 +44,7 @@ pub mod wcs_fit;
 pub use cache::{LayeredCones, PixelCache, StarCache, StarRecord};
 pub use diag::{BestAttempt, FailureClass, SolveFailure};
 pub use index::QuadIndex;
+pub use orchestrate::solve_bounded;
 pub use register::{register, register_with_config, Registration};
 pub use wcs::{SipCoefficients, WcsSolution};
 

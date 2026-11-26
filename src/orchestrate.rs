@@ -1149,10 +1149,12 @@ pub(crate) fn solve_with_stats(
     solve_inner(image, hints, caches, indexes, cfg, cancel, None, stats)
 }
 
-/// Solve with the pixel scale confined to `scale_bounds = (lo, hi)`
-/// arcsec/px: the bounded ladder step B2 of [`crate::solve_with_index`] uses,
-/// public for the lab's wrong-scale arm. The hints' scale and field of view
-/// are not used to build the ladder.
+/// Solve with the search confined to `scale_bounds = (lo, hi)` arcsec/px:
+/// the bounded ladder step B2 of [`crate::solve_with_index`] uses, public for
+/// the lab's wrong-scale arm. What is confined is the field-of-view ladder
+/// (the hints' scale and field of view are not used to build it) and the
+/// index search's scale band; a spiral candidate's own scale is checked only
+/// against the solver's absolute limits, not against `scale_bounds`.
 pub fn solve_bounded(
     image: &Path,
     hints: &SolveHints,

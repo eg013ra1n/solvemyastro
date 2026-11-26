@@ -1071,22 +1071,19 @@ mod tests {
         let band = idx.bands()[0];
 
         // Band quad 0's four stars at 20"/px about their AB midpoint, in a
-        // 3000 x 3000 frame, then 40 random points after them.
+        // 3000 x 3000 frame, placed at positions 1, 4, 6 and 9 of the list
+        // (not the prefix, not sorted by role) among random points.
         let v = idx.quad_stars(&band, 0);
         let (mra, mdec) = radec(midpoint(v[0], v[1]));
-        let mut pts: Vec<(f64, f64)> = v
-            .iter()
-            .map(|&x| {
-                let (ra, dec) = radec(x);
-                let (xi, eta) = tan::sky_to_tangent(ra, dec, mra, mdec);
-                (1500.0 + xi * 3600.0 / 20.0, 1500.0 + eta * 3600.0 / 20.0)
-            })
-            .collect();
-        for _ in 0..40 {
-            pts.push((rnd() * 3000.0, rnd() * 3000.0));
+        let slots = [6usize, 1, 9, 4];
+        let mut pts: Vec<(f64, f64)> = (0..44).map(|_| (rnd() * 3000.0, rnd() * 3000.0)).collect();
+        for (k, &x) in v.iter().enumerate() {
+            let (ra, dec) = radec(x);
+            let (xi, eta) = tan::sky_to_tangent(ra, dec, mra, mdec);
+            pts[slots[k]] = (1500.0 + xi * 3600.0 / 20.0, 1500.0 + eta * 3600.0 / 20.0);
         }
 
-        let mut first: Option<Hypothesis> = None;
+        let mut hits: Vec<Hypothesis> = Vec::new();
         search(
             &[&idx],
             &pts,
@@ -1094,14 +1091,25 @@ mod tests {
             &SearchParams::default(),
             || false,
             |h| {
-                first = Some(h);
-                true
+                hits.push(h);
+                false
             },
         );
-        let h = first.expect("the quad's own stars produce a hypothesis");
-        let mut got = h.star_idx;
-        got.sort_unstable();
-        assert_eq!(got, [0, 1, 2, 3]);
+        let want = [1usize, 4, 6, 9];
+        let h = hits
+            .iter()
+            .find(|h| {
+                let mut got = h.star_idx;
+                got.sort_unstable();
+                got == want
+            })
+            .expect("the quad's own stars produce a hypothesis naming them");
+        // The indices are the image stars' own positions, whatever the role order.
+        let mut named: Vec<(u64, u64)> = h.star_idx.iter().map(|&i| (pts[i].0.to_bits(), pts[i].1.to_bits())).collect();
+        let mut placed: Vec<(u64, u64)> = slots.iter().map(|&i| (pts[i].0.to_bits(), pts[i].1.to_bits())).collect();
+        named.sort_unstable();
+        placed.sort_unstable();
+        assert_eq!(named, placed);
     }
 
     #[test]

@@ -230,7 +230,6 @@ impl SearchPath {
     }
 }
 
-
 /// A known-correct WCS for a specific frame, used to ground-truth-check the
 /// solver's intermediate trial seeds. Populated by `known_truth_for` from
 /// externally-verified solves (from another tool) so we can answer: "did
