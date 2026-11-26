@@ -5,6 +5,77 @@ All notable changes to solvemyastro will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — unreleased
+
+### Verification
+
+- One decision replaces the bright-star completeness test: a Bayes factor of
+  the final (SIP) WCS over the image stars, after D. Lang, D. W. Hogg, K. Mierle,
+  M. Blanton, S. Roweis, The Astronomical Journal 139, 1782–1800 (2010),
+  arXiv:0910.2233, §2.4. The image stars, in order of signal-to-noise and minus
+  the hypothesis's own stars (the ones that chose or fitted it), are scanned
+  once. Each star scores against a uniform background with a Gaussian around the
+  nearest unclaimed reference star (a reference explains at most one star; a
+  star beyond 3σ of every free reference is a distractor; the uniform part of
+  the foreground weighs `distractor_fraction` = 0.25; σ is the matching
+  tolerance, never fitted); `log10_odds` is the running maximum of the
+  sum. A catalog star with no detection costs nothing: it only enlarges the
+  reference count `N_R`, which is how a dense field asks for more evidence.
+- The references are the verification ladder's list, deepened over G ≤ 12, 14
+  and `catalog_mag_limit` until the frame holds clamp(|T|/4, 8, 100) of them on
+  the final WCS (|T| the image stars), so a sparse narrow field is scored
+  against a list that is not nearly empty.
+- The bar is `log10_odds ≥ 9`: a prior of 10⁻⁶ for a given hypothesis and the
+  cost ratio of 1999 to 1 for a false against a true positive give odds of 10⁹.
+  Beyond 10⁶ hypotheses verified in one solve (all passes) the bar rises by
+  `log10(H / 10⁶)`. Under the background the scan reaches 10⁹ with probability
+  at most 10⁻⁹ per hypothesis (a non-negative martingale of mean 1).
+- The bright-star completeness test and the gate's inlier-ratio rule are gone;
+  so is the 0.3.0 known issue (the in-field count read far too low) with the
+  function that had it. The seed pre-filter at ln 10⁶ and every search stage are
+  unchanged.
+- `diag::best_finite_log10_odds` (crate-internal) folds the candidates' scores
+  into `FailureClass::NotConfident`.
+
+### Breaking
+
+- `SolveSolution`: new `log10_odds`, `reference_stars_in_frame` and
+  `hypotheses_verified`. `matched_stars` is now counted on the final WCS, one
+  detection per reference at 1σ; `inlier_ratio` is matched over the in-frame
+  reference stars, a description and no longer a quality bar.
+- `SolveConfig`: new `accept_log10_odds` (9.0, the decision's bar) and
+  `min_final_inliers` (6, the linear-inlier floor a candidate needs to reach the
+  decision).
+- `accept`: `GateMetrics` gains `log10_odds` and loses `expected_in_fov` and
+  `inlier_ratio`; `Gate::min_inlier_ratio`, `DENSE_FIELD_MIN_EXPECTED` and
+  `expected_bright_in_fov` are removed; `Gate::refusal` and `GateRefusal`
+  (a named reason, with a `Display`) are new, and `Gate::accepts` is
+  `refusal().is_none()`. Raising the odds bar changes cached verdicts: an
+  embedding app bumps its solve-recipe version.
+- `diag`: `FailureClass::NotConfident { best_log10_odds }` (code
+  `NOT_CONFIDENT`), so `FailureClass` is no longer `Eq`; `SolveFailure` gains
+  `hypotheses_verified`, `prefilter_passed` and `verifies`; `VerifyTrace` gains
+  the decision's numbers (`path`, `recentered`, `hypotheses_so_far`,
+  `own_star_count`, `image_star_count`, `inliers_outside_own`, `tol_px`,
+  `reference_stars`, `reference_mag_limit`, `test_stars`, `scan_matched`,
+  `matched_stars`, `peak_rank`, `log10_odds`, `log10_odds_quad4`,
+  `required_log10_odds`, `final_wcs`); `SearchPath` is new.
+- `index::Hypothesis::star_idx`: the image stars of the hypothesis's quad.
+- `verify`: `BRIGHT_MATCH_PROB`, `BRIGHT_LOG_ODDS_MIN` and
+  `bright_star_log_odds` are removed; `ACCEPT_LOG10_ODDS`, `SCAN_CUTOFF_SIGMA`,
+  `HYPOTHESIS_BUDGET`, `ScanInput`, `ScanResult`, `scan_log10_odds` and
+  `required_log10_odds` are new.
+- New entry points `solve_traced` and `solve_bounded` (the second confines the
+  scale to a window, as the search's step B2 does).
+- The CLI's `solve --json` keys are eleven: `ra`, `dec`, `scale`, `rot`,
+  `matched`, `rms_px`, `inlier_ratio`, `log10_odds`, `reference_stars`,
+  `hypotheses`, `gate`. `expected_in_fov` is gone. The text output prints the
+  odds, and a refusal names the check that failed.
+- `tests/corpus_layered_baseline.json` is re-frozen with the new match count,
+  ratio and odds; every recorded WCS is unchanged. The legacy
+  `corpus_baseline.json` keeps 0.3.0's meanings (it needs a deep star cache this
+  release was not built with) unless it is regenerated.
+
 ## [0.3.0] — 2026-11-26
 
 ### Catalog building moves here
