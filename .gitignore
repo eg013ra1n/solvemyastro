@@ -22,3 +22,6 @@ Thumbs.db
 
 # Bench frames are published separately (scripts/fetch_bench_data.sh), never committed
 /tests/files/
+
+# Regeneratable layered-corpus run output (the frozen baseline is corpus_layered_baseline.json)
+/tests/corpus_layered_run.json
