@@ -175,18 +175,31 @@ pub struct SolveConfig {
     /// Set to `true` from `corpus_bench` and ad-hoc profiling to see where
     /// wall-clock actually goes.
     pub print_timing: bool,
-    /// Use the Bayesian log-odds verification gate (the standard Bayesian verification of a common open solver).
+    /// Use the Bayesian log-odds seed pre-filter ([1], §2.4: D. Lang, D. W. Hogg,
+    /// K. Mierle, M. Blanton, S. Roweis, AJ 139, 1782-1800 (2010), arXiv:0910.2233).
     /// Default `true`. When `false`, falls back to the legacy 5%-of-FOV
     /// inlier floor (kept for emergency revert; documented to over-reject
-    /// valid solves in dense fields).
+    /// valid solves in dense fields). The decision on the final WCS
+    /// ([`SolveConfig::accept_log10_odds`]) applies on both paths.
     pub use_bayesian_verify: bool,
-    /// Bayesian log-odds acceptance threshold. Default `log(1e6) ≈ 13.8`.
-    /// See [`crate::verify::DEFAULT_LOG_ODDS_MIN`].
+    /// Bayesian log-odds threshold of the seed pre-filter (not of the
+    /// decision). Default `log(1e6) ≈ 13.8`. See
+    /// [`crate::verify::DEFAULT_LOG_ODDS_MIN`].
     pub log_odds_threshold: f64,
-    /// Distractor fraction `D` for the Bayesian gate (expected proportion
-    /// of catalog stars in FOV that have no matching detection). Default
-    /// `0.25`. See [`crate::verify::DEFAULT_DISTRACTOR_FRACTION`].
+    /// Distractor fraction `d` of [1], §2.4's mixture: the share of image stars
+    /// with no catalog counterpart. Used by the seed pre-filter and the
+    /// decision. Default `0.25`. See [`crate::verify::DEFAULT_DISTRACTOR_FRACTION`].
     pub distractor_fraction: f64,
+    /// The decision's bar, `log10` of the Bayes factor of the final WCS over
+    /// the image stars (posterior odds 10^3 over a prior of 10^-6, [1] §2.4).
+    /// It rises by one decade per decade of hypotheses beyond 10^6 verified in
+    /// the solve ([`crate::verify::required_log10_odds`]). Default
+    /// [`verify::ACCEPT_LOG10_ODDS`] = 9.
+    pub accept_log10_odds: f64,
+    /// Fewest stars matched within 1σ on the final WCS (own stars and scanned
+    /// stars, [`SolveSolution::matched_stars`]) for a candidate to reach the
+    /// decision. Default 6.
+    pub min_final_inliers: usize,
     /// Minimum bright-cache cone stars before the quad-matching path
     /// falls back to the deep cache for the same cone. Only honoured
     /// when a bright sub-catalog is configured ([`Caches::tiered`]) — or,
@@ -246,6 +259,8 @@ impl Default for SolveConfig {
             use_bayesian_verify: true,
             log_odds_threshold: verify::DEFAULT_LOG_ODDS_MIN,
             distractor_fraction: verify::DEFAULT_DISTRACTOR_FRACTION,
+            accept_log10_odds: verify::ACCEPT_LOG10_ODDS,
+            min_final_inliers: orchestrate::MIN_ABSOLUTE_INLIERS,
             bright_fallback_threshold: 30,
             scale_fallback_enabled: true,
             b1_min_inliers: 2,
@@ -273,9 +288,10 @@ pub struct SolveSolution {
     /// degrees in `[0, 360)`. Positive = east-of-north (counter-clockwise on
     /// a standard image where +X is right and +Y is up).
     pub field_rotation_deg: f64,
-    /// Number of catalog stars matched to detections within the inlier
-    /// tolerance after the final affine refit (linear stage). Does not
-    /// re-count after the SIP refit.
+    /// Stars matched within 1σ (`tol_px`) of a verification star on the final
+    /// (SIP) WCS: the decision's own stars plus the scanned stars, one assignment
+    /// per reference (0.4.0). 0.3.x counted this on the linear WCS, over every
+    /// verification star of the cone.
     pub matched_stars: usize,
     /// Total stars produced by `detect_fast` before SNR-gating / selection.
     /// Useful as a denominator for `matched_stars` and for diagnosing low-SNR
@@ -287,10 +303,21 @@ pub struct SolveSolution {
     /// Same as `rms_residual_px`, expressed in arcsec
     /// (`rms_residual_px * pixel_scale_arcsec`).
     pub rms_residual_arcsec: f64,
-    /// Fraction `matched_stars / total_detected`. Healthy solves are
-    /// typically in `[0.1, 0.7]`; very low values suggest a faint /
-    /// crowded field or a partial match.
+    /// `matched_stars / reference_stars_in_frame` (0.4.0): the share of the
+    /// verification stars that fall in the frame and were found. 0.3.x divided
+    /// the linear-WCS inlier count by the whole verification cone's size.
     pub inlier_ratio: f64,
+    /// `log10` of the Bayes factor of the final WCS over the image stars (the
+    /// decision's score, [`crate::verify::scan_log10_odds`]). At least
+    /// [`SolveConfig::accept_log10_odds`] for every returned solution.
+    pub log10_odds: f64,
+    /// `N_R`: the verification stars (the cone ladder's list, G ≤ 12, then 14,
+    /// then the configured limit, until the density floor) that project into
+    /// the frame on the final WCS.
+    pub reference_stars_in_frame: usize,
+    /// Hypotheses verified so far in this solve, this one included, across
+    /// every pass and fallback step (the `H` of the decision's bar).
+    pub hypotheses_verified: usize,
     /// Identifier of the catalog used. Currently `"gaia_dr3"`. Reserved for
     /// future support of alternative catalogs (lower-density fallback, etc.).
     pub catalog_used: String,
@@ -484,7 +511,27 @@ fn solve_with_index_stats(
         }
     }
 
-    // All rungs failed — surface step A's original (richest) error.
+    // All rungs failed — surface step A's original (richest) error, carrying the
+    // counts and the verify traces of every step. The class is `NotConfident`
+    // when any candidate of any step reached the decision with a finite score
+    // (the best of them), whichever step it came from.
+    let mut result = result;
+    if let Err(e) = result.as_mut() {
+        if let Some(f) = e.downcast_mut::<SolveFailure>() {
+            f.hypotheses_verified = stats.hypotheses();
+            f.prefilter_passed = stats.prefilter_passed();
+            f.verifies = stats.verifies_snapshot();
+            let best = f
+                .verifies
+                .iter()
+                .filter_map(|v| v.log10_odds)
+                .filter(|o| o.is_finite())
+                .fold(None, |acc: Option<f64>, o| Some(acc.map_or(o, |a| a.max(o))));
+            if let Some(best_log10_odds) = best {
+                f.class = FailureClass::NotConfident { best_log10_odds };
+            }
+        }
+    }
     result
 }
 
@@ -492,6 +539,14 @@ fn solve_with_index_stats(
 #[cfg(test)]
 mod fallback_config_tests {
     use super::SolveConfig;
+
+    #[test]
+    fn solve_config_defaults_carry_the_decision() {
+        let c = SolveConfig::default();
+        assert_eq!(c.accept_log10_odds, crate::verify::ACCEPT_LOG10_ODDS);
+        assert_eq!(c.accept_log10_odds, 9.0);
+        assert_eq!(c.min_final_inliers, 6);
+    }
 
     #[test]
     fn scale_fallback_defaults() {
@@ -512,6 +567,9 @@ mod harvest_tests {
         SolveFailure {
             class: FailureClass::VerifyGap { best: inliers, required: 6 },
             message: String::new(),
+            hypotheses_verified: 0,
+            prefilter_passed: 0,
+            verifies: Vec::new(),
             best_attempt: Some(BestAttempt {
                 pass_balance: true, pass_idx: 1, rung_idx: 4, rung_total: 6,
                 seed_ra: 36.7, seed_dec: 60.8, scale_arcsec_per_px: scale,

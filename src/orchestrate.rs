@@ -122,7 +122,7 @@ const MAX_CAT_STARS: usize = 6000;
 /// Inlier match radius in arcsec (adaptive: this is the base; see adaptive_tol).
 const BASE_MATCH_ARCSEC: f64 = 3.0;
 /// Minimum inlier floor (absolute) regardless of density calculation.
-const MIN_ABSOLUTE_INLIERS: usize = 6;
+pub(crate) const MIN_ABSOLUTE_INLIERS: usize = 6;
 /// Below this many detections a frame is simply sparse, and the share of
 /// streaks says nothing — the trailed verdict needs a population to judge.
 const MIN_DETECTIONS_FOR_TRAIL_VERDICT: usize = 100;
@@ -417,7 +417,6 @@ impl SolveStats {
         self.hypotheses.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // read by the decision's threshold (S4)
     pub(crate) fn hypotheses(&self) -> usize {
         self.hypotheses.load(Ordering::Relaxed)
     }
@@ -427,7 +426,6 @@ impl SolveStats {
         self.prefilter_passed.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // read by the failure's counts (S4)
     pub(crate) fn prefilter_passed(&self) -> usize {
         self.prefilter_passed.load(Ordering::Relaxed)
     }
@@ -441,6 +439,11 @@ impl SolveStats {
                 all.extend(rung.verifies.iter().cloned());
             }
         }
+    }
+
+    /// A copy of the verify traces so far, leaving them in place.
+    pub(crate) fn verifies_snapshot(&self) -> Vec<VerifyTrace> {
+        self.verifies.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub(crate) fn take_verifies(&self) -> Vec<VerifyTrace> {
@@ -712,46 +715,22 @@ fn inliers_outside_own(
     pairs.iter().filter(|(_, img)| !own.contains(&(img.0.to_bits(), img.1.to_bits()))).count()
 }
 
-/// Of the catalog stars that land in the frame, take the `image_pts.len()`
-/// brightest and count how many have a detection within `tol_px`.
-/// Returns `(k, matched)`.
-fn bright_star_evidence(
+/// The verification stars that project into the frame on `wcs`: finite pixel
+/// positions in `[0, width) x [0, height)`. This is the decision's reference
+/// list `R` (`N_R` = its length), the cone ladder's list as it stands.
+fn references_in_frame(
     wcs: &WcsSolution,
-    cat_stars: &[CatalogStar],
-    image_pts: &[(f64, f64)],
+    cat: &[CatalogStar],
     width: f64,
     height: f64,
-    tol_px: f64,
-) -> (usize, usize) {
-    let mut in_frame: Vec<(f32, f64, f64)> = cat_stars
-        .iter()
+) -> Vec<(f64, f64)> {
+    cat.iter()
         .filter_map(|c| {
             let (px, py) = wcs.sky_to_pixel(c.ra, c.dec);
             (px.is_finite() && py.is_finite() && px >= 0.0 && px < width && py >= 0.0 && py < height)
-                .then_some((c.mag, px, py))
+                .then_some((px, py))
         })
-        .collect();
-    let k = in_frame.len().min(image_pts.len());
-    if k == 0 {
-        return (0, 0);
-    }
-    let by_mag = |a: &(f32, f64, f64), b: &(f32, f64, f64)| {
-        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-    };
-    if in_frame.len() > k {
-        in_frame.select_nth_unstable_by(k - 1, by_mag);
-        in_frame.truncate(k);
-    }
-    let grid = PointGrid::new(image_pts, tol_px);
-    let tol2 = tol_px * tol_px;
-    let matched = in_frame
-        .iter()
-        .filter(|&&(_, px, py)| {
-            grid.nearest_by(px, py, |(ix, iy)| (ix - px).powi(2) + (iy - py).powi(2))
-                .is_some_and(|(_, d2)| d2 <= tol2)
-        })
-        .count();
-    (k, matched)
+        .collect()
 }
 
 /// Full-field affine refit over inlier pairs (catalog-predicted pixel → detected pixel).
@@ -1593,6 +1572,9 @@ pub(crate) fn solve_inner(
         class: trace.classify(),
         best_attempt: trace.best_attempt(),
         message: msg,
+        hypotheses_verified: stats.hypotheses(),
+        prefilter_passed: stats.prefilter_passed(),
+        verifies: Vec::new(),
     }))
 }
 
@@ -2061,7 +2043,7 @@ fn run_index_search(
 }
 
 /// Verify `trials` in order: seed inliers and log-odds, the full-field refit,
-/// SIP, and the bright-star completeness gate. The first trial that passes
+/// SIP, and the decision on the final WCS. The first trial that passes
 /// all of them is returned as the solution; every rejection is recorded in
 /// `rt`. Shared by the spiral search and the quad-index search.
 fn verify_trials(
@@ -2119,6 +2101,16 @@ fn verify_trials(
                     own_star_count: trial.own_stars.len(),
                     image_star_count: image_pts.len(),
                     inliers_outside_own: 0,
+                    tol_px: 0.0,
+                    reference_stars: 0,
+                    test_stars: 0,
+                    scan_matched: 0,
+                    matched_stars: 0,
+                    peak_rank: 0,
+                    log10_odds: None,
+                    log10_odds_quad4: None,
+                    required_log10_odds: 0.0,
+                    final_wcs: None,
                 });
                 continue 'candidates;
             }
@@ -2140,6 +2132,16 @@ fn verify_trials(
                     own_star_count: trial.own_stars.len(),
                     image_star_count: image_pts.len(),
                     inliers_outside_own: 0,
+                    tol_px: 0.0,
+                    reference_stars: 0,
+                    test_stars: 0,
+                    scan_matched: 0,
+                    matched_stars: 0,
+                    peak_rank: 0,
+                    log10_odds: None,
+                    log10_odds_quad4: None,
+                    required_log10_odds: 0.0,
+                    final_wcs: None,
                 });
                 continue 'candidates;
             }
@@ -2168,6 +2170,16 @@ fn verify_trials(
                 own_star_count: trial.own_stars.len(),
                 image_star_count: image_pts.len(),
                 inliers_outside_own: 0,
+                tol_px: 0.0,
+                reference_stars: 0,
+                test_stars: 0,
+                scan_matched: 0,
+                matched_stars: 0,
+                peak_rank: 0,
+                log10_odds: None,
+                log10_odds_quad4: None,
+                required_log10_odds: 0.0,
+                final_wcs: None,
             };
 
             // Verification uses bright stars to keep the expected-count denominator sensible.
@@ -2215,6 +2227,7 @@ fn verify_trials(
             }
 
             let tol_px = adaptive_tol_px(seed_scale, BASE_MATCH_ARCSEC);
+            v.tol_px = tol_px;
             let t_ci = Instant::now();
             let (seed_inliers, seed_rss, seed_pairs) = count_inliers(
                 &trial.wcs,
@@ -2238,7 +2251,7 @@ fn verify_trials(
             let required = required_inliers(verify_stars.len(), image_pts.len());
             v.required = required;
 
-            // Verification gate: Bayesian log-odds (as in a common open solver) by
+            // Verification gate: Bayesian log-odds seed pre-filter ([1], §2.4) by
             // default; legacy 5%-of-FOV-inlier floor available behind
             // `use_bayesian_verify=false` for emergency revert.
             let gate_decision = if cfg.use_bayesian_verify {
@@ -2367,9 +2380,9 @@ fn verify_trials(
             TimingProfile::add(&timing.count_inliers_ns, t.elapsed());
             timing.count_inliers_calls.fetch_add(1, Ordering::Relaxed);
 
-            if final_inliers < MIN_ABSOLUTE_INLIERS {
+            if final_inliers < cfg.min_final_inliers {
                 v.final_inliers = final_inliers;
-                v.reject_reason = Some(format!("final_inliers {final_inliers} < MIN_ABSOLUTE_INLIERS {MIN_ABSOLUTE_INLIERS}"));
+                v.reject_reason = Some(format!("final_inliers {final_inliers} < min_final_inliers {}", cfg.min_final_inliers));
                 rt.verifies.push(v);
                 continue 'candidates;
             }
@@ -2377,7 +2390,6 @@ fn verify_trials(
             let final_scale = final_wcs.pixel_scale_arcsec();
             let rms_px = if final_inliers > 0 { (final_rss / final_inliers as f64).sqrt() } else { 0.0 };
             let rms_arcsec = rms_px * final_scale;
-            let inlier_ratio = final_inliers as f64 / verify_stars.len() as f64;
 
             v.accepted = true;
             v.final_inliers = final_inliers;
@@ -2572,34 +2584,61 @@ fn verify_trials(
                 (final_wcs.clone(), rms_px, rms_arcsec)
             };
 
-            // Bright-star completeness on the final (SIP) WCS: the brightest
-            // catalog stars in the frame must mostly have detections. A dense
-            // field's chance alignment collects its inliers among the faint
-            // stars and finds almost none of the bright ones; evaluated after
-            // SIP so a wide lens's edge distortion does not count as a miss.
-            let (bright_k, bright_m) =
-                bright_star_evidence(&sip_wcs, &verify_stars, image_pts, width, height, tol_px);
-            let p_random = image_pts.len() as f64 * std::f64::consts::PI * tol_px * tol_px
-                / (width * height);
-            let bright_lo = crate::verify::bright_star_log_odds(bright_k, bright_m, p_random);
+            // The decision on the final (SIP) WCS ([1], §2.4): every image star of
+            // the frame is scored against the verification stars that land in the
+            // frame, so a star without a counterpart costs `ln d`. A dense field's
+            // chance alignment collects a few matches among many unexplained stars
+            // and scores low; a real solve explains a large share of them. The
+            // candidate's own stars claim their references first and add no term;
+            // the bar rises with the hypotheses verified in the solve.
+            let refs = references_in_frame(&sip_wcs, &verify_stars, width, height);
+            let scan_with = |own: &[usize]| {
+                crate::verify::scan_log10_odds(&crate::verify::ScanInput {
+                    image_stars: image_pts,
+                    own_stars: own,
+                    references: &refs,
+                    sigma_px: tol_px,
+                    area_px2: width * height,
+                    distractor: cfg.distractor_fraction,
+                })
+            };
+            let scan = scan_with(&trial.own_stars);
+            let scan_quad4 = scan_with(&trial.quad4);
+            let required_odds =
+                crate::verify::required_log10_odds(cfg.accept_log10_odds, hypotheses_so_far);
+            if let Some(last) = rt.verifies.last_mut() {
+                last.reference_stars = refs.len();
+                last.test_stars = scan.test_stars;
+                last.scan_matched = scan.scan_matched;
+                last.matched_stars = scan.matched_stars;
+                last.peak_rank = scan.peak_rank;
+                last.log10_odds = Some(scan.log10_odds);
+                last.log10_odds_quad4 = Some(scan_quad4.log10_odds);
+                last.required_log10_odds = required_odds;
+                last.final_wcs = Some(sip_wcs.clone());
+            }
             tracing::debug!(
                 frame = %frame_name,
-                bright_k,
-                bright_m,
-                p_random,
-                bright_log_odds = bright_lo,
-                "bright-star completeness"
+                log10_odds = scan.log10_odds,
+                reference_stars = refs.len(),
+                test_stars = scan.test_stars,
+                peak_rank = scan.peak_rank,
+                scan_matched = scan.scan_matched,
+                hypotheses = hypotheses_so_far,
+                required_log10_odds = required_odds,
+                "solve decision"
             );
-            let bright_min = crate::verify::BRIGHT_LOG_ODDS_MIN.max(cfg.log_odds_threshold);
-            if bright_lo < bright_min {
+            if !(scan.log10_odds >= required_odds) {
                 if let Some(last) = rt.verifies.last_mut() {
                     last.accepted = false;
                     last.reject_reason = Some(format!(
-                        "bright stars: {bright_m}/{bright_k} found, log-odds {bright_lo:.1} < {bright_min:.1}"
+                        "not confident: log10 odds {:.1} < {:.1}",
+                        scan.log10_odds, required_odds
                     ));
                 }
                 continue 'candidates;
             }
+            let inlier_ratio = scan.matched_stars as f64 / refs.len() as f64;
             let solve_time_ms = t0.elapsed().as_millis() as u64;
 
 
@@ -2618,11 +2657,14 @@ fn verify_trials(
             return Ok(Some(SolveSolution {
                 pixel_scale_arcsec: sip_wcs.pixel_scale_arcsec(),
                 field_rotation_deg: sip_wcs.field_rotation_deg(),
-                matched_stars: final_inliers,
+                matched_stars: scan.matched_stars,
                 total_detected,
                 rms_residual_px: sip_rms_px,
                 rms_residual_arcsec: sip_rms_arcsec,
                 inlier_ratio,
+                log10_odds: scan.log10_odds,
+                reference_stars_in_frame: refs.len(),
+                hypotheses_verified: hypotheses_so_far,
                 catalog_used: "gaia_dr3".to_string(),
                 algorithm: "solvemyastro".to_string(),
                 solve_time_ms,
@@ -2672,6 +2714,35 @@ mod bounded_ladder_tests {
 mod orchestrate_unit_tests {
     use super::*;
     use crate::SolveHints;
+
+    #[test]
+    fn references_in_frame_keeps_finite_in_frame_projections() {
+        // 100 x 100 px, 1"/px TAN WCS; the reference pixel is the corner (0, 0), so that
+        // star's projection is exactly 0 and the lower edge is inclusive.
+        let wcs = WcsSolution {
+            crpix: (0.0, 0.0),
+            crval: (180.0, 10.0),
+            cd: [[-1.0 / 3600.0, 0.0], [0.0, 1.0 / 3600.0]],
+            sip_forward: None,
+            sip_reverse: None,
+        };
+        let at = |x: f64, y: f64| {
+            let (ra, dec) = wcs.pixel_to_sky(x, y);
+            CatalogStar { ra, dec, mag: 10.0 }
+        };
+        let cat = [
+            at(0.0, 0.0),
+            at(50.0, 50.0),
+            at(100.0, 50.0),
+            at(-0.5, 10.0),
+            // A quarter turn from the tangent point: the gnomonic projection leaves the frame
+            // (or is non-finite) and the star must be dropped either way.
+            CatalogStar { ra: 270.0, dec: 10.0, mag: 10.0 },
+        ];
+        let refs = references_in_frame(&wcs, &cat, 100.0, 100.0);
+        assert_eq!(refs.len(), 2, "kept {refs:?}");
+        assert!(refs.iter().all(|&(x, y)| x.is_finite() && y.is_finite()));
+    }
 
     /// Measured shares, from real frames (2026-09-05): a wind-shaken frame
     /// leaves 14 of 600 detections after the shape cut, a healthy one 572,

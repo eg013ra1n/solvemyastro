@@ -301,33 +301,6 @@ pub fn required_log10_odds(base: f64, hypotheses: usize) -> f64 {
     base + (hypotheses as f64 / HYPOTHESIS_BUDGET).log10().max(0.0)
 }
 
-/// Chance a bright catalog star in the frame has a detection at its
-/// predicted position when the WCS is right. Set low on purpose: the
-/// brightest stars saturate and drop out of detection, and nebulosity hides
-/// others, so a correct solve is not expected to find most of them.
-pub const BRIGHT_MATCH_PROB: f64 = 0.25;
-
-/// Acceptance threshold for [`bright_star_log_odds`]: `log(1e9)`, the
-/// blind-solve level. A blind search tests thousands of hypotheses, so a
-/// chance alignment clearing `log(1e6)` once is to be expected (one did, at
-/// 16.0: 7 of 58 bright stars at 0.25"/px); correct solves measured ≥ 33.
-pub const BRIGHT_LOG_ODDS_MIN: f64 = 20.723_265_836_946_41; // log(1e9)
-
-/// Log-likelihood ratio of "correct WCS" vs "chance alignment" from the `k`
-/// brightest catalog stars in the frame, `matched` of which have a detection
-/// within tolerance. Under a correct WCS each is found with probability
-/// [`BRIGHT_MATCH_PROB`]; by chance with `p_random` (detection density times
-/// the tolerance disc). Unlike [`log_odds`], stars that are *not* found
-/// count against the WCS — the evidence that separates a dense-field chance
-/// alignment (a handful of hits among the faint stars, none among the bright
-/// ones) from a real solve.
-pub fn bright_star_log_odds(k: usize, matched: usize, p_random: f64) -> f64 {
-    let p_r = p_random.clamp(1e-12, 0.5);
-    let p_t = BRIGHT_MATCH_PROB.max(p_r);
-    let missed = k.saturating_sub(matched) as f64;
-    matched as f64 * (p_t / p_r).ln() + missed * ((1.0 - p_t) / (1.0 - p_r)).ln()
-}
-
 /// Configuration for [`accept_bayesian`].
 #[derive(Clone, Copy, Debug)]
 pub struct BayesianGateConfig {

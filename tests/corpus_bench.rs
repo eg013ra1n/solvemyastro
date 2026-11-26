@@ -1071,7 +1071,8 @@ fn sip_table_json(c: &solvemyastro::SipCoefficients) -> serde_json::Value {
 
 /// One frame's record: whether it solved and, when it did, the WCS (`crval`,
 /// `crpix`, `cd`, SIP) with the run's own numbers (`matched_stars`,
-/// `inlier_ratio`, `rms_px`, `elapsed_ms`). Only the WCS keys are compared.
+/// `inlier_ratio`, `log10_odds`, `reference_stars`, `hypotheses`, `rms_px`,
+/// `elapsed_ms`). Only the WCS keys are compared.
 fn frame_json(name: &str, res: &anyhow::Result<solvemyastro::SolveSolution>) -> serde_json::Value {
     use serde_json::{json, Value};
     let Ok(s) = res else {
@@ -1097,6 +1098,24 @@ fn frame_json(name: &str, res: &anyhow::Result<solvemyastro::SolveSolution>) -> 
             })
         }
     };
+    // The decision's numbers (0.4.0): every solved frame cleared the bar, its
+    // ratio is the one assignment's count over the reference list, and at least
+    // one hypothesis was verified.
+    assert!(
+        s.log10_odds >= solvemyastro::verify::ACCEPT_LOG10_ODDS,
+        "{name}: solved with log10_odds {} below the bar",
+        s.log10_odds
+    );
+    assert!(s.reference_stars_in_frame > 0, "{name}: solved with no reference star in the frame");
+    let ratio = s.matched_stars as f64 / s.reference_stars_in_frame as f64;
+    assert!(
+        (s.inlier_ratio - ratio).abs() < 1e-12,
+        "{name}: inlier_ratio {} != matched {} / reference_stars {}",
+        s.inlier_ratio,
+        s.matched_stars,
+        s.reference_stars_in_frame
+    );
+    assert!(s.hypotheses_verified >= 1, "{name}: solved with no hypothesis counted");
     json!({
         "frame": name,
         "solved": true,
@@ -1106,6 +1125,9 @@ fn frame_json(name: &str, res: &anyhow::Result<solvemyastro::SolveSolution>) -> 
         "sip": sip,
         "matched_stars": s.matched_stars,
         "inlier_ratio": s.inlier_ratio,
+        "log10_odds": s.log10_odds,
+        "reference_stars": s.reference_stars_in_frame,
+        "hypotheses": s.hypotheses_verified,
         "rms_px": s.rms_residual_px,
         "elapsed_ms": s.solve_time_ms,
     })
