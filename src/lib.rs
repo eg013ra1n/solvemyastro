@@ -307,8 +307,11 @@ pub struct SolveSolution {
     /// (`rms_residual_px * pixel_scale_arcsec`).
     pub rms_residual_arcsec: f64,
     /// `matched_stars / reference_stars_in_frame` (0.4.0): the share of the
-    /// verification stars that fall in the frame and were found. 0.3.x divided
-    /// the linear-WCS inlier count by the whole verification cone's size.
+    /// decision's in-frame reference stars that were found. A description,
+    /// not a quality bar: on a sparse list it is near 1 for any match, so
+    /// nothing gates on it; [`SolveSolution::log10_odds`] is the measure of
+    /// confidence. 0.3.x divided the linear-WCS inlier count by the whole
+    /// verification cone's size.
     pub inlier_ratio: f64,
     /// `log10` of the Bayes factor of the final WCS over the image stars (the
     /// decision's score, [`crate::verify::scan_log10_odds`]). At least

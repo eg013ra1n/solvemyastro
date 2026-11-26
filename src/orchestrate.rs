@@ -1106,7 +1106,7 @@ fn adaptive_tol_px(scale_arcsec: f64, base_arcsec: f64) -> f64 {
 // Required inlier floor (density-aware)
 // ---------------------------------------------------------------------------
 
-fn required_inliers(expected_bright_in_fov: usize, n_detected: usize) -> usize {
+fn required_inliers(catalog_stars: usize, n_detected: usize) -> usize {
     // The requirement is: max(
     //   MIN_ABSOLUTE_INLIERS,
     //   min(
@@ -1121,7 +1121,7 @@ fn required_inliers(expected_bright_in_fov: usize, n_detected: usize) -> usize {
     // over-rejection while still demanding a real positional match.
     // Both floors are at 5% so the formula is symmetric: roughly 5% of
     // available reference points must corroborate.
-    let cat_floor = (expected_bright_in_fov as f64 * 0.05) as usize;
+    let cat_floor = (catalog_stars as f64 * 0.05) as usize;
     let det_cap = (n_detected as f64 * 0.05) as usize;
     let dynamic = cat_floor.min(det_cap);
     MIN_ABSOLUTE_INLIERS.max(dynamic)
