@@ -232,7 +232,8 @@ uses the index too.
    verified only once a second, independent match agrees with it (same centre,
    scale, rotation and parity). Chance matches scatter; a true field repeats.
 3. Verification is the same pipeline as the spiral: seed inliers and log-odds,
-   refit, SIP, then the bright-star completeness gate at `log(1e9)`.
+   refit, SIP, then the decision: the Bayes factor of the final WCS over the
+   image stars, accepted at 10^9 to 1 (`log10_odds` ≥ 9).
 4. If no hypothesis verifies, the spiral runs only where the index did not
    look:
    - rungs of 6° and wider, which are cheap and catch wide lenses whose
@@ -260,7 +261,7 @@ Measured blind, i.e. no hints, with both packs:
 | Level | Event | Fields |
 |-------|-------|--------|
 | `debug` | `quad-index search` | `hypotheses`, `rejected`, `queries_at_last_hypothesis`, `search_ms`, `verify_ms`, `solved` |
-| `debug` | `bright-star completeness` | Per verified candidate. |
+| `debug` | `solve decision` | Per verified candidate: `log10_odds`, `reference_stars`, `reference_mag_limit`, `test_stars`, `peak_rank`, `scan_matched`, `hypotheses`, `required_log10_odds`. |
 | `info` | `solve succeeded` | Carries `path = "index"` when the index found the solution. |
 | `warn` | (fallback) | When the index found nothing and the spiral takes over. |
 

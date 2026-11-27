@@ -12,7 +12,7 @@ builds the star catalog from Gaia data.
 cargo install solvemyastro --features cli --locked
 ```
 
-The library alone (`solvemyastro = "0.3"` in `Cargo.toml`) has no command line
+The library alone (`solvemyastro = "0.4"` in `Cargo.toml`) has no command line
 and none of the catalog-building dependencies: those sit behind the `catalog`
 (Gaia ingest, tiers, packages) and `cli` (the `solvemyastro` command) features.
 
@@ -34,20 +34,21 @@ solvemyastro build-cache (--bins | --from) <bins> --out <cache> [--epoch 2016.0]
 solvemyastro build-bright-cache --from <cache> --out <bright cache> [--bright-floor 14.0] [--target-density 100] [--mode hybrid|floor-only|cap-only]
 ```
 
-`solve` checks every solution with the acceptance gate (inlier floor, inlier
-ratio in a dense field, RMS against the pixel tolerance, plausible scale, and
-the scale against `--scale` when given). A refused solve prints the reason
-(`rejected: ...`) on stderr and nothing on stdout; `--no-gate` prints it anyway.
-`--json` prints `ra, dec, scale, rot, matched, rms_px, inlier_ratio,
-expected_in_fov` and `gate` (`"passed"` or `"off"`).
+`solve` decides whether a solution is real or a chance alignment: it scores the
+final WCS over the image stars as a Bayes factor, `log10_odds`, and accepts only
+10^9 to 1 or better (the bar rises when more than a million hypotheses were
+tried). A catalog star the frame does not show costs nothing; a dense field asks
+for more evidence on its own. Then the acceptance gate re-checks the result:
+RMS against the pixel tolerance, at least 6 stars matched on the final WCS, the
+odds again, a plausible scale, and the scale against `--scale` when given. A
+refused solve prints the check that failed (`rejected: ...`) on stderr and
+nothing on stdout; `--no-gate` prints it anyway.
+`--json` prints `ra, dec, scale, rot, matched, rms_px, inlier_ratio, log10_odds,
+reference_stars, hypotheses` and `gate` (`"passed"` or `"off"`).
 
 ```
 solvemyastro solve frame.fits --tiers ~/catalog --index ~/catalog/index/base --json
 ```
-
-Known issue: the gate's in-field radius takes the square root of the detected
-star count for the image side, so `expected_in_fov` comes out far too low and the
-dense-field ratio check rarely arms. A fix changes verdicts and is planned.
 
 `info` says what a folder is: a star cache, a folder of tiers, an index pack or a
 folder of packs, a folder of bins or a publish tree, with its counts. `cache-info` is the old name.

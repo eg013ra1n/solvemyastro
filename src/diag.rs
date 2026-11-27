@@ -188,7 +188,7 @@ pub struct VerifyTrace {
     pub final_inliers: usize,
     pub final_rms_px: f64,
     /// Angular distance from this trial's seed center to a known-correct WCS
-    /// (e.g. an externally-verified solve from another tool), in degrees.
+    /// (e.g. an externally-verified solve from a comparison solver), in degrees.
     /// `None` if no known truth is registered for this frame. See
     /// [`known_truth_for`].
     pub dist_from_truth_deg: Option<f64>,
@@ -198,6 +198,67 @@ pub struct VerifyTrace {
     pub scale_ratio_to_truth: Option<f64>,
     pub accepted: bool,
     pub reject_reason: Option<String>,
+    /// The search that produced this candidate.
+    pub path: SearchPath,
+    /// True for a recentred re-fit of a spiral seed.
+    pub recentered: bool,
+    /// Hypotheses entering verification so far in this solve, this one
+    /// included, across every pass and fallback step.
+    pub hypotheses_so_far: usize,
+    /// Image stars that chose this candidate (`own_stars.len()`).
+    pub own_star_count: usize,
+    /// Image stars of the frame the candidate was verified against.
+    pub image_star_count: usize,
+    /// Of the seed pre-filter's inliers (`seed_inliers`), those whose image
+    /// star is not one of the candidate's own stars.
+    pub inliers_outside_own: usize,
+    /// The decision's σ in pixels (the matching tolerance of this candidate's
+    /// scale); `0.0` when the verification cone was too sparse (set before the
+    /// seed pre-filter, so every candidate past the cone carries it).
+    pub tol_px: f64,
+    /// `N_R`: verification stars that project into the frame on the final WCS.
+    pub reference_stars: usize,
+    /// The magnitude limit of the cone `reference_stars` came from (the ladder's level
+    /// the frame's share reached the floor at, or the deepest); `0.0` when the
+    /// decision was not reached.
+    pub reference_mag_limit: f32,
+    /// `|T|`: image stars minus the candidate's own stars.
+    pub test_stars: usize,
+    /// Scanned stars matched within 1σ of their claimed reference.
+    pub scan_matched: usize,
+    /// Own stars within 1σ plus `scan_matched` (the solution's `matched_stars`).
+    pub matched_stars: usize,
+    /// Scan rank (1-based) at which the running score peaked; 0 when none.
+    pub peak_rank: usize,
+    /// `log10` Bayes factor on the final WCS with the candidate's own stars;
+    /// `None` when the decision was not reached.
+    pub log10_odds: Option<f64>,
+    /// The same with only the four stars of the first quad set aside.
+    pub log10_odds_quad4: Option<f64>,
+    /// The bar the candidate faced: `required_log10_odds(accept, hypotheses_so_far)`;
+    /// `0.0` when the decision was not reached.
+    pub required_log10_odds: f64,
+    /// The matched-star floor the decision applied (`min_final_inliers`);
+    /// `0` when the decision was not reached.
+    pub matched_floor: usize,
+    /// The final (SIP) WCS the decision scored; `None` when it was not reached.
+    pub final_wcs: Option<crate::wcs::WcsSolution>,
+}
+
+/// Which search produced a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchPath {
+    Spiral,
+    Index,
+}
+
+impl SearchPath {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Spiral => "spiral",
+            Self::Index => "index",
+        }
+    }
 }
 
 /// A known-correct WCS for a specific frame, used to ground-truth-check the
@@ -219,7 +280,7 @@ pub struct KnownTruth {
 /// solve has been captured.
 pub fn known_truth_for(frame_name: &str) -> Option<KnownTruth> {
     if frame_name.contains("_0023.fits") {
-        // Reference solver v2026.02.09 solved this frame in 0.1s. Captured 2026-05-24.
+        // A comparison solver solved this frame in 0.1s. Captured 2026-05-24.
         return Some(KnownTruth {
             ra: 334.0989556839,
             dec: 74.22973718397,
@@ -245,7 +306,7 @@ impl TraceOutcome {
 }
 
 /// Heuristic failure classification, computed from the trace contents.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FailureClass {
     /// Solve succeeded.
     Solved,
@@ -265,6 +326,12 @@ pub enum FailureClass {
     VerifyZeroInliers,
     /// Best verified inliers > 0 but below the required floor.
     VerifyGap { best: usize, required: usize },
+    /// A candidate reached the decision on its final WCS and scored below the
+    /// bar; `best_log10_odds` is the highest finite score of the solve.
+    NotConfident { best_log10_odds: f64 },
+    /// The strongest candidate's odds met the bar but it matched fewer stars on
+    /// the final WCS than the floor.
+    TooFewMatched { best_matched: usize, floor: usize },
     /// Catch-all when nothing of the above fits.
     Unclassified,
 }
@@ -280,6 +347,8 @@ impl FailureClass {
             Self::NoVerifyAttempted => "NO_VERIFY_ATTEMPTED",
             Self::VerifyZeroInliers => "VERIFY_ZERO_INLIERS",
             Self::VerifyGap { .. } => "VERIFY_GAP",
+            Self::NotConfident { .. } => "NOT_CONFIDENT",
+            Self::TooFewMatched { .. } => "TOO_FEW_MATCHED",
             Self::Unclassified => "UNCLASSIFIED",
         }
     }
@@ -295,6 +364,12 @@ pub struct SolveFailure {
     pub class: FailureClass,
     pub best_attempt: Option<BestAttempt>,
     pub message: String,
+    /// Hypotheses verified in the whole solve, every pass and fallback step.
+    pub hypotheses_verified: usize,
+    /// Candidates that passed the seed pre-filter (reached scoring).
+    pub prefilter_passed: usize,
+    /// The verify trace of every candidate of every step, in verification order.
+    pub verifies: Vec<VerifyTrace>,
 }
 
 impl fmt::Display for SolveFailure {
@@ -305,7 +380,44 @@ impl fmt::Display for SolveFailure {
 
 impl std::error::Error for SolveFailure {}
 
+/// The refusal of the candidate with the highest finite decision score among
+/// `verifies` (the first of equals), as the failure's class and message;
+/// `None` when no candidate reached the decision with a finite score. Below its
+/// own bar the class is [`FailureClass::NotConfident`]; at or above it the
+/// candidate was refused on the matched-star floor
+/// ([`FailureClass::TooFewMatched`], the gate's wording). The one choice behind
+/// `SolveTrace::classify` and both places a failure's class and message are set.
+pub(crate) fn strongest_refusal<'a>(
+    verifies: impl IntoIterator<Item = &'a VerifyTrace>,
+) -> Option<(FailureClass, String)> {
+    let best = verifies
+        .into_iter()
+        .filter(|v| v.log10_odds.is_some_and(f64::is_finite))
+        .fold(None, |acc: Option<&VerifyTrace>, v| match acc {
+            Some(a) if a.log10_odds >= v.log10_odds => Some(a),
+            _ => Some(v),
+        })?;
+    let odds = best.log10_odds?;
+    if odds >= best.required_log10_odds {
+        let (best_matched, floor) = (best.matched_stars, best.matched_floor);
+        let message = format!("only {best_matched} stars matched ({floor} needed)");
+        Some((FailureClass::TooFewMatched { best_matched, floor }, message))
+    } else {
+        let message = format!(
+            "the best match could be a chance alignment (odds 10^{odds:.1} to 1, \
+             10^{:.1} needed)",
+            best.required_log10_odds
+        );
+        Some((FailureClass::NotConfident { best_log10_odds: odds }, message))
+    }
+}
+
 impl SolveTrace {
+    /// Every verify trace of the solve, in verification order.
+    pub(crate) fn all_verifies(&self) -> Vec<&VerifyTrace> {
+        self.passes.iter().flat_map(|p| p.rungs.iter()).flat_map(|r| r.verifies.iter()).collect()
+    }
+
     pub fn classify(&self) -> FailureClass {
         if matches!(self.outcome, TraceOutcome::Solved { .. }) {
             return FailureClass::Solved;
@@ -332,6 +444,10 @@ impl SolveTrace {
             if any_affine { return FailureClass::NoVerifyAttempted; }
             if any_match { return FailureClass::AffineNeverFit; }
             return FailureClass::MatchStarved;
+        }
+        // The strongest candidate that reached the decision names the refusal.
+        if let Some((class, _)) = strongest_refusal(all_verifies.iter().copied()) {
+            return class;
         }
         let (best_inl, best_req) = all_verifies.iter().fold((0usize, 0usize), |acc, v| {
             if v.seed_inliers > acc.0 { (v.seed_inliers, v.required) } else { acc }
@@ -459,15 +575,26 @@ impl fmt::Display for SolveTrace {
                         )?;
                     }
                     for v in &r.verifies {
+                        let decision = match v.log10_odds {
+                            Some(o) => format!(
+                                "log10_odds={o:.1}/{:.1} refs={} ",
+                                v.required_log10_odds, v.reference_stars
+                            ),
+                            None => String::new(),
+                        };
+                        let verdict = if v.accepted {
+                            "ACCEPTED".to_string()
+                        } else {
+                            format!("REJECTED({})", v.reject_reason.as_deref().unwrap_or("?"))
+                        };
                         writeln!(
                             f,
                             "        verify seed=({:.3},{:.3}) scale={:.3}\"/px \
-                             cat_in_fov={} inl={}/{} final_inl={} rms={:.2}px {}",
+                             cat_in_fov={} inl={}/{} final_inl={} rms={:.2}px {}{}",
                             v.seed_ra, v.seed_dec, v.scale_arcsec_per_px,
                             v.cat_in_fov, v.seed_inliers, v.required,
                             v.final_inliers, v.final_rms_px,
-                            if v.accepted { "ACCEPTED".to_string() }
-                            else { format!("REJECTED({})", v.reject_reason.as_deref().unwrap_or("?")) },
+                            decision, verdict,
                         )?;
                     }
                 }
@@ -501,6 +628,12 @@ impl fmt::Display for SolveTrace {
             } else {
                 writeln!(f, "  best_attempt: no candidate ever reached verification")?;
             }
+            if let FailureClass::NotConfident { best_log10_odds } = class {
+                writeln!(f, "  decision: best log10_odds={best_log10_odds:.1} below the bar")?;
+            }
+            if let FailureClass::TooFewMatched { best_matched, floor } = class {
+                writeln!(f, "  decision: best candidate met the bar with {best_matched} matched (floor {floor})")?;
+            }
             // If a known truth was registered and ANY trial seed landed near
             // it, surface that explicitly — it's the strongest signal that the
             // verify gate (not matching) is what failed us.
@@ -521,4 +654,152 @@ impl fmt::Display for SolveTrace {
 fn avg<I: IntoIterator<Item = usize>>(iter: I) -> usize {
     let v: Vec<usize> = iter.into_iter().collect();
     if v.is_empty() { 0 } else { v.iter().sum::<usize>() / v.len() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_path_names_are_stable() {
+        assert_eq!(SearchPath::Spiral.as_str(), "spiral");
+        assert_eq!(SearchPath::Index.as_str(), "index");
+    }
+
+    fn verify(seed_inliers: usize, required: usize, log10_odds: Option<f64>) -> VerifyTrace {
+        VerifyTrace {
+            seed_ra: 10.0,
+            seed_dec: 20.0,
+            scale_arcsec_per_px: 1.0,
+            cat_in_fov: 100,
+            seed_inliers,
+            required,
+            seed_rms_px: 1.0,
+            log_odds: 15.0,
+            final_inliers: 0,
+            final_rms_px: 0.0,
+            dist_from_truth_deg: None,
+            scale_ratio_to_truth: None,
+            accepted: false,
+            reject_reason: None,
+            path: SearchPath::Spiral,
+            recentered: false,
+            hypotheses_so_far: 1,
+            own_star_count: 4,
+            image_star_count: 300,
+            inliers_outside_own: 0,
+            tol_px: 1.5,
+            reference_stars: 50,
+            reference_mag_limit: 0.0,
+            test_stars: 296,
+            scan_matched: 0,
+            matched_stars: 0,
+            peak_rank: 0,
+            log10_odds,
+            log10_odds_quad4: None,
+            required_log10_odds: 9.0,
+            matched_floor: 0,
+            final_wcs: None,
+        }
+    }
+
+    /// One pass, one rung, these verifies, enough upstream stages to reach the verify classes.
+    fn trace_with(verifies: Vec<VerifyTrace>) -> SolveTrace {
+        let mut rung = RungTrace::new(1, 1, 1.0, 1);
+        rung.candidates_emitted = verifies.len();
+        rung.verifies = verifies;
+        let mut pass = PassTrace::new(false);
+        pass.rungs.push(rung);
+        SolveTrace {
+            frame: "f".into(),
+            n_detected: 300,
+            n_selected: 300,
+            n_image_quads: 100,
+            passes: vec![pass],
+            outcome: TraceOutcome::Failed("no".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_search_that_reached_the_decision_is_not_confident() {
+        // The best score is neither the last verify's nor the best-seed one's.
+        let t = trace_with(vec![
+            verify(40, 10, Some(6.2)),
+            verify(30, 10, Some(7.5)),
+            verify(35, 10, Some(7.0)),
+        ]);
+        assert_eq!(t.classify(), FailureClass::NotConfident { best_log10_odds: 7.5 });
+    }
+
+    fn decided(odds: f64, required: f64, matched: usize, floor: usize) -> VerifyTrace {
+        let mut v = verify(30, 10, Some(odds));
+        v.required_log10_odds = required;
+        v.matched_stars = matched;
+        v.matched_floor = floor;
+        v
+    }
+
+    #[test]
+    fn a_not_confident_failure_says_it_could_be_a_chance_alignment() {
+        // The message carries the bar the best-scoring candidate faced.
+        let mut hi = verify(30, 10, Some(7.5));
+        hi.required_log10_odds = 9.4;
+        let lo = verify(40, 10, Some(6.2));
+        let (class, message) = strongest_refusal([&lo, &hi]).unwrap();
+        assert_eq!(class, FailureClass::NotConfident { best_log10_odds: 7.5 });
+        assert_eq!(
+            message,
+            "the best match could be a chance alignment (odds 10^7.5 to 1, 10^9.4 needed)"
+        );
+        let none = verify(5, 10, Some(f64::NEG_INFINITY));
+        assert!(strongest_refusal([&none]).is_none());
+        let t = trace_with(vec![lo, hi]);
+        assert_eq!(t.all_verifies().len(), 2);
+    }
+
+    #[test]
+    fn the_strongest_candidate_names_the_failure() {
+        // Refused on the floor: odds above the bar, too few matched.
+        let t = trace_with(vec![decided(20.0, 9.0, 5, 6), decided(2.0, 9.0, 30, 6)]);
+        assert_eq!(t.classify(), FailureClass::TooFewMatched { best_matched: 5, floor: 6 });
+        let (class, message) = strongest_refusal(t.all_verifies()).unwrap();
+        assert_eq!(class, FailureClass::TooFewMatched { best_matched: 5, floor: 6 });
+        assert_eq!(message, "only 5 stars matched (6 needed)");
+        // Both below the bar: the strongest names the odds.
+        let t = trace_with(vec![decided(7.5, 9.0, 12, 6), decided(6.2, 9.0, 12, 6)]);
+        assert_eq!(t.classify(), FailureClass::NotConfident { best_log10_odds: 7.5 });
+        // The order of verification does not matter.
+        let t = trace_with(vec![decided(6.2, 9.0, 12, 6), decided(7.5, 9.0, 12, 6)]);
+        assert_eq!(t.classify(), FailureClass::NotConfident { best_log10_odds: 7.5 });
+        // No finite score: the old classes.
+        let mut gap = decided(f64::NEG_INFINITY, 9.0, 0, 6);
+        gap.seed_inliers = 5;
+        let t = trace_with(vec![gap]);
+        assert_eq!(t.classify(), FailureClass::VerifyGap { best: 5, required: 10 });
+    }
+
+    #[test]
+    fn a_non_finite_decision_falls_back_to_the_old_classes() {
+        let t = trace_with(vec![verify(5, 10, Some(f64::NEG_INFINITY))]);
+        assert_eq!(t.classify(), FailureClass::VerifyGap { best: 5, required: 10 });
+    }
+
+    #[test]
+    fn failure_codes_are_stable() {
+        assert_eq!(FailureClass::NotConfident { best_log10_odds: 7.5 }.as_str(), "NOT_CONFIDENT");
+        assert_eq!(
+            FailureClass::TooFewMatched { best_matched: 5, floor: 6 }.as_str(),
+            "TOO_FEW_MATCHED"
+        );
+        assert_eq!(FailureClass::Solved.as_str(), "SOLVED");
+        assert_eq!(FailureClass::DetectTooFew.as_str(), "DETECT_TOO_FEW");
+        assert_eq!(FailureClass::ImgQuadsEmpty.as_str(), "IMG_QUADS_EMPTY");
+        assert_eq!(FailureClass::MatchStarved.as_str(), "MATCH_STARVED");
+        assert_eq!(FailureClass::AffineNeverFit.as_str(), "AFFINE_NEVER_FIT");
+        assert_eq!(FailureClass::NoVerifyAttempted.as_str(), "NO_VERIFY_ATTEMPTED");
+        assert_eq!(FailureClass::VerifyZeroInliers.as_str(), "VERIFY_ZERO_INLIERS");
+        assert_eq!(FailureClass::VerifyGap { best: 1, required: 2 }.as_str(), "VERIFY_GAP");
+        assert_eq!(FailureClass::Unclassified.as_str(), "UNCLASSIFIED");
+    }
 }

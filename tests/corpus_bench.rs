@@ -1041,6 +1041,238 @@ fn layered_single_layer_solve_equals_legacy() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Recorded WCS of every bench frame, held to a frozen baseline
+// ---------------------------------------------------------------------------
+
+/// The truth frames the blind index pass solves through the base pack
+/// (name substrings, picked as the ones that solve blind through the base pack
+/// at 0.3.0; scale in arcsec/px). Two at <= 0.5, two at 1-2, two at 2.2-2.9;
+/// none is above 3 in the corpus. (The 0.39 frame and the 0.88 pair do not
+/// solve blind through the base pack.)
+const INDEX_PASS_FRAMES: &[&str] = &[
+    "2024-02-24_19-42-32_H", // 0.48
+    "M 51_H",                // 0.48
+    "_DSC2522",              // 1.004
+    "2025-10-26_01-35-09",   // 1.73
+    "2025-08-23_01-38-32",   // 2.22
+    "Gamma Scuti",           // 2.88
+];
+
+/// The WCS gate's run file: every solved frame's WCS, written by
+/// `corpus_layered_tiers` (not committed; regenerated on each run).
+const LAYERED_RUN_FILE: &str = "tests/corpus_layered_run.json";
+/// The frozen baseline the run is compared against (frozen at 0.4.0).
+const LAYERED_BASELINE_FILE: &str = "tests/corpus_layered_baseline.json";
+
+fn sip_table_json(c: &solvemyastro::SipCoefficients) -> serde_json::Value {
+    serde_json::json!(c.coeffs)
+}
+
+/// One frame's record: whether it solved and, when it did, the WCS (`crval`,
+/// `crpix`, `cd`, SIP) with the run's own numbers (`matched_stars`,
+/// `inlier_ratio`, `log10_odds`, `reference_stars`, `hypotheses`, `rms_px`,
+/// `elapsed_ms`). Only the WCS keys are compared.
+fn frame_json(name: &str, res: &anyhow::Result<solvemyastro::SolveSolution>) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let Ok(s) = res else {
+        return json!({ "frame": name, "solved": false });
+    };
+    let w = &s.wcs;
+    let sip = match &w.sip_forward {
+        None => Value::Null,
+        Some((a, b)) => {
+            let (ap, bp) = match &w.sip_reverse {
+                Some((ap, bp)) => (Some(ap), Some(bp)),
+                None => (None, None),
+            };
+            json!({
+                "a_order": a.order,
+                "a": sip_table_json(a),
+                "b_order": b.order,
+                "b": sip_table_json(b),
+                "ap_order": ap.map(|c| c.order),
+                "ap": ap.map(sip_table_json),
+                "bp_order": bp.map(|c| c.order),
+                "bp": bp.map(sip_table_json),
+            })
+        }
+    };
+    // The decision's numbers (0.4.0): every solved frame cleared the bar, its
+    // ratio is the one assignment's count over the reference list, and at least
+    // one hypothesis was verified.
+    assert!(
+        s.log10_odds >= solvemyastro::verify::ACCEPT_LOG10_ODDS,
+        "{name}: solved with log10_odds {} below the bar",
+        s.log10_odds
+    );
+    assert!(s.reference_stars_in_frame > 0, "{name}: solved with no reference star in the frame");
+    let ratio = s.matched_stars as f64 / s.reference_stars_in_frame as f64;
+    assert!(
+        (s.inlier_ratio - ratio).abs() < 1e-12,
+        "{name}: inlier_ratio {} != matched {} / reference_stars {}",
+        s.inlier_ratio,
+        s.matched_stars,
+        s.reference_stars_in_frame
+    );
+    assert!(s.hypotheses_verified >= 1, "{name}: solved with no hypothesis counted");
+    json!({
+        "frame": name,
+        "solved": true,
+        "crval": [w.crval.0, w.crval.1],
+        "crpix": [w.crpix.0, w.crpix.1],
+        "cd": [w.cd[0][0], w.cd[0][1], w.cd[1][0], w.cd[1][1]],
+        "sip": sip,
+        "matched_stars": s.matched_stars,
+        "inlier_ratio": s.inlier_ratio,
+        "log10_odds": s.log10_odds,
+        "reference_stars": s.reference_stars_in_frame,
+        "hypotheses": s.hypotheses_verified,
+        "rms_px": s.rms_residual_px,
+        "elapsed_ms": s.solve_time_ms,
+    })
+}
+
+/// The own-set keys of an accepted candidate, from `solve_traced`'s last
+/// trace: `path`, `recentered`, `hypotheses`, `own` (image stars that chose
+/// the seed), `image_pts`, `linear_inliers` (the seed pre-filter's inliers),
+/// `inliers_outside_own` (of those, the ones not in the own set) and
+/// `final_inliers`, `reference_mag_limit` (the cone level the reference list came from). Recorded, not compared with the baseline (`wcs_moved`
+/// reads only the WCS keys).
+fn own_set_json(traces: &[solvemyastro::diag::VerifyTrace]) -> serde_json::Value {
+    let t = traces.last().expect("a solved frame has a verify trace");
+    assert!(t.accepted, "the last verify trace of a solved frame is the accepted candidate's");
+    serde_json::json!({
+        "path": t.path.as_str(),
+        "recentered": t.recentered,
+        "hypotheses": t.hypotheses_so_far,
+        "own": t.own_star_count,
+        "image_pts": t.image_star_count,
+        "linear_inliers": t.seed_inliers,
+        "inliers_outside_own": t.inliers_outside_own,
+        "final_inliers": t.final_inliers,
+        "reference_mag_limit": t.reference_mag_limit,
+    })
+}
+
+/// `frame_json` plus `own_set` for a solved frame.
+fn traced_frame_json(
+    name: &str,
+    res: &anyhow::Result<solvemyastro::SolveSolution>,
+    traces: &[solvemyastro::diag::VerifyTrace],
+) -> serde_json::Value {
+    let mut rec = frame_json(name, res);
+    if res.is_ok() {
+        rec["own_set"] = own_set_json(traces);
+    }
+    rec
+}
+
+/// The first key path at which two values differ, or `None`. Numbers are equal
+/// when `|x - y| <= 1e-9 * max(|x|, |y|)` (exactly equal when both are 0);
+/// arrays must have equal length.
+fn json_moved(path: &str, run: &serde_json::Value, base: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    match (run, base) {
+        (Value::Number(a), Value::Number(b)) => {
+            let (x, y) = (a.as_f64().unwrap_or(f64::NAN), b.as_f64().unwrap_or(f64::NAN));
+            let same = x == y || (x - y).abs() <= 1e-9 * x.abs().max(y.abs());
+            (!same).then(|| path.to_string())
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            if a.len() != b.len() {
+                return Some(path.to_string());
+            }
+            a.iter()
+                .zip(b)
+                .enumerate()
+                .find_map(|(i, (x, y))| json_moved(&format!("{path}[{i}]"), x, y))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            let mut keys: Vec<&String> = a.keys().chain(b.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            keys.into_iter().find_map(|k| {
+                json_moved(
+                    &format!("{path}.{k}"),
+                    a.get(k).unwrap_or(&Value::Null),
+                    b.get(k).unwrap_or(&Value::Null),
+                )
+            })
+        }
+        (x, y) => (x != y).then(|| path.to_string()),
+    }
+}
+
+/// The first moved WCS key of a frame against its baseline record (`crval`,
+/// `crpix`, `cd`, `sip` only), as a path such as `"sip.a[2][1]"`.
+fn wcs_moved(run: &serde_json::Value, base: &serde_json::Value) -> Option<String> {
+    ["crval", "crpix", "cd", "sip"].iter().find_map(|k| {
+        json_moved(
+            k,
+            run.get(*k).unwrap_or(&serde_json::Value::Null),
+            base.get(*k).unwrap_or(&serde_json::Value::Null),
+        )
+    })
+}
+
+/// The baseline text, or `None` when the file does not exist. Any other read
+/// error is a failure of the gate, never "no baseline".
+fn read_baseline(res: std::io::Result<String>) -> Option<String> {
+    match res {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("read {LAYERED_BASELINE_FILE}: {e}"),
+    }
+}
+
+/// The names of the solved frames in a list of frame records.
+fn solved_names(frames: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    frames
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["solved"] == true)
+        .filter_map(|f| f["frame"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Compare one list of the run against the baseline's: the solved sets must be
+/// equal and no solved frame may have a moved WCS key. Returns the number of
+/// solved frames compared and a problem line per difference.
+fn compare_to_baseline(
+    list: &str,
+    run: &serde_json::Value,
+    base: &serde_json::Value,
+) -> (usize, Vec<String>) {
+    let mut problems = Vec::new();
+    let (rs, bs) = (solved_names(run), solved_names(base));
+    for n in rs.difference(&bs) {
+        problems.push(format!("{list}: {n} solved now, not in the baseline"));
+    }
+    for n in bs.difference(&rs) {
+        problems.push(format!("{list}: {n} solved in the baseline, not now"));
+    }
+    let mut n = 0usize;
+    for f in run.as_array().into_iter().flatten().filter(|f| f["solved"] == true) {
+        let name = f["frame"].as_str().unwrap_or("?");
+        let Some(b) = base
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|b| b["frame"].as_str() == Some(name) && b["solved"] == true)
+        else {
+            continue;
+        };
+        n += 1;
+        if let Some(key) = wcs_moved(f, b) {
+            problems.push(format!("{list}: {name}: WCS key {key} moved"));
+        }
+    }
+    (n, problems)
+}
+
+
 /// Plan 2 real-data gate: the full additive density-tier union must solve the
 /// corpus. Opens `tier_500..tier_8000` from `SOLVEMYASTRO_TIER_DIR`, builds
 /// `Caches::layered`, and solves every corpus frame. Gates on CORRECTNESS only
@@ -1048,8 +1280,16 @@ fn layered_single_layer_solve_equals_legacy() {
 /// the frozen `corpus_baseline.json`, because the tier catalog differs from the
 /// deep cache the baseline was frozen against.
 ///
+/// It also records every frame's WCS (`frame_json`) in
+/// `tests/corpus_layered_run.json`, solves [`INDEX_PASS_FRAMES`] blind through
+/// the base pack in `SOLVEMYASTRO_INDEX_DIR` (`solve_with_index`; the variable
+/// absent prints `SKIP`), and holds both lists to
+/// `tests/corpus_layered_baseline.json` when that file exists: equal solved
+/// sets and no moved `crval`, `crpix`, `cd` or SIP coefficient (`wcs_moved`).
+///
 /// Run with:
 ///   SOLVEMYASTRO_TIER_DIR=/path/to/catalog_out \
+///   SOLVEMYASTRO_INDEX_DIR=/path/to/base_pack \
 ///     cargo test -p solvemyastro --release --test corpus_bench \
 ///     -- --ignored corpus_layered_tiers --nocapture
 #[test]
@@ -1117,6 +1357,8 @@ fn corpus_layered_tiers() {
     let mut panicked: Vec<String> = Vec::new();
     let mut m78_correct = false;
     let mut m78_sip = false;
+    let mut tier_frames: Vec<serde_json::Value> = Vec::new();
+    let mut bounded_pick: Option<(PathBuf, SolveHints, f64, usize, u128)> = None;
 
     for path in &files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -1142,10 +1384,27 @@ fn corpus_layered_tiers() {
         let hints = hints_from_fits(&hdr, n1.max(n2));
 
         let t0 = Instant::now();
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            solve(path, &hints, &caches, &cfg, None)
+        let traced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            solvemyastro::solve_traced(path, &hints, &caches, &[], &cfg, None)
         }));
         let elapsed_ms = t0.elapsed().as_millis();
+        let (res, traces) = match traced {
+            Ok((r, t)) => (Ok(r), t),
+            Err(e) => (Err(e), Vec::new()),
+        };
+        tier_frames.push(match &res {
+            Ok(r) => traced_frame_json(&name, r, &traces),
+            Err(_) => frame_json(&name, &Err(anyhow::anyhow!("panicked"))),
+        });
+        // The quickest correct truth frame feeds the `solve_bounded` check.
+        if let (Ok(Ok(s)), true) = (&res, truth_solved) {
+            let near = sep_arcsec(tra, tdec, s.wcs.crval.0, s.wcs.crval.1) < 30.0
+                && (s.pixel_scale_arcsec - tscale).abs() / tscale * 100.0 < 2.0;
+            if near && bounded_pick.as_ref().is_none_or(|b| elapsed_ms < b.4) {
+                bounded_pick =
+                    Some((path.clone(), hints, tscale, tier_frames.len() - 1, elapsed_ms));
+            }
+        }
         let (solved, ra, dec, scale, has_sip) = match res {
             Ok(Ok(s)) => (
                 true,
@@ -1230,10 +1489,290 @@ fn corpus_layered_tiers() {
         panicked.len()
     );
 
+    // Blind index pass: the base pack, no hints beyond the epoch.
+    let mut index_frames: Vec<serde_json::Value> = Vec::new();
+    let mut index_correct = 0usize;
+    let mut index_wrong: Vec<String> = Vec::new();
+    let mut index_panicked: Vec<String> = Vec::new();
+    let mut index_ran = false;
+    match std::env::var("SOLVEMYASTRO_INDEX_DIR") {
+        Err(_) => println!("SKIP: SOLVEMYASTRO_INDEX_DIR not set"),
+        Ok(d) => {
+            let index = solvemyastro::QuadIndex::open(Path::new(&d))
+                .unwrap_or_else(|e| panic!("open quad index {d}: {e}"));
+            index_ran = true;
+            for path in &files {
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if !INDEX_PASS_FRAMES.iter().any(|k| name.contains(k)) {
+                    continue;
+                }
+                let &(_, tra, tdec, tscale) = truth
+                    .iter()
+                    .find(|&&(k, ..)| name.contains(k))
+                    .unwrap_or_else(|| panic!("index pass frame {name} has no truth entry"));
+                let hdr = if name.ends_with(".xisf") {
+                    read_xisf_header(path)
+                } else {
+                    read_fits_header(path)
+                };
+                let n1 = hdr.get("NAXIS1").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                let n2 = hdr.get("NAXIS2").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                let hints = SolveHints {
+                    epoch: hints_from_fits(&hdr, n1.max(n2)).epoch,
+                    ..SolveHints::default()
+                };
+                let traced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    solvemyastro::solve_traced(path, &hints, &caches, &[&index], &cfg, None)
+                }));
+                let did_panic = traced.is_err();
+                let (res, traces) = traced
+                    .unwrap_or_else(|_| (Err(anyhow::anyhow!("panicked")), Vec::new()));
+                // A solve outside the truth's 30" / 2 % is WRONG: reported with
+                // its position and scale, kept under "wrong" (a key `wcs_moved`
+                // ignores), never recorded as a solve.
+                let mut wrong_solve: Option<(f64, f64, f64)> = None;
+                let correct = match &res {
+                    Ok(s) => {
+                        let ok = sep_arcsec(tra, tdec, s.wcs.crval.0, s.wcs.crval.1) < 30.0
+                            && (s.pixel_scale_arcsec - tscale).abs() / tscale * 100.0 < 2.0;
+                        if !ok {
+                            wrong_solve =
+                                Some((s.wcs.crval.0, s.wcs.crval.1, s.pixel_scale_arcsec));
+                        }
+                        ok
+                    }
+                    Err(_) => false,
+                };
+                if correct {
+                    index_correct += 1;
+                }
+                let tag = if correct {
+                    "OK".to_string()
+                } else if did_panic {
+                    index_panicked.push(name.clone());
+                    "PANICKED".to_string()
+                } else if let Some((ra, dec, sc)) = wrong_solve {
+                    index_wrong.push(name.clone());
+                    format!("WRONG ra={ra:.3} dec={dec:+.3} {sc:.3}\"/px")
+                } else {
+                    "MISSED".to_string()
+                };
+                println!("index pass: {:50} {tag}", &name[..name.len().min(50)]);
+                let mut rec = if correct {
+                    traced_frame_json(&name, &res, &traces)
+                } else {
+                    frame_json(&name, &Err(anyhow::anyhow!("not a truth solve")))
+                };
+                if let Some((ra, dec, sc)) = wrong_solve {
+                    rec["wrong"] = serde_json::json!({
+                        "crval": [ra, dec],
+                        "scale_arcsec_px": sc,
+                        "wcs": frame_json(&name, &res),
+                    });
+                }
+                index_frames.push(rec);
+            }
+        }
+    }
+    println!("index pass: {index_correct} solved of {}", INDEX_PASS_FRAMES.len());
+    panicked.extend(index_panicked);
+
+    // `solve_bounded`: a window around a frame's true scale solves the frame
+    // to the same field as `solve`. The bounded ladder is B2's, a different
+    // ladder from the hinted one, so it may seed in another cell and end on a
+    // slightly different WCS: the check is the same field (10" in position,
+    // 1 % in scale), not the same bits.
+    let (bpath, bhints, bscale, bidx, _) =
+        bounded_pick.expect("a correct truth frame to check solve_bounded on");
+    let bname = bpath.file_name().unwrap().to_string_lossy().to_string();
+    let bounded = solvemyastro::orchestrate::solve_bounded(
+        &bpath,
+        &bhints,
+        &caches,
+        &[],
+        &cfg,
+        None,
+        (bscale * 0.9, bscale * 1.1),
+    );
+    let bounded_problem: Option<String> = match &bounded {
+        Ok(b) => {
+            let r = &tier_frames[bidx];
+            let sep = sep_arcsec(
+                b.wcs.crval.0,
+                b.wcs.crval.1,
+                r["crval"][0].as_f64().unwrap(),
+                r["crval"][1].as_f64().unwrap(),
+            );
+            let dscale = (b.pixel_scale_arcsec / bscale - 1.0).abs() * 100.0;
+            println!(
+                "solve_bounded: {bname} {sep:.2} arcsec from solve's centre, scale {dscale:.3} % \
+                 from the truth's, matched {} vs {}",
+                b.matched_stars, r["matched_stars"]
+            );
+            (sep >= 10.0 || dscale >= 1.0)
+                .then(|| format!("{bname}: {sep:.2} arcsec, scale {dscale:.3} % off"))
+        }
+        Err(e) => Some(format!("{bname}: solve_bounded failed: {e}")),
+    };
+
+    // A bounded solve that must fail (no odds are enough) still carries the
+    // traces it scored: the lab reads them off the failure (PC-14).
+    let never = SolveConfig { accept_log10_odds: f64::INFINITY, ..cfg.clone() };
+    let bounded_fail_problem: Option<String> = match solvemyastro::orchestrate::solve_bounded(
+        &bpath,
+        &bhints,
+        &caches,
+        &[],
+        &never,
+        None,
+        (bscale * 0.9, bscale * 1.1),
+    ) {
+        Ok(_) => Some(format!("{bname}: solved with an infinite bar")),
+        Err(e) => match e.downcast_ref::<solvemyastro::SolveFailure>() {
+            Some(f) if !f.verifies.is_empty() => {
+                println!(
+                    "solve_bounded failure: {bname} class {} with {} verify traces",
+                    f.class.as_str(),
+                    f.verifies.len()
+                );
+                if matches!(f.class, solvemyastro::FailureClass::NotConfident { .. }) {
+                    None
+                } else {
+                    Some(format!("{bname}: class {} is not NOT_CONFIDENT", f.class.as_str()))
+                }
+            }
+            Some(_) => Some(format!("{bname}: the failure carries no verify traces")),
+            None => Some(format!("{bname}: not a SolveFailure: {e}")),
+        },
+    };
+
+    let run = serde_json::json!({
+        "schema_version": 1,
+        "frames": tier_frames,
+        "index_frames": index_frames,
+    });
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    std::fs::write(
+        manifest.join(LAYERED_RUN_FILE),
+        serde_json::to_string_pretty(&run).expect("serialize run"),
+    )
+    .unwrap_or_else(|e| panic!("write {LAYERED_RUN_FILE}: {e}"));
+
+    // The WCS gate: both lists against the frozen baseline. Every line is
+    // printed before any assert, so one run shows every difference.
+    let freezing = std::env::var("SOLVEMYASTRO_FREEZE").is_ok_and(|v| v == "1");
+    let mut problems: Vec<String> = Vec::new();
+    match read_baseline(std::fs::read_to_string(manifest.join(LAYERED_BASELINE_FILE))) {
+        None if freezing => println!("WCS gate: no baseline, wrote the run"),
+        None => {
+            println!(
+                "WCS gate: no baseline at {LAYERED_BASELINE_FILE} \
+                 (SOLVEMYASTRO_FREEZE=1 freezes the run)"
+            );
+            problems.push(format!("no baseline at {LAYERED_BASELINE_FILE}"));
+        }
+        Some(text) => {
+            let base: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("parse {LAYERED_BASELINE_FILE}: {e}"));
+            let (n_t, more_t) = compare_to_baseline("frames", &run["frames"], &base["frames"]);
+            let (n_i, more_i) =
+                compare_to_baseline("index_frames", &run["index_frames"], &base["index_frames"]);
+            problems.extend(more_t);
+            problems.extend(more_i);
+            let moved = problems.iter().filter(|p| p.contains("moved")).count();
+            println!("WCS gate: {} solved frames, {moved} moved", n_t + n_i);
+            for p in &problems {
+                println!("WCS gate: {p}");
+            }
+        }
+    }
+
     assert!(panicked.is_empty(), "GATE FAIL: panic(s): {panicked:?}");
     assert!(m78_correct, "GATE FAIL: M78 did not solve correctly on the tier stack");
     assert!(m78_sip, "GATE FAIL: M78 solved without SIP");
     assert!(wrong.is_empty(), "GATE FAIL: false positive(s): {wrong:?}");
     assert!(missed.is_empty(), "GATE FAIL: truth frame(s) not solved: {missed:?}");
+    assert!(index_ran, "GATE FAIL: the blind index pass did not run (SOLVEMYASTRO_INDEX_DIR)");
+    assert!(bounded_problem.is_none(), "GATE FAIL: solve_bounded: {bounded_problem:?}");
+    assert!(
+        bounded_fail_problem.is_none(),
+        "GATE FAIL: solve_bounded failure: {bounded_fail_problem:?}"
+    );
+    assert!(index_wrong.is_empty(), "GATE FAIL: wrong blind index solve(s): {index_wrong:?}");
+    assert_eq!(
+        index_correct,
+        INDEX_PASS_FRAMES.len(),
+        "GATE FAIL: blind index pass solved {index_correct} of {}",
+        INDEX_PASS_FRAMES.len()
+    );
+    assert!(problems.is_empty(), "GATE FAIL: WCS differs from the baseline: {problems:#?}");
     println!("\nGATE: layered-tier corpus PASSED");
+}
+
+#[test]
+fn wcs_compare_flags_a_moved_coefficient() {
+    use serde_json::json;
+    let frame = || {
+        json!({
+            "frame": "f",
+            "solved": true,
+            "crval": [10.5, 41.25],
+            "crpix": [1000.0, 750.0],
+            "cd": [-1.0e-4, 2.0e-6, 3.0e-6, 1.0e-4],
+            "sip": {
+                "a_order": 3,
+                "a": [[0.0, 0.0, 1.5e-7], [0.0, 2.0e-8], [3.0e-9]],
+                "b_order": 3,
+                "b": [[0.0, 0.0, -1.5e-7], [0.0, 4.0e-8], [5.0e-9]],
+                "ap_order": 3,
+                "ap": [[0.0, 0.0, 1.0e-7], [0.0, 2.0e-8], [3.0e-9]],
+                "bp_order": 3,
+                "bp": [[0.0, 0.0, -1.0e-7], [0.0, 4.0e-8], [5.0e-9]],
+            },
+            "matched_stars": 40,
+            "inlier_ratio": 0.3,
+            "rms_px": 0.2,
+            "elapsed_ms": 1234,
+        })
+    };
+    let base = frame();
+    assert_eq!(wcs_moved(&frame(), &base), None);
+
+    // A run's timing and counts are not WCS keys.
+    let mut other = frame();
+    other["elapsed_ms"] = json!(99999);
+    other["matched_stars"] = json!(41);
+    assert_eq!(wcs_moved(&other, &base), None);
+
+    let mut moved = frame();
+    let c = moved["sip"]["a"][1][1].as_f64().unwrap();
+    moved["sip"]["a"][1][1] = json!(c * (1.0 + 1e-6));
+    assert_eq!(wcs_moved(&moved, &base).as_deref(), Some("sip.a[1][1]"));
+
+    let mut same = frame();
+    same["sip"]["a"][1][1] = json!(c * (1.0 + 1e-12));
+    assert_eq!(wcs_moved(&same, &base), None);
+
+    let mut shifted = frame();
+    shifted["crpix"][0] = json!(1000.001);
+    assert_eq!(wcs_moved(&shifted, &base).as_deref(), Some("crpix[0]"));
+
+    // SIP present on one side only, and a zero that became non-zero.
+    let mut no_sip = frame();
+    no_sip["sip"] = serde_json::Value::Null;
+    assert_eq!(wcs_moved(&no_sip, &base).as_deref(), Some("sip"));
+    let mut zero = frame();
+    zero["sip"]["a"][0][0] = json!(1e-30);
+    assert_eq!(wcs_moved(&zero, &base).as_deref(), Some("sip.a[0][0]"));
+}
+
+#[test]
+fn only_a_missing_baseline_reads_as_no_baseline() {
+    use std::io::{Error, ErrorKind};
+    assert_eq!(read_baseline(Ok("{}".to_string())).as_deref(), Some("{}"));
+    assert_eq!(read_baseline(Err(Error::from(ErrorKind::NotFound))), None);
+    let denied = std::panic::catch_unwind(|| {
+        read_baseline(Err(Error::from(ErrorKind::PermissionDenied)))
+    });
+    assert!(denied.is_err(), "a permission error must not read as no baseline");
 }

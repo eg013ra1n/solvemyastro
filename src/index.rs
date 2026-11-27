@@ -769,6 +769,9 @@ pub struct Hypothesis {
     pub star_n: usize,
     /// Code lookups made so far.
     pub queries: usize,
+    /// The four image stars of the matching quad: indices into the `pts`
+    /// given to [`search`] (a prefix of the caller's SNR-ordered list).
+    pub star_idx: [usize; 4],
 }
 
 /// Similarity (with optional reflection) mapping image points to tangent-plane
@@ -891,7 +894,7 @@ pub fn search(
                     if !(params.scale_lo..=params.scale_hi).contains(&scale) {
                         continue;
                     }
-                    if emit(Hypothesis { wcs, star_n: n, queries: *queries }) {
+                    if emit(Hypothesis { wcs, star_n: n, queries: *queries, star_idx: quad }) {
                         return true;
                     }
                 }
@@ -1039,6 +1042,74 @@ mod tests {
                 (0..all.len()).filter(|&i| (0..4).all(|k| (all[i][k] - q[k]).abs() <= tol)).collect();
             assert_eq!(got, want);
         }
+    }
+
+    /// A hypothesis names the four image stars of the quad that produced it.
+    #[test]
+    fn a_hypothesis_names_its_image_quad() {
+        let mut s = 7u64;
+        let mut rnd = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let stars: Vec<crate::cache::StarRecord> = (0..40_000)
+            .map(|_| crate::cache::StarRecord {
+                ra: rnd() * 360.0,
+                dec: (rnd() * 2.0 - 1.0).asin().to_degrees(),
+                mag: (4.0 + rnd() * 10.0) as f32,
+                pmra_mas_yr: 0.0,
+                pmdec_mas_yr: 0.0,
+            })
+            .collect();
+        let cat_dir = tempfile::tempdir().expect("tmp");
+        crate::cache::build_cache(stars, cat_dir.path(), 2016.0, |_| {}).expect("cache");
+        let cache = StarCache::open(cat_dir.path()).expect("open cache");
+        let idx_dir = tempfile::tempdir().expect("tmp");
+        let params = BuildParams { min_depth: 2, max_depth: 2, stars_per_cell: 10, quads_per_cell: 8 };
+        build_index(&[&cache], idx_dir.path(), &params, |_| {}).expect("build");
+        let idx = QuadIndex::open(idx_dir.path()).expect("open index");
+        let band = idx.bands()[0];
+
+        // Band quad 0's four stars at 20"/px about their AB midpoint, in a
+        // 3000 x 3000 frame, placed at positions 1, 4, 6 and 9 of the list
+        // (not the prefix, not sorted by role) among random points.
+        let v = idx.quad_stars(&band, 0);
+        let (mra, mdec) = radec(midpoint(v[0], v[1]));
+        let slots = [6usize, 1, 9, 4];
+        let mut pts: Vec<(f64, f64)> = (0..44).map(|_| (rnd() * 3000.0, rnd() * 3000.0)).collect();
+        for (k, &x) in v.iter().enumerate() {
+            let (ra, dec) = radec(x);
+            let (xi, eta) = tan::sky_to_tangent(ra, dec, mra, mdec);
+            pts[slots[k]] = (1500.0 + xi * 3600.0 / 20.0, 1500.0 + eta * 3600.0 / 20.0);
+        }
+
+        let mut hits: Vec<Hypothesis> = Vec::new();
+        search(
+            &[&idx],
+            &pts,
+            (1500.0, 1500.0),
+            &SearchParams::default(),
+            || false,
+            |h| {
+                hits.push(h);
+                false
+            },
+        );
+        let want = [1usize, 4, 6, 9];
+        let h = hits
+            .iter()
+            .find(|h| {
+                let mut got = h.star_idx;
+                got.sort_unstable();
+                got == want
+            })
+            .expect("the quad's own stars produce a hypothesis naming them");
+        // The indices are the image stars' own positions, whatever the role order.
+        let mut named: Vec<(u64, u64)> = h.star_idx.iter().map(|&i| (pts[i].0.to_bits(), pts[i].1.to_bits())).collect();
+        let mut placed: Vec<(u64, u64)> = slots.iter().map(|&i| (pts[i].0.to_bits(), pts[i].1.to_bits())).collect();
+        named.sort_unstable();
+        placed.sort_unstable();
+        assert_eq!(named, placed);
     }
 
     #[test]
